@@ -690,6 +690,52 @@ On the second run in the same repo, workers reuse repo facts, scheduler benefits
 
 ---
 
+## Review Integration Contract
+
+Code review is Claude Code's or Codex's job. Review orchestration and merge policy is Antfarm's job.
+
+### ReviewVerdict
+
+```python
+@dataclass
+class ReviewVerdict:
+    provider: str                    # "claude_code", "codex", "human"
+    verdict: str                     # "pass", "needs_changes", "blocked"
+    summary: str
+    findings: list[str]
+    severity: str | None             # "low", "medium", "high", "critical"
+    reviewed_commit_sha: str         # must match head_commit_sha in artifact
+    reviewer_run_id: str | None
+```
+
+### Soldier Review Gating
+
+Soldier gates on review as deterministic evidence (not AI judgment):
+
+- Review verdict exists on the attempt
+- Verdict is `pass`
+- `reviewed_commit_sha` matches current `head_commit_sha` (review is fresh)
+- No critical findings remain
+
+### How Review Happens
+
+Antfarm does not perform reviews. It triggers and consumes them:
+
+1. Worker harvests → task is DONE with artifact
+2. Soldier sees DONE task → creates a **review task** in the queue
+3. A reviewer worker (Claude Code or Codex) forages the review task
+4. Reviewer reads the PR diff, posts comments, produces ReviewVerdict
+5. Reviewer harvests the review task with the verdict
+6. Soldier reads the verdict → if PASS + fresh SHA → merge
+
+This makes review a task like any other — Antfarm orchestrates, agents execute.
+
+### Implementation Note
+
+ReviewVerdict is defined in v0.5 but implementation lands in v0.5.x or v0.6, depending on whether the Claude plugin (MCP + slash commands) ships first. The contract is frozen now so Soldier can be built to expect it.
+
+---
+
 ## Explicitly Deferred
 
 - Redis backend enhancements
