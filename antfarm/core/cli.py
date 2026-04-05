@@ -457,6 +457,35 @@ def scout(
 
 
 # ---------------------------------------------------------------------------
+# inbox
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def inbox(colony_url: str, token: str | None):
+    """Show items needing operator attention."""
+    from antfarm.core.inbox import collect_inbox_items
+
+    data = _get(colony_url, "/status/full", token=token)
+    items = collect_inbox_items(
+        tasks=data.get("tasks", []),
+        workers=data.get("workers", []),
+    )
+    if not items:
+        click.echo("Inbox empty — everything healthy.")
+        return
+
+    severity_colors = {"error": "red", "warning": "yellow", "info": "blue"}
+    for item in items:
+        color = severity_colors.get(item["severity"], "white")
+        label = click.style(f"[{item['severity'].upper()}]", fg=color)
+        click.echo(f"{label} {item['type']}: {item['message']}")
+        click.echo(f"  → {item['action']}")
+
+
+# ---------------------------------------------------------------------------
 # scent
 # ---------------------------------------------------------------------------
 

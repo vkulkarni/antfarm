@@ -14,8 +14,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from antfarm.core.backends.file import FileBackend
-from antfarm.core.serve import get_app
 from antfarm.core.models import FailureType
+from antfarm.core.serve import get_app
 from antfarm.core.worker import AgentResult, WorkerRuntime
 
 # ---------------------------------------------------------------------------
@@ -426,7 +426,9 @@ def test_classify_failure_infra():
 def test_classify_failure_build():
     from antfarm.core.worker import classify_failure
 
-    result = classify_failure(returncode=1, stderr="ModuleNotFoundError: No module named 'foo'", stdout="")
+    result = classify_failure(
+        returncode=1, stderr="ModuleNotFoundError: No module named 'foo'", stdout=""
+    )
     assert result == FailureType.BUILD_FAILURE
 
 
@@ -450,7 +452,9 @@ def test_classify_failure_lint_before_test():
     """Lint markers take precedence even if 'test' appears."""
     from antfarm.core.worker import classify_failure
 
-    result = classify_failure(returncode=1, stderr="", stdout="ruff check: 3 errors in test_file.py")
+    result = classify_failure(
+        returncode=1, stderr="", stdout="ruff check: 3 errors in test_file.py"
+    )
     assert result == FailureType.LINT_FAILURE
 
 
