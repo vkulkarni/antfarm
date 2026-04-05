@@ -1,0 +1,354 @@
+"""Tests for antfarm.core.doctor — pre-flight diagnostic and stale recovery."""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from antfarm.core.backends.file import FileBackend
+from antfarm.core.doctor import run_doctor
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def setup(tmp_path: Path):
+    data_dir = str(tmp_path / ".antfarm")
+    backend = FileBackend(root=data_dir)
+    config = {"data_dir": data_dir, "worker_ttl": 300, "guard_ttl": 300}
+    return backend, config
+
+
+def _make_task(task_id: str = "task-1", depends_on: list | None = None) -> dict:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "id": task_id,
+        "title": f"Task {task_id}",
+        "spec": "Do something",
+        "complexity": "M",
+        "priority": 10,
+        "depends_on": depends_on or [],
+        "touches": ["src/foo.py"],
+        "created_at": now,
+        "updated_at": now,
+        "created_by": "test",
+    }
+
+
+def _make_worker(worker_id: str = "worker-1", workspace_root: str = "/tmp/ws1") -> dict:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "worker_id": worker_id,
+        "node_id": "node-1",
+        "agent_type": "engineer",
+        "workspace_root": workspace_root,
+        "status": "idle",
+        "registered_at": now,
+        "last_heartbeat": now,
+    }
+
+
+def _backdate(path: str | Path, seconds: int = 600) -> None:
+    """Set file mtime to `seconds` ago."""
+    old_time = time.time() - seconds
+    os.utime(str(path), (old_time, old_time))
+
+
+# ---------------------------------------------------------------------------
+# 1. test_healthy_colony_no_findings
+# ---------------------------------------------------------------------------
+
+
+def test_healthy_colony_no_findings(setup):
+    backend, config = setup
+    findings = run_doctor(backend, config)
+    errors_warnings = [f for f in findings if f.severity in ("error", "warning")]
+    assert errors_warnings == [], f"Expected no errors/warnings, got: {errors_warnings}"
+
+
+# ---------------------------------------------------------------------------
+# 2. test_stale_worker_detected
+# ---------------------------------------------------------------------------
+
+
+def test_stale_worker_detected(setup):
+    backend, config = setup
+    worker = _make_worker("worker-stale")
+    backend.register_worker(worker)
+
+    # Backdate the worker file
+    data_dir = Path(config["data_dir"])
+    worker_file = data_dir / "workers" / "worker-stale.json"
+    _backdate(worker_file, seconds=600)
+
+    findings = run_doctor(backend, config, fix=False)
+    stale = [f for f in findings if f.check == "stale_worker"]
+    assert len(stale) == 1
+    assert "worker-stale" in stale[0].message
+    assert stale[0].fixed is False
+
+
+# ---------------------------------------------------------------------------
+# 3. test_stale_worker_fixed
+# ---------------------------------------------------------------------------
+
+
+def test_stale_worker_fixed(setup):
+    backend, config = setup
+    worker = _make_worker("worker-stale")
+    backend.register_worker(worker)
+
+    data_dir = Path(config["data_dir"])
+    worker_file = data_dir / "workers" / "worker-stale.json"
+    _backdate(worker_file, seconds=600)
+
+    findings = run_doctor(backend, config, fix=True)
+    stale = [f for f in findings if f.check == "stale_worker"]
+    assert len(stale) == 1
+    assert stale[0].fixed is True
+    # Worker file should be gone
+    assert not worker_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# 4. test_stale_task_detected
+# ---------------------------------------------------------------------------
+
+
+def test_stale_task_detected(setup):
+    backend, config = setup
+    # Register a worker, carry a task, forage it (creates active task)
+    worker = _make_worker("worker-dead")
+    backend.register_worker(worker)
+    backend.carry(_make_task("task-stale"))
+    backend.pull("worker-dead")
+
+    # Kill the worker (deregister)
+    backend.deregister_worker("worker-dead")
+
+    findings = run_doctor(backend, config, fix=False)
+    stale = [f for f in findings if f.check == "stale_task"]
+    assert len(stale) == 1
+    assert "task-stale" in stale[0].message
+    assert stale[0].fixed is False
+
+
+# ---------------------------------------------------------------------------
+# 5. test_stale_task_fixed
+# ---------------------------------------------------------------------------
+
+
+def test_stale_task_fixed(setup):
+    backend, config = setup
+    worker = _make_worker("worker-dead")
+    backend.register_worker(worker)
+    backend.carry(_make_task("task-stale"))
+    task_data = backend.pull("worker-dead")
+    attempt_id = task_data["current_attempt"]
+
+    # Kill the worker
+    backend.deregister_worker("worker-dead")
+
+    findings = run_doctor(backend, config, fix=True)
+    stale = [f for f in findings if f.check == "stale_task"]
+    assert len(stale) == 1
+    assert stale[0].fixed is True
+
+    # Task should now be in ready/ with status "ready"
+    data_dir = Path(config["data_dir"])
+    active_file = data_dir / "tasks" / "active" / "task-stale.json"
+    ready_file = data_dir / "tasks" / "ready" / "task-stale.json"
+    assert not active_file.exists()
+    assert ready_file.exists()
+
+    recovered = json.loads(ready_file.read_text())
+    assert recovered["status"] == "ready"
+    assert recovered["current_attempt"] is None
+
+    # Attempt should be superseded
+    superseded = [a for a in recovered["attempts"] if a["attempt_id"] == attempt_id]
+    assert len(superseded) == 1
+    assert superseded[0]["status"] == "superseded"
+
+    # Trail should have doctor entry
+    trail_msgs = [t["message"] for t in recovered.get("trail", [])]
+    assert any("recovered by doctor" in m for m in trail_msgs)
+
+
+# ---------------------------------------------------------------------------
+# 6. test_stale_guard_detected
+# ---------------------------------------------------------------------------
+
+
+def test_stale_guard_detected(setup):
+    backend, config = setup
+    # No live worker for this guard
+    backend.guard("resource/lock", "worker-gone")
+
+    data_dir = Path(config["data_dir"])
+    guard_file = data_dir / "guards" / "resource__lock.lock"
+    _backdate(guard_file, seconds=600)
+
+    findings = run_doctor(backend, config, fix=False)
+    stale = [f for f in findings if f.check == "stale_guard"]
+    assert len(stale) == 1
+    assert stale[0].fixed is False
+
+
+# ---------------------------------------------------------------------------
+# 7. test_stale_guard_fixed
+# ---------------------------------------------------------------------------
+
+
+def test_stale_guard_fixed(setup):
+    backend, config = setup
+    backend.guard("resource/lock", "worker-gone")
+
+    data_dir = Path(config["data_dir"])
+    guard_file = data_dir / "guards" / "resource__lock.lock"
+    _backdate(guard_file, seconds=600)
+
+    findings = run_doctor(backend, config, fix=True)
+    stale = [f for f in findings if f.check == "stale_guard"]
+    assert len(stale) == 1
+    assert stale[0].fixed is True
+    assert not guard_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# 8. test_workspace_conflict_detected
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_conflict_detected(setup):
+    backend, config = setup
+    shared_ws = "/tmp/shared-workspace"
+    backend.register_worker(_make_worker("worker-a", workspace_root=shared_ws))
+    backend.register_worker(_make_worker("worker-b", workspace_root=shared_ws))
+
+    findings = run_doctor(backend, config, fix=False)
+    conflicts = [f for f in findings if f.check == "workspace_conflict"]
+    assert len(conflicts) == 1
+    assert "worker-a" in conflicts[0].message or "worker-b" in conflicts[0].message
+
+
+# ---------------------------------------------------------------------------
+# 9. test_orphan_workspace_reported
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_workspace_reported(setup, tmp_path):
+    backend, config = setup
+    # Create a workspace_root with a worktree dir
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir()
+    orphan = workspace_root / "orphan-worktree"
+    orphan.mkdir()
+
+    config["workspace_root"] = str(workspace_root)
+
+    findings = run_doctor(backend, config, fix=False)
+    orphans = [f for f in findings if f.check == "orphan_workspace"]
+    assert len(orphans) == 1
+    assert "orphan-worktree" in orphans[0].message
+
+
+# ---------------------------------------------------------------------------
+# 10. test_folder_status_mismatch
+# ---------------------------------------------------------------------------
+
+
+def test_folder_status_mismatch(setup):
+    backend, config = setup
+    # Carry a task (lands in ready/ with status=ready), then manually corrupt it
+    backend.carry(_make_task("task-mismatch"))
+
+    data_dir = Path(config["data_dir"])
+    task_file = data_dir / "tasks" / "ready" / "task-mismatch.json"
+    data = json.loads(task_file.read_text())
+    data["status"] = "done"  # Mismatch: file is in ready/ but status says done
+    task_file.write_text(json.dumps(data))
+
+    findings = run_doctor(backend, config, fix=False)
+    mismatches = [f for f in findings if f.check == "state_consistency" and "status" in f.message]
+    assert len(mismatches) == 1
+    assert "task-mismatch" in mismatches[0].message
+
+
+# ---------------------------------------------------------------------------
+# 11. test_dependency_cycle_detected
+# ---------------------------------------------------------------------------
+
+
+def test_dependency_cycle_detected(setup):
+    backend, config = setup
+    # task-a depends on task-b, task-b depends on task-a
+    backend.carry(_make_task("task-a", depends_on=["task-b"]))
+    backend.carry(_make_task("task-b", depends_on=["task-a"]))
+
+    findings = run_doctor(backend, config, fix=False)
+    cycles = [f for f in findings if f.check == "dependency_cycles"]
+    assert len(cycles) >= 1
+    assert any("task-a" in f.message and "task-b" in f.message for f in cycles)
+
+
+# ---------------------------------------------------------------------------
+# 12. test_dangling_dependency_detected
+# ---------------------------------------------------------------------------
+
+
+def test_dangling_dependency_detected(setup):
+    backend, config = setup
+    backend.carry(_make_task("task-orphan", depends_on=["task-nonexistent"]))
+
+    findings = run_doctor(backend, config, fix=False)
+    dangling = [f for f in findings if f.check == "dangling_dependency"]
+    assert len(dangling) == 1
+    assert "task-nonexistent" in dangling[0].message
+
+
+# ---------------------------------------------------------------------------
+# 13. test_malformed_json_detected
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_json_detected(setup):
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+    # Write garbage into a task file
+    garbage_file = data_dir / "tasks" / "ready" / "task-corrupt.json"
+    garbage_file.write_text("{ this is not valid JSON !!!")
+
+    findings = run_doctor(backend, config, fix=False)
+    malformed = [f for f in findings if f.check == "state_consistency" and "Malformed" in f.message]
+    assert len(malformed) == 1
+    assert "task-corrupt.json" in malformed[0].message
+
+
+# ---------------------------------------------------------------------------
+# 14. test_filesystem_check_creates_dirs
+# ---------------------------------------------------------------------------
+
+
+def test_filesystem_check_creates_dirs(setup):
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+
+    # Delete a required subdir
+    import shutil
+    shutil.rmtree(str(data_dir / "guards"))
+    assert not (data_dir / "guards").exists()
+
+    findings = run_doctor(backend, config, fix=True)
+    fs_findings = [f for f in findings if f.check == "filesystem"]
+    assert len(fs_findings) >= 1
+    assert all(f.fixed for f in fs_findings)
+    # Directory should be recreated
+    assert (data_dir / "guards").exists()
