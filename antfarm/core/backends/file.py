@@ -36,6 +36,7 @@ from antfarm.core.models import (
     TrailEntry,
 )
 from antfarm.core.rate_limiter import is_worker_rate_limited
+from antfarm.core.scheduler import select_task
 
 from .base import TaskBackend
 
@@ -160,20 +161,13 @@ class FileBackend(TaskBackend):
     def pull(self, worker_id: str) -> dict | None:
         """Claim the next eligible task. Creates a new Attempt. Atomic.
 
-        Scheduling policy (inline, v0.1):
-        1. Dependency check — skip if depends_on not all in done_task_ids
-        2. Priority — lower number = higher priority
-        3. FIFO — oldest created_at first among equals
+        Delegates task selection entirely to scheduler.select_task().
+        Backend only handles state persistence and atomic file rename.
 
         Returns:
             The updated task dict with a new ACTIVE attempt, or None.
         """
         with self._lock:
-            # Collect done task IDs for dependency checking
-            done_task_ids = {
-                p.stem for p in (self._root / "tasks" / "done").iterdir() if p.suffix == ".json"
-            }
-
             # Read worker file — check rate limit and capabilities
             worker_capabilities: set[str] | None = None
             worker_path = self._worker_path(worker_id)
@@ -187,6 +181,11 @@ class FileBackend(TaskBackend):
                 except (json.JSONDecodeError, KeyError):
                     pass
 
+            # Collect done task IDs for dependency checking
+            done_task_ids = {
+                p.stem for p in (self._root / "tasks" / "done").iterdir() if p.suffix == ".json"
+            }
+
             # Load all ready tasks
             ready_dir = self._root / "tasks" / "ready"
             candidates: list[Task] = []
@@ -199,27 +198,29 @@ class FileBackend(TaskBackend):
                 except (json.JSONDecodeError, KeyError):
                     continue
 
-            # Select using inline scheduling policy
-            eligible = [t for t in candidates if all(dep in done_task_ids for dep in t.depends_on)]
+            # Load active tasks for scope preference
+            active_dir = self._root / "tasks" / "active"
+            active_tasks: list[Task] = []
+            for p in active_dir.iterdir():
+                if p.suffix != ".json":
+                    continue
+                try:
+                    data = self._read_json(p)
+                    active_tasks.append(Task.from_dict(data))
+                except (json.JSONDecodeError, KeyError):
+                    continue
 
-            # Filter by capability requirements
-            if worker_capabilities is not None:
-                eligible = [
-                    t for t in eligible
-                    if set(t.capabilities_required).issubset(worker_capabilities)
-                ]
+            # Delegate ALL scheduling to the canonical scheduler
+            chosen = select_task(
+                ready_tasks=candidates,
+                done_task_ids=done_task_ids,
+                active_tasks=active_tasks,
+                worker_capabilities=worker_capabilities,
+                worker_id=worker_id,
+            )
 
-            # Filter by pin — skip tasks pinned to a different worker
-            eligible = [
-                t for t in eligible
-                if t.pinned_to is None or t.pinned_to == worker_id
-            ]
-
-            if not eligible:
+            if chosen is None:
                 return None
-
-            eligible.sort(key=lambda t: (t.priority, t.created_at))
-            chosen = eligible[0]
 
             # Create new attempt
             attempt = Attempt(
