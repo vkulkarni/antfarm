@@ -17,6 +17,7 @@ import time
 from enum import StrEnum
 
 from antfarm.core.colony_client import ColonyClient
+from antfarm.core.models import ReviewVerdict
 
 
 class MergeResult(StrEnum):
@@ -332,3 +333,133 @@ class Soldier:
         return any(
             attempt.get("status") == "merged" for attempt in task.get("attempts", [])
         )
+
+    # ------------------------------------------------------------------
+    # v0.5.2+ Artifact and review helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_attempt_artifact(task: dict) -> dict | None:
+        """Extract the artifact from the task's current attempt."""
+        current_attempt_id = task.get("current_attempt")
+        if not current_attempt_id:
+            return None
+        for attempt in task.get("attempts", []):
+            if attempt.get("attempt_id") == current_attempt_id:
+                return attempt.get("artifact")
+        return None
+
+    @staticmethod
+    def _get_review_verdict(task: dict) -> dict | None:
+        """Extract the review verdict from the task's current attempt."""
+        current_attempt_id = task.get("current_attempt")
+        if not current_attempt_id:
+            return None
+        for attempt in task.get("attempts", []):
+            if attempt.get("attempt_id") == current_attempt_id:
+                return attempt.get("review_verdict")
+        return None
+
+    def check_freshness(self, artifact_dict: dict) -> bool:
+        """Check if the artifact's target branch SHA still matches current HEAD.
+
+        Returns True if fresh (safe to merge), False if stale.
+        """
+        target_sha = artifact_dict.get("target_branch_sha_at_harvest", "")
+        if not target_sha:
+            return True  # no freshness data — allow (backward compat)
+
+        target_branch = artifact_dict.get(
+            "target_branch", self.integration_branch
+        )
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", f"origin/{target_branch}"],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if r.returncode != 0:
+                return True  # can't check — allow
+            current_sha = r.stdout.strip()
+            return current_sha.startswith(target_sha) or target_sha.startswith(
+                current_sha
+            )
+        except Exception:
+            return True  # can't check — allow
+
+    def check_review_verdict(self, task: dict) -> tuple[bool, str]:
+        """Check if the task has a passing, fresh review verdict.
+
+        Returns:
+            (passed, reason) — passed is True if review is valid.
+        """
+        verdict_dict = self._get_review_verdict(task)
+        if verdict_dict is None:
+            return False, "no review verdict on attempt"
+
+        verdict = ReviewVerdict.from_dict(verdict_dict)
+
+        if verdict.verdict != "pass":
+            return False, f"review verdict is '{verdict.verdict}', not 'pass'"
+
+        # Check freshness: reviewed_commit_sha must match head_commit_sha
+        artifact_dict = self._get_attempt_artifact(task)
+        if artifact_dict:
+            head_sha = artifact_dict.get("head_commit_sha", "")
+            if (
+                head_sha
+                and verdict.reviewed_commit_sha
+                and not (
+                    head_sha.startswith(verdict.reviewed_commit_sha)
+                    or verdict.reviewed_commit_sha.startswith(head_sha)
+                )
+            ):
+                return (
+                    False,
+                    f"review is stale: reviewed {verdict.reviewed_commit_sha[:12]} "
+                    f"but head is {head_sha[:12]}",
+                )
+
+        return True, "review passed"
+
+    def create_review_task(self, task: dict) -> str | None:
+        """Create a review task in the queue for a done task.
+
+        Returns the review task ID, or None if creation failed.
+        """
+        task_id = task["id"]
+        review_task_id = f"review-{task_id}"
+
+        branch = self._get_attempt_branch(task) or ""
+        pr = ""
+        for a in task.get("attempts", []):
+            if a.get("attempt_id") == task.get("current_attempt"):
+                pr = a.get("pr", "")
+                break
+
+        spec = (
+            f"Review task {task_id}: '{task.get('title', '')}'\n\n"
+            f"Branch: {branch}\n"
+            f"PR: {pr}\n\n"
+            "Instructions:\n"
+            "1. Read the PR diff\n"
+            "2. Check for bugs, security issues, and design problems\n"
+            "3. Run tests to verify\n"
+            "4. Produce a ReviewVerdict (pass/needs_changes/blocked)\n"
+        )
+
+        try:
+            self.colony.carry(
+                task_id=review_task_id,
+                title=f"Review: {task.get('title', task_id)}",
+                spec=spec,
+                depends_on=[],
+                touches=task.get("touches", []),
+                priority=1,  # reviews are high priority
+                complexity="S",
+            )
+            return review_task_id
+        except Exception:
+            return None

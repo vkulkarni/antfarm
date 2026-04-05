@@ -150,17 +150,24 @@ def collect_inbox_items(
                         })
                     break
 
-        # --- Kicked-back tasks ---
-        elif status == "kicked_back":
+        # --- Kicked-back tasks (detected from trail on ready tasks) ---
+        # FileBackend moves kicked-back tasks to ready/ with status "ready",
+        # so we detect kickbacks by checking trail entries with superseded attempts.
+        if status == "ready":
             trail = t.get("trail", [])
-            reason = trail[-1].get("message", "unknown") if trail else "unknown"
-            items.append({
-                "severity": "info",
-                "type": "kicked_back",
-                "message": f"Task '{tid}' was kicked back: {reason[:100]}",
-                "action": "Review rejection reason and requeue",
-                "task_id": tid,
-            })
+            # A ready task with a superseded attempt was kicked back
+            has_superseded = any(
+                a.get("status") == "superseded" for a in t.get("attempts", [])
+            )
+            if has_superseded and trail:
+                reason = trail[-1].get("message", "unknown")
+                items.append({
+                    "severity": "info",
+                    "type": "kicked_back",
+                    "message": f"Task '{tid}' was kicked back: {reason[:100]}",
+                    "action": "Review rejection reason and requeue",
+                    "task_id": tid,
+                })
 
         # --- Tasks with signals (need human input) ---
         signals = t.get("signals", [])

@@ -23,6 +23,7 @@ class TaskStatus(StrEnum):
     DONE = "done"
     PAUSED = "paused"
     BLOCKED = "blocked"
+    HARVEST_PENDING = "harvest_pending"
 
 
 class AttemptStatus(StrEnum):
@@ -349,9 +350,10 @@ class Attempt:
     pr: str | None
     started_at: str
     completed_at: str | None
+    artifact: dict | None = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "attempt_id": self.attempt_id,
             "worker_id": self.worker_id,
             "status": self.status.value,
@@ -360,6 +362,9 @@ class Attempt:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
         }
+        if self.artifact is not None:
+            d["artifact"] = self.artifact
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> Attempt:
@@ -371,6 +376,7 @@ class Attempt:
             pr=data.get("pr"),
             started_at=data["started_at"],
             completed_at=data.get("completed_at"),
+            artifact=data.get("artifact"),
         )
 
 

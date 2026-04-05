@@ -11,6 +11,8 @@ exit code on failure is a valid agent.
 
 from __future__ import annotations
 
+import contextlib
+import json as _json
 import logging
 import subprocess
 import threading
@@ -264,7 +266,17 @@ class WorkerRuntime:
                 f"[{failure.failure_type.value}] {failure.message}: "
                 f"{result.stderr[:200]}",
             )
+            # Persist structured failure record in trail for downstream consumers
+            self.colony.trail(
+                task_id,
+                self.worker_id,
+                f"[FAILURE_RECORD] {_json.dumps(failure.to_dict())}",
+            )
             return True
+
+        # Set harvest_pending before writing result (best-effort)
+        with contextlib.suppress(Exception):
+            self.colony.mark_harvest_pending(task_id, attempt_id)
 
         # Successful agent — harvest the task.
         try:

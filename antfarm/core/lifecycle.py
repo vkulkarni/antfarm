@@ -45,12 +45,13 @@ def _normalize_attempt_state(state: str) -> str:
 # ---------------------------------------------------------------------------
 
 LEGAL_TASK_TRANSITIONS: dict[str, set[str]] = {
-    "queued": {"claimed", "blocked", "paused"},
+    "queued": {"claimed", "blocked", "paused", "active"},  # "active" = legacy pull (ready→active)
     "blocked": {"queued", "paused"},
     "claimed": {"active"},
-    "active": {"harvest_pending", "paused"},
+    # "done" = legacy harvest (active→done), "queued" = legacy reassign (active→ready)
+    "active": {"harvest_pending", "paused", "queued", "done"},
     "harvest_pending": {"done", "failed"},
-    "done": {"merge_ready", "kicked_back"},
+    "done": {"merge_ready", "kicked_back", "queued"},  # "queued" = legacy kickback (done→ready)
     "kicked_back": {"queued"},
     "merge_ready": {"merged"},
     "merged": set(),  # terminal

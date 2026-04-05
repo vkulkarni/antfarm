@@ -101,10 +101,11 @@ def test_inbox_finds_long_running_tasks():
 
 
 def test_inbox_finds_kicked_back_tasks():
-    """Kicked-back tasks appear in inbox."""
+    """Kicked-back tasks appear in inbox (ready status with superseded attempts)."""
     tasks = [
-        {"id": "task-1", "status": "kicked_back", "depends_on": [],
-         "attempts": [], "trail": [{"message": "merge conflict"}],
+        {"id": "task-1", "status": "ready", "depends_on": [],
+         "attempts": [{"attempt_id": "att-1", "status": "superseded"}],
+         "trail": [{"message": "merge conflict"}],
          "signals": []},
     ]
     items = collect_inbox_items(tasks=tasks, workers=[])

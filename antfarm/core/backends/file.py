@@ -13,21 +13,20 @@ Stores task state as JSON files in a directory tree:
 
 All mutations that could race are protected by a threading.Lock().
 File renames (os.rename) are used for atomic state transitions.
-
-Scheduler note: pull() currently uses an inline scheduling policy
-(dependency check → priority → FIFO). Full scheduler integration will
-land when antfarm.core.scheduler is merged.
+Scheduling is delegated entirely to scheduler.select_task().
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from antfarm.core.lifecycle import assert_task_transition
 from antfarm.core.models import (
     Attempt,
     AttemptStatus,
@@ -140,6 +139,10 @@ class FileBackend(TaskBackend):
             ValueError: If a task with this ID already exists in any state folder.
         """
         task_id = task["id"]
+        if not re.match(r"^[a-zA-Z0-9_-]+$", task_id):
+            raise ValueError(
+                f"Invalid task_id '{task_id}': must contain only alphanumeric, dash, underscore"
+            )
         with self._lock:
             if self._find_task_path(task_id) is not None:
                 raise ValueError(f"Task '{task_id}' already exists")
@@ -222,6 +225,8 @@ class FileBackend(TaskBackend):
             if chosen is None:
                 return None
 
+            assert_task_transition(chosen.status.value, TaskStatus.ACTIVE.value)
+
             # Create new attempt
             attempt = Attempt(
                 attempt_id=str(uuid.uuid4()),
@@ -302,6 +307,8 @@ class FileBackend(TaskBackend):
                     f"(got '{data.get('current_attempt')}')"
                 )
 
+            assert_task_transition(data["status"], TaskStatus.DONE.value)
+
             # Update attempt
             now = _now_iso()
             for a in data["attempts"]:
@@ -333,6 +340,7 @@ class FileBackend(TaskBackend):
                 raise FileNotFoundError(f"Task '{task_id}' not found in done/")
 
             data = self._read_json(done_path)
+            assert_task_transition(data["status"], TaskStatus.READY.value)
             now = _now_iso()
 
             current_attempt_id = data.get("current_attempt")
@@ -373,6 +381,7 @@ class FileBackend(TaskBackend):
                     f"(got '{data.get('current_attempt')}')"
                 )
 
+            assert_task_transition(data["status"], "harvest_pending")
             data["status"] = "harvest_pending"
             data["updated_at"] = _now_iso()
             self._write_json(active_path, data)
@@ -430,6 +439,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in ACTIVE state")
 
             data = self._read_json(active_path)
+            assert_task_transition(data["status"], TaskStatus.PAUSED.value)
             now = _now_iso()
             data["status"] = TaskStatus.PAUSED.value
             data["updated_at"] = now
@@ -450,6 +460,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in PAUSED state")
 
             data = self._read_json(paused_path)
+            assert_task_transition(data["status"], TaskStatus.READY.value)
             now = _now_iso()
 
             # Supersede current attempt so next pull creates a fresh one
@@ -478,6 +489,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in ACTIVE state")
 
             data = self._read_json(active_path)
+            assert_task_transition(data["status"], TaskStatus.READY.value)
             now = _now_iso()
 
             current_attempt_id = data.get("current_attempt")
@@ -513,6 +525,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in READY state")
 
             data = self._read_json(ready_path)
+            assert_task_transition(data["status"], TaskStatus.BLOCKED.value)
             now = _now_iso()
 
             trail_entry = TrailEntry(ts=now, worker_id="system", message=f"Blocked: {reason}")
@@ -535,6 +548,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in BLOCKED state")
 
             data = self._read_json(blocked_path)
+            assert_task_transition(data["status"], TaskStatus.READY.value)
             now = _now_iso()
             data["status"] = TaskStatus.READY.value
             data["updated_at"] = now
