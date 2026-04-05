@@ -21,6 +21,8 @@ class TaskStatus(StrEnum):
     READY = "ready"
     ACTIVE = "active"
     DONE = "done"
+    PAUSED = "paused"
+    BLOCKED = "blocked"
 
 
 class AttemptStatus(StrEnum):

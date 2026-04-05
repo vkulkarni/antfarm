@@ -86,6 +86,14 @@ class MergeRequest(BaseModel):
     attempt_id: str
 
 
+class ReassignRequest(BaseModel):
+    worker_id: str
+
+
+class BlockRequest(BaseModel):
+    reason: str
+
+
 class GuardRequest(BaseModel):
     owner: str
 
@@ -270,6 +278,61 @@ def get_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/pause", status_code=200)
+    def pause_task(task_id: str):
+        """Pause an active task."""
+        try:
+            _backend.pause_task(task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/resume", status_code=200)
+    def resume_task(task_id: str):
+        """Resume a paused task."""
+        try:
+            _backend.resume_task(task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/reassign", status_code=200)
+    def reassign_task(task_id: str, req: ReassignRequest):
+        """Reassign an active task to a different worker."""
+        try:
+            _backend.reassign_task(task_id, req.worker_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/block", status_code=200)
+    def block_task(task_id: str, req: BlockRequest):
+        """Block a ready task with a reason."""
+        try:
+            _backend.block_task(task_id, req.reason)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/unblock", status_code=200)
+    def unblock_task(task_id: str):
+        """Unblock a blocked task."""
+        try:
+            _backend.unblock_task(task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True}
 
     @app.get("/tasks", status_code=200)
