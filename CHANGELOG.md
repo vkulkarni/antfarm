@@ -6,6 +6,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-05
+
+### Added
+- GitHub Issues backend — tasks stored as GitHub Issues with label-based status tracking (`antfarm colony --backend github`)
+- Codex adapter — agent definitions + hooks for OpenAI Codex CLI (`--approval-mode full-auto`)
+- Aider adapter — agent definitions + convention file (`--yes --no-auto-commits`)
+- Import command — import tasks from GitHub Issues or JSON files (`antfarm import --from github/json`)
+- `--backend` option on colony command (file or github)
+
 ## [0.3.0] - 2026-04-05
 
 ### Added
