@@ -611,7 +611,18 @@ For v0.5, planner can remain simple:
 
 ## Release Slices
 
-### v0.5.0-alpha.1 — Runtime Truth
+### v0.5.1 — Review Integration (FIRST PRIORITY)
+
+Close the autonomous loop. Without this, all review is manual.
+
+- ReviewVerdict contract (#85) — dataclass with provider, verdict, findings, reviewed SHA
+- Soldier review gating — verdict exists + pass + fresh SHA + no critical findings
+- Review-as-task flow — Soldier creates review task → reviewer worker produces verdict
+- Reviewer agent definitions for Claude Code and Codex adapters
+
+**Why first:** This is the #1 blocker for using Antfarm on real projects (BrahmaOS). Every other improvement is wasted if review is still manual.
+
+### v0.5.2 — Runtime Truth
 
 Make the runtime deterministic and observable.
 
@@ -620,7 +631,7 @@ Make the runtime deterministic and observable.
 - Task / attempt lifecycle + invariants (new states, transition rules)
 - Initial inbox surfacing for stale / blocked / failed work (#81 partial)
 
-### v0.5.0-alpha.2 — Artifact Gating
+### v0.5.3 — Artifact Gating
 
 Make merges safe with evidence-based gating.
 
@@ -628,7 +639,7 @@ Make merges safe with evidence-based gating.
 - Soldier artifact gating — freshness checks, base SHA validation
 - Review pack generation (#82)
 
-### v0.5.0-alpha.3 — Memory + Prevention
+### v0.5.4 — Memory + Prevention
 
 Make parallelism smarter with data.
 
@@ -636,7 +647,7 @@ Make parallelism smarter with data.
 - Conflict prevention layer (#80) — overlap warnings, hotspots, claim hints
 - Touch observation feedback loop (artifacts → memory → better touches)
 
-### v0.5.0-alpha.4 — Planning
+### v0.5.5 — Planning
 
 Add AI-assisted planning on top of a stable substrate.
 
@@ -644,11 +655,11 @@ Add AI-assisted planning on top of a stable substrate.
 - Planner informed by repo facts + hotspots + observed touches
 - Conflict warnings in plan output
 
-### v0.5.0 — Docs + Polish
+### v0.5.6 — Docs + Polish
 
 - Docs rewrite (#73)
 - Audit trail (#75)
-- Bug fixes from alpha testing
+- Bug fixes from testing
 
 **Why this order:** First make the runtime deterministic, then make merges safe, then make parallelism smarter, then add AI-assisted planning on top of a stable substrate.
 
