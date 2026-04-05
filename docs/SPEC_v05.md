@@ -1,6 +1,6 @@
 # Antfarm v0.5 — Specification
 
-**Status:** Draft (final)
+**Status:** FROZEN — approved for implementation
 **Date:** 2026-04-05
 **Goal:** Antfarm v0.5 should not become broader. It should become more trustworthy.
 **Philosophy:** Deterministic core, AI at the edges. Repo execution coordinator, not agent civilization simulator.
