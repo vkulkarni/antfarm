@@ -1,12 +1,32 @@
-# v0.5.0-alpha.1 Foundation Implementation Plan
+# v0.5.0-alpha.1 — Runtime Truth Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Consolidate scheduling logic, add structured task output, and classify failures — the foundation for all v0.5 features.
+**Goal:** Make the runtime deterministic and observable — one scheduling brain, explicit lifecycle states, classified failures with retry policy, and operator visibility for stuck work.
 
-**Architecture:** Three independent changes that share no files (except models.py): (1) refactor FileBackend.pull() to call the canonical scheduler instead of duplicating logic, (2) add TaskArtifact dataclass and wire it through worker→harvest→soldier, (3) add FailureType enum and classification in worker. All backward compatible.
+**Architecture:** Five PRs in sequence: (1) model foundation with new states and types, (2) lifecycle enforcement in backends and worker, (3) canonical scheduler refactor, (4) failure classification with retry behavior, (5) initial operator inbox. Each PR is independently testable and leaves the system in a working state.
 
-**Tech Stack:** Python 3.12, pytest, ruff, FastAPI, click, httpx
+**Tech Stack:** Python 3.12, pytest, ruff, FastAPI, click, httpx, rich
+
+**Spec:** `docs/SPEC_v05.md` (frozen)
+
+---
+
+## Scope
+
+### In
+- Canonical scheduler (#72) — single scheduling brain
+- Task/attempt lifecycle + invariants — new states, transition rules, recovery semantics
+- Failure taxonomy + default retry policy (#83)
+- Initial inbox surfacing (#81 partial)
+
+### Out
+- TaskArtifact (alpha.2)
+- Soldier freshness gating (alpha.2)
+- Review packs (alpha.2)
+- Repo memory (alpha.3)
+- Conflict prevention weighting (alpha.3)
+- Planner (alpha.4)
 
 ---
 
@@ -14,301 +34,63 @@
 
 | File | Action | Responsibility |
 |------|--------|---------------|
-| `antfarm/core/models.py` | Modify | Add TaskArtifact, FailureType |
-| `antfarm/core/scheduler.py` | No change | Already correct — becomes single source of truth |
-| `antfarm/core/backends/file.py` | Modify | Remove inline scheduling from pull(), call scheduler |
-| `antfarm/core/worker.py` | Modify | Build TaskArtifact after agent, classify failures |
-| `antfarm/core/soldier.py` | Modify | Gate merge on artifact (tests_passed, lint_clean) |
-| `antfarm/core/backends/base.py` | Modify | Update mark_harvested() signature for artifact |
-| `antfarm/core/serve.py` | Modify | Pass artifact through harvest endpoint |
-| `tests/test_scheduler_integration.py` | Create | Verify pull() uses scheduler |
-| `tests/test_models.py` | Modify | Add TaskArtifact + FailureType roundtrip tests |
-| `tests/test_worker.py` | Modify | Add artifact collection + failure classification tests |
-| `tests/test_soldier.py` | Modify | Add artifact gating tests |
+| `antfarm/core/models.py` | Modify | Add TaskState, AttemptState, FailureType, FailureRecord |
+| `antfarm/core/lifecycle.py` | Create | State transition validator — legal transitions only |
+| `antfarm/core/backends/base.py` | Modify | Enforce lifecycle transitions in abstract methods |
+| `antfarm/core/backends/file.py` | Modify | Implement new states, remove inline scheduling |
+| `antfarm/core/scheduler.py` | Modify | Becomes sole scheduling authority |
+| `antfarm/core/worker.py` | Modify | HARVEST_PENDING state, failure classification, retry logic |
+| `antfarm/core/soldier.py` | Modify | Use failure type for kickback decisions |
+| `antfarm/core/tui.py` | Modify | Add inbox panel |
+| `antfarm/core/cli.py` | Modify | Add `antfarm inbox` command |
+| `tests/test_models.py` | Modify | Roundtrip tests for new types |
+| `tests/test_lifecycle.py` | Create | Transition legality tests |
+| `tests/test_scheduler_integration.py` | Create | Verify pull() delegates to scheduler |
+| `tests/test_worker.py` | Modify | Failure classification + retry tests |
+| `tests/test_inbox.py` | Create | Inbox surfacing tests |
 
 ---
 
-## Task 1: Canonical Scheduler — Remove Inline Scheduling from FileBackend (#72)
+## PR 1: Model Foundation
 
-**Files:**
-- Modify: `antfarm/core/backends/file.py:160-242`
-- Create: `tests/test_scheduler_integration.py`
-
-- [ ] **Step 1: Write the failing integration test**
-
-Create `tests/test_scheduler_integration.py`:
-
-```python
-"""Verify FileBackend.pull() delegates to scheduler.select_task()."""
-
-import pytest
-from unittest.mock import patch, MagicMock
-from antfarm.core.backends.file import FileBackend
-from antfarm.core.models import Task, TaskStatus
-
-
-def _make_task(task_id="task-001", title="Test", spec="Do something",
-               depends_on=None, touches=None, priority=10):
-    return {
-        "id": task_id,
-        "title": title,
-        "spec": spec,
-        "complexity": "M",
-        "priority": priority,
-        "depends_on": depends_on or [],
-        "touches": touches or [],
-        "capabilities_required": [],
-        "pinned_to": None,
-        "merge_override": None,
-        "created_by": "test",
-    }
-
-
-@pytest.fixture
-def backend(tmp_path):
-    return FileBackend(root=str(tmp_path / ".antfarm"))
-
-
-def test_pull_delegates_to_scheduler(backend):
-    """pull() must call scheduler.select_task() — not use inline logic."""
-    backend.carry(_make_task("task-001", touches=["api"]))
-    backend.carry(_make_task("task-002", touches=["frontend"]))
-
-    # Register a worker so pull can read capabilities
-    backend.register_worker({
-        "worker_id": "w1", "node_id": "n1", "agent_type": "generic",
-        "workspace_root": "/tmp", "capabilities": [],
-    })
-
-    with patch("antfarm.core.backends.file.select_task") as mock_scheduler:
-        # Make scheduler return task-002 (not task-001 which would be FIFO default)
-        mock_scheduler.return_value = None  # Will be called with Task objects
-
-        result = backend.pull("w1")
-
-        # Verify scheduler was called
-        mock_scheduler.assert_called_once()
-        call_args = mock_scheduler.call_args
-
-        # Verify it received ready_tasks, done_task_ids, active_tasks
-        ready_tasks = call_args[0][0]  # first positional arg
-        assert len(ready_tasks) == 2
-        assert all(isinstance(t, Task) for t in ready_tasks)
-
-
-def test_pull_scope_preference_works_via_scheduler(backend):
-    """Scope preference (from scheduler) must actually affect pull() results."""
-    # Carry two tasks with different touches
-    backend.carry(_make_task("task-api", touches=["api"], priority=10))
-    backend.carry(_make_task("task-frontend", touches=["frontend"], priority=10))
-
-    backend.register_worker({
-        "worker_id": "w1", "node_id": "n1", "agent_type": "generic",
-        "workspace_root": "/tmp", "capabilities": [],
-    })
-
-    # Pull first task (either is fine)
-    result1 = backend.pull("w1")
-    assert result1 is not None
-    first_touches = result1.get("touches", [])
-
-    # Pull second task — scheduler should prefer non-overlapping scope
-    backend.register_worker({
-        "worker_id": "w2", "node_id": "n1", "agent_type": "generic",
-        "workspace_root": "/tmp2", "capabilities": [],
-    })
-    result2 = backend.pull("w2")
-    assert result2 is not None
-    # The second task should have different touches than the first
-    second_touches = result2.get("touches", [])
-    assert set(first_touches) != set(second_touches), \
-        "Scheduler scope preference should pick non-overlapping task"
-
-
-def test_pull_passes_active_tasks_to_scheduler(backend):
-    """pull() must load active tasks and pass them to scheduler for scope preference."""
-    backend.carry(_make_task("task-001", touches=["api"]))
-    backend.carry(_make_task("task-002", touches=["api"]))
-    backend.carry(_make_task("task-003", touches=["frontend"]))
-
-    backend.register_worker({
-        "worker_id": "w1", "node_id": "n1", "agent_type": "generic",
-        "workspace_root": "/tmp", "capabilities": [],
-    })
-
-    # Pull task-001 (now active, touches "api")
-    result1 = backend.pull("w1")
-    assert result1 is not None
-
-    # Now pull again — scheduler should see task-001 as active
-    # and prefer task-003 (touches "frontend") over task-002 (touches "api")
-    backend.register_worker({
-        "worker_id": "w2", "node_id": "n2", "agent_type": "generic",
-        "workspace_root": "/tmp2", "capabilities": [],
-    })
-    result2 = backend.pull("w2")
-    assert result2 is not None
-    assert result2["id"] == "task-003", \
-        "Should prefer task-003 (frontend) since task-001 (api) is active"
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `python3.12 -m pytest tests/test_scheduler_integration.py -v`
-Expected: FAIL — pull() currently doesn't call scheduler or pass active_tasks
-
-- [ ] **Step 3: Refactor FileBackend.pull() to use scheduler**
-
-Modify `antfarm/core/backends/file.py`. Replace the inline scheduling logic in pull() (approximately lines 195-222) with a call to the canonical scheduler:
-
-```python
-# At the top of file.py, add import:
-from antfarm.core.scheduler import select_task
-
-# In pull() method, replace the inline filtering block with:
-
-    def pull(self, worker_id: str) -> dict | None:
-        """Claim next task. Creates a new attempt. Atomic."""
-        with self._lock:
-            # 1. Read all ready tasks as Task objects
-            ready_dir = self._root / "tasks" / "ready"
-            if not ready_dir.exists():
-                return None
-
-            candidates = []
-            for f in sorted(ready_dir.glob("*.json")):
-                try:
-                    data = json.loads(f.read_text())
-                    candidates.append(Task.from_dict(data))
-                except (json.JSONDecodeError, KeyError):
-                    continue
-
-            if not candidates:
-                return None
-
-            # 2. Collect done task IDs (for dependency checking)
-            done_dir = self._root / "tasks" / "done"
-            done_task_ids: set[str] = set()
-            if done_dir.exists():
-                for f in done_dir.glob("*.json"):
-                    done_task_ids.add(f.stem)
-
-            # 3. Collect active tasks (for scope preference)
-            active_dir = self._root / "tasks" / "active"
-            active_tasks: list[Task] = []
-            if active_dir.exists():
-                for f in active_dir.glob("*.json"):
-                    try:
-                        data = json.loads(f.read_text())
-                        active_tasks.append(Task.from_dict(data))
-                    except (json.JSONDecodeError, KeyError):
-                        continue
-
-            # 4. Read worker capabilities
-            worker_capabilities: set[str] | None = None
-            worker_path = self._worker_path(worker_id)
-            if worker_path.exists():
-                try:
-                    worker_data = json.loads(worker_path.read_text())
-                    caps = worker_data.get("capabilities", [])
-                    if caps:
-                        worker_capabilities = set(caps)
-                    # Check rate limit cooldown
-                    cooldown = worker_data.get("cooldown_until")
-                    if cooldown:
-                        from antfarm.core.rate_limiter import is_worker_rate_limited
-                        if is_worker_rate_limited(cooldown):
-                            return None
-                except (json.JSONDecodeError, KeyError):
-                    pass
-
-            # 5. Call the canonical scheduler (SINGLE SOURCE OF TRUTH)
-            winner = select_task(
-                ready_tasks=candidates,
-                done_task_ids=done_task_ids,
-                active_tasks=active_tasks,
-                worker_capabilities=worker_capabilities,
-                worker_id=worker_id,
-            )
-
-            if winner is None:
-                return None
-
-            # 6. Create attempt and move file (existing logic, unchanged)
-            # ... rest of the method stays the same ...
-```
-
-- [ ] **Step 4: Run integration tests**
-
-Run: `python3.12 -m pytest tests/test_scheduler_integration.py -v`
-Expected: All 3 PASS
-
-- [ ] **Step 5: Run full test suite**
-
-Run: `python3.12 -m pytest tests/ -x -q --ignore=tests/test_redis_backend.py`
-Expected: All pass (the refactor doesn't change behavior, just consolidates it)
-
-- [ ] **Step 6: Run lint**
-
-Run: `python3.12 -m ruff check antfarm/core/backends/file.py`
-Expected: Clean
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add antfarm/core/backends/file.py tests/test_scheduler_integration.py
-git commit -m "refactor(scheduler): remove inline scheduling from FileBackend.pull() #72
-
-pull() now delegates to scheduler.select_task() instead of duplicating
-dependency, capability, pin, and scope filtering logic. This makes the
-scheduler the single source of truth for task selection.
-
-Active tasks are now loaded and passed to the scheduler for scope
-preference, which was previously missing from pull()."
-```
-
----
-
-## Task 2: Add FailureType Enum and Classification (#83)
+**Issue:** Alpha.1: Add lifecycle states, FailureType, FailureRecord to models
 
 **Files:**
 - Modify: `antfarm/core/models.py`
-- Modify: `antfarm/core/worker.py`
+- Create: `antfarm/core/lifecycle.py`
 - Modify: `tests/test_models.py`
-- Modify: `tests/test_worker.py`
+- Create: `tests/test_lifecycle.py`
 
-- [ ] **Step 1: Write the failing test for FailureType enum**
+### What changes
 
-Add to `tests/test_models.py`:
-
-```python
-def test_failure_type_values():
-    """FailureType enum has expected values."""
-    from antfarm.core.models import FailureType
-
-    assert FailureType.AGENT_CRASH.value == "agent_crash"
-    assert FailureType.AGENT_TIMEOUT.value == "agent_timeout"
-    assert FailureType.TEST_FAILURE.value == "test_failure"
-    assert FailureType.LINT_FAILURE.value == "lint_failure"
-    assert FailureType.MERGE_CONFLICT.value == "merge_conflict"
-    assert FailureType.BUILD_FAILURE.value == "build_failure"
-    assert FailureType.INFRA_FAILURE.value == "infra_failure"
-    assert FailureType.INVALID_TASK.value == "invalid_task"
-    assert isinstance(FailureType.AGENT_CRASH, str)
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `python3.12 -m pytest tests/test_models.py::test_failure_type_values -v`
-Expected: FAIL — FailureType not defined yet
-
-- [ ] **Step 3: Add FailureType enum to models.py**
-
-Add to `antfarm/core/models.py` after WorkerStatus:
+Add to `models.py`:
 
 ```python
+class TaskState(StrEnum):
+    QUEUED = "queued"
+    BLOCKED = "blocked"
+    CLAIMED = "claimed"
+    ACTIVE = "active"
+    HARVEST_PENDING = "harvest_pending"
+    DONE = "done"
+    KICKED_BACK = "kicked_back"
+    MERGE_READY = "merge_ready"
+    MERGED = "merged"
+    FAILED = "failed"
+    PAUSED = "paused"
+
+
+class AttemptState(StrEnum):
+    STARTED = "started"
+    HEARTBEATING = "heartbeating"
+    AGENT_SUCCEEDED = "agent_succeeded"
+    AGENT_FAILED = "agent_failed"
+    HARVESTED = "harvested"
+    STALE = "stale"
+    ABANDONED = "abandoned"
+
+
 class FailureType(StrEnum):
-    """Classification of task attempt failures."""
     AGENT_CRASH = "agent_crash"
     AGENT_TIMEOUT = "agent_timeout"
     TEST_FAILURE = "test_failure"
@@ -317,558 +99,590 @@ class FailureType(StrEnum):
     BUILD_FAILURE = "build_failure"
     INFRA_FAILURE = "infra_failure"
     INVALID_TASK = "invalid_task"
-```
-
-Also add `failure_type: str | None = None` to the Attempt dataclass, and include it in to_dict()/from_dict().
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `python3.12 -m pytest tests/test_models.py::test_failure_type_values -v`
-Expected: PASS
-
-- [ ] **Step 5: Write failing test for failure classification in worker**
-
-Add to `tests/test_worker.py`:
-
-```python
-def test_classify_failure_agent_crash():
-    """Non-zero exit with no test/lint markers = agent_crash."""
-    from antfarm.core.worker import classify_failure
-    from antfarm.core.models import FailureType
-
-    result = classify_failure(returncode=1, stderr="Segmentation fault", stdout="")
-    assert result == FailureType.AGENT_CRASH
 
 
-def test_classify_failure_test_failure():
-    """Exit with pytest/test failure markers = test_failure."""
-    from antfarm.core.worker import classify_failure
-    from antfarm.core.models import FailureType
-
-    result = classify_failure(
-        returncode=1,
-        stderr="",
-        stdout="FAILED tests/test_foo.py::test_bar - AssertionError"
-    )
-    assert result == FailureType.TEST_FAILURE
-
-
-def test_classify_failure_lint_failure():
-    """Exit with ruff/lint markers = lint_failure."""
-    from antfarm.core.worker import classify_failure
-    from antfarm.core.models import FailureType
-
-    result = classify_failure(
-        returncode=1,
-        stderr="Found 3 errors",
-        stdout="ruff check failed"
-    )
-    assert result == FailureType.LINT_FAILURE
-
-
-def test_classify_failure_timeout():
-    """Exit code -9 or timeout marker = agent_timeout."""
-    from antfarm.core.worker import classify_failure
-    from antfarm.core.models import FailureType
-
-    result = classify_failure(returncode=-9, stderr="", stdout="")
-    assert result == FailureType.AGENT_TIMEOUT
-```
-
-- [ ] **Step 6: Run tests to verify they fail**
-
-Run: `python3.12 -m pytest tests/test_worker.py -k "classify_failure" -v`
-Expected: FAIL — classify_failure not defined
-
-- [ ] **Step 7: Implement classify_failure() in worker.py**
-
-Add to `antfarm/core/worker.py`:
-
-```python
-from antfarm.core.models import FailureType
-
-
-def classify_failure(returncode: int, stderr: str, stdout: str) -> FailureType:
-    """Classify a worker failure based on exit code and output.
-
-    Args:
-        returncode: Agent subprocess exit code.
-        stderr: Agent stderr output.
-        stdout: Agent stdout output.
-
-    Returns:
-        FailureType classification.
-    """
-    combined = (stderr + stdout).lower()
-
-    # Timeout signals
-    if returncode in (-9, -15) or "timeout" in combined:
-        return FailureType.AGENT_TIMEOUT
-
-    # Test failure markers
-    test_markers = ["failed", "error", "assert", "pytest", "unittest", "test_"]
-    if any(m in combined for m in test_markers) and "test" in combined:
-        return FailureType.TEST_FAILURE
-
-    # Lint failure markers
-    lint_markers = ["ruff", "flake8", "pylint", "mypy", "lint", "type error"]
-    if any(m in combined for m in lint_markers):
-        return FailureType.LINT_FAILURE
-
-    # Build failure markers
-    build_markers = ["build failed", "compilation error", "pip install", "npm install",
-                     "modulenotfounderror", "importerror"]
-    if any(m in combined for m in build_markers):
-        return FailureType.BUILD_FAILURE
-
-    # Infrastructure failure markers
-    infra_markers = ["permission denied", "disk full", "connection refused",
-                     "network", "dns", "enospc", "eacces"]
-    if any(m in combined for m in infra_markers):
-        return FailureType.INFRA_FAILURE
-
-    # Default: agent crash
-    return FailureType.AGENT_CRASH
-```
-
-- [ ] **Step 8: Run tests to verify they pass**
-
-Run: `python3.12 -m pytest tests/test_worker.py -k "classify_failure" -v`
-Expected: All 4 PASS
-
-- [ ] **Step 9: Wire classify_failure into _process_one_task()**
-
-In `antfarm/core/worker.py`, modify the failure path in `_process_one_task()` (around line 147-160) to classify the failure:
-
-```python
-        if result.returncode != 0:
-            failure_type = classify_failure(result.returncode, result.stderr, result.stdout)
-            logger.warning(
-                "agent failed task_id=%s failure_type=%s returncode=%d",
-                task_id, failure_type.value, result.returncode,
-            )
-            self.colony.trail(
-                task_id,
-                self.worker_id,
-                f"[{failure_type.value}] agent exited with code {result.returncode}: "
-                f"{result.stderr[:200]}",
-            )
-            return True
-```
-
-- [ ] **Step 10: Run full test suite**
-
-Run: `python3.12 -m pytest tests/ -x -q --ignore=tests/test_redis_backend.py`
-Expected: All pass
-
-- [ ] **Step 11: Commit**
-
-```bash
-git add antfarm/core/models.py antfarm/core/worker.py tests/test_models.py tests/test_worker.py
-git commit -m "feat(core): add failure taxonomy with classify_failure() #83
-
-Added FailureType enum (agent_crash, agent_timeout, test_failure,
-lint_failure, merge_conflict, build_failure, infra_failure, invalid_task).
-
-Worker now classifies failures based on exit code and output markers,
-and includes the failure type in trail messages."
-```
-
----
-
-## Task 3: Add TaskArtifact and Structured Output (#77)
-
-**Files:**
-- Modify: `antfarm/core/models.py`
-- Modify: `antfarm/core/worker.py`
-- Modify: `antfarm/core/backends/base.py`
-- Modify: `antfarm/core/backends/file.py`
-- Modify: `antfarm/core/serve.py`
-- Modify: `antfarm/core/soldier.py`
-- Modify: `tests/test_models.py`
-- Modify: `tests/test_worker.py`
-- Modify: `tests/test_soldier.py`
-
-- [ ] **Step 1: Write failing test for TaskArtifact roundtrip**
-
-Add to `tests/test_models.py`:
-
-```python
-def test_task_artifact_roundtrip():
-    """TaskArtifact serializes and deserializes correctly."""
-    from antfarm.core.models import TaskArtifact
-
-    artifact = TaskArtifact(
-        task_id="task-001",
-        attempt_id="att-001",
-        worker_id="node-1/claude-1",
-        branch="feat/task-001",
-        pr_url="https://github.com/org/repo/pull/42",
-        files_changed=["src/auth.py", "tests/test_auth.py"],
-        lines_added=120,
-        lines_removed=5,
-        tests_run=True,
-        tests_passed=True,
-        test_output_summary="15 passed in 2.3s",
-        lint_clean=True,
-        summary="Added JWT auth middleware",
-        risks=["Token printed at startup"],
-        merge_readiness="ready",
-        review_focus=["auth.py: HMAC implementation"],
-    )
-
-    d = artifact.to_dict()
-    restored = TaskArtifact.from_dict(d)
-
-    assert restored.task_id == "task-001"
-    assert restored.files_changed == ["src/auth.py", "tests/test_auth.py"]
-    assert restored.tests_passed is True
-    assert restored.merge_readiness == "ready"
-    assert restored.risks == ["Token printed at startup"]
-
-
-def test_task_artifact_defaults():
-    """TaskArtifact has sensible defaults for optional fields."""
-    from antfarm.core.models import TaskArtifact
-
-    artifact = TaskArtifact(
-        task_id="task-001",
-        attempt_id="att-001",
-        worker_id="w1",
-        branch="feat/x",
-    )
-
-    assert artifact.pr_url is None
-    assert artifact.files_changed == []
-    assert artifact.lines_added == 0
-    assert artifact.tests_run is False
-    assert artifact.tests_passed is False
-    assert artifact.lint_clean is False
-    assert artifact.summary == ""
-    assert artifact.risks == []
-    assert artifact.merge_readiness == "unknown"
-    assert artifact.review_focus == []
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `python3.12 -m pytest tests/test_models.py::test_task_artifact_roundtrip -v`
-Expected: FAIL — TaskArtifact not defined
-
-- [ ] **Step 3: Add TaskArtifact dataclass to models.py**
-
-Add to `antfarm/core/models.py`:
-
-```python
 @dataclass
-class TaskArtifact:
-    """Structured output from a completed task attempt."""
+class FailureRecord:
     task_id: str
     attempt_id: str
     worker_id: str
-    branch: str
-    pr_url: str | None = None
+    failure_type: FailureType
+    message: str
+    retryable: bool
+    captured_at: str
+    stderr_summary: str
+    verification_snapshot: dict = field(default_factory=dict)
+    recommended_action: str = "kickback"
 
-    # What changed
-    files_changed: list[str] = field(default_factory=list)
-    lines_added: int = 0
-    lines_removed: int = 0
-
-    # What was verified
-    tests_run: bool = False
-    tests_passed: bool = False
-    test_output_summary: str = ""
-    lint_clean: bool = False
-
-    # Assessment (AI-generated fields — optional, filled by capable adapters)
-    summary: str = ""
-    risks: list[str] = field(default_factory=list)
-    merge_readiness: str = "unknown"  # "ready", "needs_review", "blocked", "unknown"
-    review_focus: list[str] = field(default_factory=list)
-
-    def to_dict(self) -> dict:
-        return {
-            "task_id": self.task_id,
-            "attempt_id": self.attempt_id,
-            "worker_id": self.worker_id,
-            "branch": self.branch,
-            "pr_url": self.pr_url,
-            "files_changed": self.files_changed,
-            "lines_added": self.lines_added,
-            "lines_removed": self.lines_removed,
-            "tests_run": self.tests_run,
-            "tests_passed": self.tests_passed,
-            "test_output_summary": self.test_output_summary,
-            "lint_clean": self.lint_clean,
-            "summary": self.summary,
-            "risks": list(self.risks),
-            "merge_readiness": self.merge_readiness,
-            "review_focus": list(self.review_focus),
-        }
-
+    def to_dict(self) -> dict: ...
     @classmethod
-    def from_dict(cls, data: dict) -> "TaskArtifact":
-        return cls(
-            task_id=data["task_id"],
-            attempt_id=data["attempt_id"],
-            worker_id=data["worker_id"],
-            branch=data["branch"],
-            pr_url=data.get("pr_url"),
-            files_changed=data.get("files_changed", []),
-            lines_added=data.get("lines_added", 0),
-            lines_removed=data.get("lines_removed", 0),
-            tests_run=data.get("tests_run", False),
-            tests_passed=data.get("tests_passed", False),
-            test_output_summary=data.get("test_output_summary", ""),
-            lint_clean=data.get("lint_clean", False),
-            summary=data.get("summary", ""),
-            risks=data.get("risks", []),
-            merge_readiness=data.get("merge_readiness", "unknown"),
-            review_focus=data.get("review_focus", []),
+    def from_dict(cls, data: dict) -> "FailureRecord": ...
+```
+
+Create `lifecycle.py`:
+
+```python
+# Legal task state transitions
+LEGAL_TASK_TRANSITIONS: dict[str, set[str]] = {
+    "queued": {"claimed", "blocked", "paused"},
+    "blocked": {"queued", "paused"},
+    "claimed": {"active"},
+    "active": {"harvest_pending", "paused"},
+    "harvest_pending": {"done", "failed"},
+    "done": {"merge_ready", "kicked_back"},
+    "kicked_back": {"queued"},
+    "merge_ready": {"merged"},
+    "merged": set(),  # terminal
+    "failed": {"queued"},  # retry path
+    "paused": {"queued", "active", "blocked"},
+}
+
+def validate_task_transition(from_state: str, to_state: str) -> bool:
+    """Return True if transition is legal, False otherwise."""
+    return to_state in LEGAL_TASK_TRANSITIONS.get(from_state, set())
+
+def assert_task_transition(from_state: str, to_state: str) -> None:
+    """Raise ValueError if transition is illegal."""
+    if not validate_task_transition(from_state, to_state):
+        raise ValueError(
+            f"Illegal task transition: {from_state} → {to_state}. "
+            f"Legal: {LEGAL_TASK_TRANSITIONS.get(from_state, set())}"
         )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+### Steps
 
-Run: `python3.12 -m pytest tests/test_models.py -k "artifact" -v`
-Expected: Both PASS
-
-- [ ] **Step 5: Add artifact collection to worker**
-
-Add to `antfarm/core/worker.py` a new method `_collect_artifact()`:
+- [ ] **Step 1: Write failing tests for new enums**
 
 ```python
-def _collect_artifact(self, task: dict, workspace: str, result: AgentResult) -> dict:
-    """Collect structured artifact from completed agent work.
+# tests/test_models.py additions
 
-    Gathers git diff stats and returns artifact dict.
-    AI-generated fields (summary, risks) are left empty — adapters fill these.
-    """
-    import subprocess as sp
+def test_task_state_values():
+    from antfarm.core.models import TaskState
+    assert TaskState.QUEUED.value == "queued"
+    assert TaskState.HARVEST_PENDING.value == "harvest_pending"
+    assert TaskState.MERGE_READY.value == "merge_ready"
+    assert isinstance(TaskState.QUEUED, str)
 
-    artifact = {
-        "task_id": task["id"],
-        "attempt_id": task["current_attempt"],
-        "worker_id": self.worker_id,
-        "branch": result.branch,
-        "pr_url": "",
-        "files_changed": [],
-        "lines_added": 0,
-        "lines_removed": 0,
-        "tests_run": False,
-        "tests_passed": result.returncode == 0,
-        "test_output_summary": "",
-        "lint_clean": False,
-        "summary": "",
-        "risks": [],
-        "merge_readiness": "ready" if result.returncode == 0 else "blocked",
-        "review_focus": [],
-    }
+def test_attempt_state_values():
+    from antfarm.core.models import AttemptState
+    assert AttemptState.STARTED.value == "started"
+    assert AttemptState.STALE.value == "stale"
 
-    # Collect git diff stats
-    try:
-        diff_stat = sp.run(
-            ["git", "diff", "--stat", "HEAD~1"],
-            cwd=workspace, capture_output=True, text=True, timeout=10,
-        )
-        if diff_stat.returncode == 0:
-            lines = diff_stat.stdout.strip().split("\n")
-            # Parse files from diff stat
-            for line in lines[:-1]:  # skip summary line
-                parts = line.strip().split("|")
-                if len(parts) >= 1:
-                    artifact["files_changed"].append(parts[0].strip())
+def test_failure_type_values():
+    from antfarm.core.models import FailureType
+    assert FailureType.AGENT_CRASH.value == "agent_crash"
+    assert FailureType.INVALID_TASK.value == "invalid_task"
 
-            # Parse +/- from summary line
-            if lines:
-                summary = lines[-1]
-                import re
-                added = re.search(r"(\d+) insertion", summary)
-                removed = re.search(r"(\d+) deletion", summary)
-                if added:
-                    artifact["lines_added"] = int(added.group(1))
-                if removed:
-                    artifact["lines_removed"] = int(removed.group(1))
-    except (sp.TimeoutExpired, Exception):
-        pass  # Best effort — don't fail harvest on stat collection
-
-    return artifact
-```
-
-Then modify `_process_one_task()` to call it and pass artifact to harvest:
-
-```python
-        # In the success path (after line 163):
-        artifact = self._collect_artifact(task, workspace, result)
-        try:
-            self.colony.harvest(
-                task_id, attempt_id, pr="", branch=result.branch,
-                artifact=artifact,
-            )
-```
-
-- [ ] **Step 6: Update mark_harvested in backend interface**
-
-Modify `antfarm/core/backends/base.py` — update mark_harvested signature:
-
-```python
-    @abstractmethod
-    def mark_harvested(
-        self, task_id: str, attempt_id: str, pr: str, branch: str,
-        artifact: dict | None = None,
-    ) -> None:
-        """Transition task to DONE, attempt to DONE. Optionally store artifact."""
-        ...
-```
-
-Modify `antfarm/core/backends/file.py` — store artifact on the attempt:
-
-```python
-    def mark_harvested(self, task_id, attempt_id, pr, branch, artifact=None):
-        # ... existing logic ...
-        # After setting attempt status to DONE:
-        if artifact:
-            attempt["artifact"] = artifact
-        # ... rest of method ...
-```
-
-- [ ] **Step 7: Update colony_client and serve.py**
-
-Modify `antfarm/core/colony_client.py` — add artifact to harvest():
-
-```python
-    def harvest(self, task_id, attempt_id, pr, branch, artifact=None):
-        payload = {"attempt_id": attempt_id, "pr": pr, "branch": branch}
-        if artifact:
-            payload["artifact"] = artifact
-        r = self._client.post(f"/tasks/{task_id}/harvest", json=payload)
-        r.raise_for_status()
-```
-
-Modify `antfarm/core/serve.py` — accept artifact in HarvestRequest:
-
-```python
-class HarvestRequest(BaseModel):
-    attempt_id: str
-    pr: str
-    branch: str
-    artifact: dict | None = None
-```
-
-And pass it through in the harvest endpoint handler.
-
-- [ ] **Step 8: Add artifact gating to Soldier**
-
-Modify `antfarm/core/soldier.py` — in `attempt_merge()`, before step 3 (git merge), check artifact:
-
-```python
-    def attempt_merge(self, task: dict) -> MergeResult:
-        # Check artifact if present
-        attempt = self._get_current_attempt(task)
-        if attempt:
-            artifact = attempt.get("artifact")
-            if artifact:
-                if artifact.get("merge_readiness") == "blocked":
-                    self.last_failure_reason = "Task artifact is marked as blocked"
-                    return MergeResult.FAILED
-                if artifact.get("tests_run") and not artifact.get("tests_passed"):
-                    self.last_failure_reason = "Task artifact shows tests failed"
-                    return MergeResult.FAILED
-
-        # ... rest of attempt_merge() unchanged ...
-```
-
-- [ ] **Step 9: Write soldier artifact gating test**
-
-Add to `tests/test_soldier.py`:
-
-```python
-def test_soldier_skips_merge_when_artifact_blocked(soldier_env):
-    """Soldier should not merge tasks with merge_readiness=blocked."""
-    soldier, cc, repo_path, origin_path = soldier_env
-
-    # Carry, forage, create branch, harvest with blocked artifact
-    cc._client.post("/nodes", json={"node_id": "n1"})
-    cc.register_worker("n1/w1", "n1", "generic", "/tmp")
-    cc._client.post("/tasks", json={
-        "id": "task-blocked", "title": "Blocked task", "spec": "x",
-    })
-    task = cc.forage("n1/w1")
-
-    # Create a commit on the branch
-    _commit_file(repo_path, "blocked.txt", "blocked", "add blocked file")
-    _git(["push", "origin", "HEAD"], repo_path)
-
-    # Harvest with blocked artifact
-    cc.harvest(
-        "task-blocked", task["current_attempt"],
-        pr="", branch=f"feat/task-blocked-{task['current_attempt']}",
-        artifact={"merge_readiness": "blocked", "tests_passed": False},
+def test_failure_record_roundtrip():
+    from antfarm.core.models import FailureRecord, FailureType
+    rec = FailureRecord(
+        task_id="task-001", attempt_id="att-001", worker_id="w1",
+        failure_type=FailureType.TEST_FAILURE,
+        message="test_auth failed", retryable=False,
+        captured_at="2026-04-05T10:00:00Z",
+        stderr_summary="AssertionError: expected 200 got 401",
+        recommended_action="kickback",
     )
-
-    results = soldier.run_once()
-    # Should be kicked back, not merged
-    assert len(results) == 1
-    assert results[0][1] == MergeResult.FAILED
+    d = rec.to_dict()
+    restored = FailureRecord.from_dict(d)
+    assert restored.failure_type == FailureType.TEST_FAILURE
+    assert restored.retryable is False
 ```
 
-- [ ] **Step 10: Run full test suite**
+- [ ] **Step 2: Run tests — verify they fail**
+
+Run: `python3.12 -m pytest tests/test_models.py -k "task_state or attempt_state or failure" -v`
+
+- [ ] **Step 3: Implement new enums and FailureRecord in models.py**
+
+- [ ] **Step 4: Write failing tests for lifecycle transitions**
+
+```python
+# tests/test_lifecycle.py
+
+from antfarm.core.lifecycle import validate_task_transition, assert_task_transition
+import pytest
+
+def test_legal_transition_queued_to_claimed():
+    assert validate_task_transition("queued", "claimed") is True
+
+def test_legal_transition_active_to_harvest_pending():
+    assert validate_task_transition("active", "harvest_pending") is True
+
+def test_illegal_transition_active_to_merged():
+    assert validate_task_transition("active", "merged") is False
+
+def test_illegal_transition_queued_to_done():
+    assert validate_task_transition("queued", "done") is False
+
+def test_illegal_transition_failed_to_merged():
+    assert validate_task_transition("failed", "merged") is False
+
+def test_assert_raises_on_illegal():
+    with pytest.raises(ValueError, match="Illegal task transition"):
+        assert_task_transition("active", "merged")
+
+def test_assert_passes_on_legal():
+    assert_task_transition("queued", "claimed")  # should not raise
+
+def test_terminal_state_merged_has_no_transitions():
+    assert validate_task_transition("merged", "queued") is False
+    assert validate_task_transition("merged", "active") is False
+```
+
+- [ ] **Step 5: Run tests — verify they fail**
+
+- [ ] **Step 6: Implement lifecycle.py**
+
+- [ ] **Step 7: Run all tests — verify pass**
 
 Run: `python3.12 -m pytest tests/ -x -q --ignore=tests/test_redis_backend.py`
-Expected: All pass
 
-- [ ] **Step 11: Run lint**
-
-Run: `python3.12 -m ruff check .`
-Expected: Clean
-
-- [ ] **Step 12: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add antfarm/core/models.py antfarm/core/worker.py antfarm/core/backends/base.py \
-    antfarm/core/backends/file.py antfarm/core/colony_client.py antfarm/core/serve.py \
-    antfarm/core/soldier.py tests/test_models.py tests/test_worker.py tests/test_soldier.py
-git commit -m "feat(core): add structured task output with TaskArtifact #77
-
-Workers now collect git diff stats after agent completion and build a
-TaskArtifact with: files_changed, lines_added/removed, tests_passed,
-merge_readiness.
-
-Soldier gates merge on artifact: skips tasks with merge_readiness=blocked
-or tests_passed=False.
-
-AI-generated fields (summary, risks, review_focus) are left empty in v0.5
-— adapters can fill these."
+git add antfarm/core/models.py antfarm/core/lifecycle.py tests/test_models.py tests/test_lifecycle.py
+git commit -m "feat(models): add TaskState, AttemptState, FailureType, FailureRecord, lifecycle transitions"
 ```
 
 ---
 
-## Task 4: Final Integration + Tag
+## PR 2: Lifecycle Enforcement
 
-- [ ] **Step 1: Run full test suite one final time**
+**Issue:** Alpha.1: Enforce explicit task/attempt lifecycle in backends and worker
 
-Run: `python3.12 -m pytest tests/ -x -q --ignore=tests/test_redis_backend.py`
-Expected: All pass
+**Files:**
+- Modify: `antfarm/core/backends/base.py`
+- Modify: `antfarm/core/backends/file.py`
+- Modify: `antfarm/core/worker.py`
+- Modify: `tests/test_file_backend.py`
+- Modify: `tests/test_worker.py`
 
-- [ ] **Step 2: Update CHANGELOG**
+### What changes
 
-Add v0.5.0-alpha.1 section to CHANGELOG.md.
+- FileBackend state mutations call `assert_task_transition()` before moving files
+- Worker sets HARVEST_PENDING before writing artifact/failure
+- Worker death → attempt becomes STALE (not silently DONE)
+- If harvest write fails, task stays HARVEST_PENDING (surfaced by inbox later)
+- Backward compatibility: existing "ready"/"active"/"done" map to new states
 
-- [ ] **Step 3: Bump version**
+### Steps
 
-Update pyproject.toml to `version = "0.5.0a1"`.
+- [ ] **Step 1: Write failing test — worker crash before harvest = STALE**
 
-- [ ] **Step 4: Commit and tag**
+```python
+# tests/test_worker.py addition
+
+def test_worker_crash_before_harvest_marks_stale(backend, ...):
+    """If worker dies mid-task, attempt becomes STALE, not DONE."""
+    # Carry + forage task
+    # Simulate worker crash (don't call harvest)
+    # Run doctor stale recovery
+    # Verify attempt status is STALE, not DONE
+    # Verify task is re-queued (QUEUED or equivalent)
+```
+
+- [ ] **Step 2: Write failing test — illegal transition rejected**
+
+```python
+# tests/test_file_backend.py addition
+
+def test_illegal_transition_raises(backend):
+    """Backend rejects illegal state transitions."""
+    backend.carry(_make_task("task-001"))
+    # Try to mark_merged on a READY task (skipping ACTIVE, DONE, MERGE_READY)
+    with pytest.raises(ValueError, match="Illegal"):
+        backend.mark_merged("task-001", "nonexistent-attempt")
+```
+
+- [ ] **Step 3: Run tests — verify they fail**
+
+- [ ] **Step 4: Add lifecycle enforcement to FileBackend**
+
+In each state-mutating method (pull, mark_harvested, kickback, mark_merged, pause_task, etc.), add:
+```python
+from antfarm.core.lifecycle import assert_task_transition
+assert_task_transition(current_status, new_status)
+```
+
+- [ ] **Step 5: Add HARVEST_PENDING to worker**
+
+In `_process_one_task()`, after agent finishes but before writing artifact:
+```python
+# Set task to HARVEST_PENDING
+self.colony.trail(task_id, self.worker_id, "[lifecycle] agent finished, writing result")
+```
+
+- [ ] **Step 6: Run all tests — verify pass**
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add CHANGELOG.md pyproject.toml
-git commit -m "chore: bump version to 0.5.0-alpha.1"
+git commit -m "feat(core): enforce task/attempt lifecycle transitions in backends and worker"
+```
+
+---
+
+## PR 3: Canonical Scheduler Refactor
+
+**Issue:** Alpha.1: Remove inline scheduling from FileBackend.pull() (#72)
+
+**Files:**
+- Modify: `antfarm/core/scheduler.py`
+- Modify: `antfarm/core/backends/file.py`
+- Create: `tests/test_scheduler_integration.py`
+
+### What changes
+
+- Remove all inline scheduling logic from `file.py` pull() (lines ~195-222)
+- pull() reads ready tasks, active tasks, worker info, then calls `scheduler.select_task()`
+- scheduler.select_task() is the ONLY place that decides task eligibility
+- Active tasks loaded and passed to scheduler for scope preference
+
+### Steps
+
+- [ ] **Step 1: Write failing integration test**
+
+```python
+# tests/test_scheduler_integration.py
+
+def test_pull_delegates_to_scheduler(backend):
+    """pull() must call scheduler.select_task() — not use inline logic."""
+    backend.carry(_make_task("task-001", touches=["api"]))
+    backend.carry(_make_task("task-002", touches=["frontend"]))
+    backend.register_worker({"worker_id": "w1", "node_id": "n1", "agent_type": "generic", "workspace_root": "/tmp", "capabilities": []})
+
+    with patch("antfarm.core.backends.file.select_task") as mock:
+        mock.return_value = None
+        backend.pull("w1")
+        mock.assert_called_once()
+
+def test_pull_passes_active_tasks_to_scheduler(backend):
+    """Scope preference requires active tasks in scheduler input."""
+    backend.carry(_make_task("task-001", touches=["api"]))
+    backend.carry(_make_task("task-002", touches=["api"]))
+    backend.carry(_make_task("task-003", touches=["frontend"]))
+    backend.register_worker({"worker_id": "w1", ...})
+    backend.register_worker({"worker_id": "w2", ...})
+
+    backend.pull("w1")  # claims task-001 (api), now active
+    result = backend.pull("w2")  # should prefer task-003 (frontend) via scope preference
+    assert result["id"] == "task-003"
+
+def test_pull_scope_preference_works(backend):
+    """Two tasks with different touches — second pull prefers non-overlapping."""
+    backend.carry(_make_task("task-api", touches=["api"]))
+    backend.carry(_make_task("task-ui", touches=["frontend"]))
+    backend.register_worker({"worker_id": "w1", ...})
+    backend.register_worker({"worker_id": "w2", ...})
+
+    r1 = backend.pull("w1")
+    r2 = backend.pull("w2")
+    assert set(r1["touches"]) != set(r2["touches"])
+```
+
+- [ ] **Step 2: Run tests — verify they fail**
+
+- [ ] **Step 3: Refactor FileBackend.pull()**
+
+Replace inline scheduling with:
+```python
+from antfarm.core.scheduler import select_task
+
+# In pull():
+# 1. Read ready tasks as Task objects
+# 2. Collect done_task_ids
+# 3. Collect active tasks (NEW — currently never loaded)
+# 4. Read worker capabilities + rate limit
+# 5. Call select_task(candidates, done_task_ids, active_tasks, worker_capabilities, worker_id)
+# 6. If None, return None
+# 7. Create attempt, move file (unchanged)
+```
+
+- [ ] **Step 4: Run integration tests — verify pass**
+
+- [ ] **Step 5: Run full suite**
+
+Run: `python3.12 -m pytest tests/ -x -q --ignore=tests/test_redis_backend.py`
+
+- [ ] **Step 6: Commit**
+
+```bash
+git commit -m "refactor(scheduler): remove inline scheduling from FileBackend.pull() #72
+
+pull() now delegates to scheduler.select_task(). Active tasks loaded
+and passed for scope preference. Single source of truth."
+```
+
+---
+
+## PR 4: Failure Classification + Retry Behavior
+
+**Issue:** Alpha.1: Implement failure taxonomy with retry policy (#83)
+
+**Files:**
+- Modify: `antfarm/core/worker.py`
+- Modify: `antfarm/core/soldier.py`
+- Modify: `tests/test_worker.py`
+
+### What changes
+
+- `classify_failure()` function in worker.py
+- Worker writes FailureRecord on failure (not just trail message)
+- Default retry policy: INFRA retries, TEST kicks back, INVALID escalates
+- Repeated AGENT_CRASH stops after N retries
+
+### Steps
+
+- [ ] **Step 1: Write failing tests for classify_failure**
+
+```python
+def test_classify_failure_agent_crash():
+    from antfarm.core.worker import classify_failure
+    from antfarm.core.models import FailureType
+    result = classify_failure(returncode=1, stderr="Segmentation fault", stdout="")
+    assert result == FailureType.AGENT_CRASH
+
+def test_classify_failure_test_failure():
+    result = classify_failure(returncode=1, stderr="", stdout="FAILED tests/test_foo.py")
+    assert result == FailureType.TEST_FAILURE
+
+def test_classify_failure_lint_failure():
+    result = classify_failure(returncode=1, stderr="", stdout="ruff check failed")
+    assert result == FailureType.LINT_FAILURE
+
+def test_classify_failure_timeout():
+    result = classify_failure(returncode=-9, stderr="", stdout="")
+    assert result == FailureType.AGENT_TIMEOUT
+
+def test_classify_failure_infra():
+    result = classify_failure(returncode=1, stderr="connection refused", stdout="")
+    assert result == FailureType.INFRA_FAILURE
+```
+
+- [ ] **Step 2: Run tests — verify they fail**
+
+- [ ] **Step 3: Implement classify_failure()**
+
+```python
+def classify_failure(returncode: int, stderr: str, stdout: str) -> FailureType:
+    combined = (stderr + stdout).lower()
+    if returncode in (-9, -15) or "timeout" in combined:
+        return FailureType.AGENT_TIMEOUT
+    test_markers = ["failed", "error", "assert", "pytest", "test_"]
+    if any(m in combined for m in test_markers) and "test" in combined:
+        return FailureType.TEST_FAILURE
+    lint_markers = ["ruff", "flake8", "pylint", "mypy", "lint"]
+    if any(m in combined for m in lint_markers):
+        return FailureType.LINT_FAILURE
+    build_markers = ["build failed", "pip install", "modulenotfounderror"]
+    if any(m in combined for m in build_markers):
+        return FailureType.BUILD_FAILURE
+    infra_markers = ["permission denied", "disk full", "connection refused", "network"]
+    if any(m in combined for m in infra_markers):
+        return FailureType.INFRA_FAILURE
+    return FailureType.AGENT_CRASH
+```
+
+- [ ] **Step 4: Write failing test for retry policy**
+
+```python
+def test_infra_failure_is_retryable():
+    from antfarm.core.worker import get_retry_policy
+    from antfarm.core.models import FailureType
+    policy = get_retry_policy(FailureType.INFRA_FAILURE)
+    assert policy["retryable"] is True
+    assert policy["max_retries"] > 0
+
+def test_test_failure_not_retryable():
+    policy = get_retry_policy(FailureType.TEST_FAILURE)
+    assert policy["retryable"] is False
+    assert policy["action"] == "kickback"
+
+def test_invalid_task_escalates():
+    policy = get_retry_policy(FailureType.INVALID_TASK)
+    assert policy["retryable"] is False
+    assert policy["action"] == "escalate"
+```
+
+- [ ] **Step 5: Implement get_retry_policy()**
+
+```python
+RETRY_POLICIES = {
+    FailureType.INFRA_FAILURE: {"retryable": True, "max_retries": 3, "action": "retry"},
+    FailureType.AGENT_CRASH: {"retryable": True, "max_retries": 2, "action": "retry"},
+    FailureType.AGENT_TIMEOUT: {"retryable": True, "max_retries": 1, "action": "retry"},
+    FailureType.TEST_FAILURE: {"retryable": False, "max_retries": 0, "action": "kickback"},
+    FailureType.LINT_FAILURE: {"retryable": False, "max_retries": 0, "action": "kickback"},
+    FailureType.BUILD_FAILURE: {"retryable": True, "max_retries": 1, "action": "retry"},
+    FailureType.MERGE_CONFLICT: {"retryable": True, "max_retries": 1, "action": "retry"},
+    FailureType.INVALID_TASK: {"retryable": False, "max_retries": 0, "action": "escalate"},
+}
+
+def get_retry_policy(failure_type: FailureType) -> dict:
+    return RETRY_POLICIES.get(failure_type, {"retryable": False, "max_retries": 0, "action": "kickback"})
+```
+
+- [ ] **Step 6: Wire into _process_one_task() and soldier**
+
+Worker: on failure, classify → build FailureRecord → check retry policy → retry or trail failure
+Soldier: on kickback, include failure_type in trail message
+
+- [ ] **Step 7: Run full suite**
+
+- [ ] **Step 8: Commit**
+
+```bash
+git commit -m "feat(core): add failure taxonomy with classify_failure() and retry policy #83"
+```
+
+---
+
+## PR 5: Initial Operator Inbox
+
+**Issue:** Alpha.1: Add inbox surfacing for stale/blocked/failed work (#81 partial)
+
+**Files:**
+- Modify: `antfarm/core/tui.py`
+- Modify: `antfarm/core/cli.py`
+- Create: `tests/test_inbox.py`
+
+### What changes
+
+- New inbox panel in TUI showing actionable items
+- `antfarm inbox` standalone CLI command
+- Each item explains: what happened, why, what to do
+
+### Steps
+
+- [ ] **Step 1: Write failing test for inbox data collection**
+
+```python
+# tests/test_inbox.py
+
+def test_inbox_finds_stale_workers(backend):
+    """Workers with expired heartbeat appear in inbox."""
+    # Register worker, backdate heartbeat
+    # Collect inbox items
+    # Assert stale worker appears with explanation
+
+def test_inbox_finds_blocked_tasks(backend):
+    """Tasks blocked by unmet deps appear in inbox."""
+    # Carry task with depends_on=["nonexistent"]
+    # Collect inbox items
+    # Assert blocked task appears with blocking dep
+
+def test_inbox_finds_failed_tasks(backend):
+    """Tasks with FailureRecord appear in inbox."""
+    # Carry, pull, fail with FailureRecord
+    # Collect inbox items
+    # Assert failed task appears with failure type
+
+def test_inbox_empty_when_healthy(backend):
+    """No inbox items when everything is healthy."""
+    # Carry and pull a task (normal state)
+    # Collect inbox items
+    # Assert empty
+```
+
+- [ ] **Step 2: Run tests — verify they fail**
+
+- [ ] **Step 3: Implement inbox data collector**
+
+```python
+# In tui.py or a new inbox.py
+
+def collect_inbox_items(status: dict, tasks: list, workers: list) -> list[dict]:
+    """Collect actionable items from colony state."""
+    items = []
+    # Stale workers (heartbeat > TTL)
+    # Blocked tasks (deps not met)
+    # Failed tasks (has FailureRecord)
+    # Long-running active tasks (duration > threshold)
+    # Kicked-back tasks
+    # Tasks with signals
+    return items
+```
+
+- [ ] **Step 4: Add inbox panel to TUI**
+
+New panel in `_build_display()` showing inbox items with color coding:
+- Red: failed, stale
+- Yellow: blocked, long-running
+- Blue: kicked-back, needs review
+
+- [ ] **Step 5: Add `antfarm inbox` CLI command**
+
+```python
+@main.command()
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def inbox(colony_url, token):
+    """Show items needing operator attention."""
+    data = _get(colony_url, "/status/full", token=token)
+    items = collect_inbox_items(data["status"], data["tasks"], data["workers"])
+    if not items:
+        click.echo("Inbox empty — everything healthy.")
+        return
+    for item in items:
+        click.echo(f"[{item['severity']}] {item['type']}: {item['message']}")
+        click.echo(f"  → {item['action']}")
+```
+
+- [ ] **Step 6: Run full suite**
+
+- [ ] **Step 7: Commit**
+
+```bash
+git commit -m "feat(cli): add operator inbox for stale/blocked/failed work #81"
+```
+
+---
+
+## PR 6: Integration + Tag
+
+- [ ] **Step 1: Run full test suite**
+
+Run: `python3.12 -m pytest tests/ -x -q --ignore=tests/test_redis_backend.py`
+
+- [ ] **Step 2: Dogfood test**
+
+Start colony, carry 3 tasks, run 2 workers. Verify:
+- Scheduler is singular (scope preference works)
+- Kill one worker mid-task → attempt becomes STALE
+- Doctor recovers stale task
+- Inbox shows stale worker + recovered task
+- Failed agent produces classified FailureRecord
+
+- [ ] **Step 3: Update CHANGELOG**
+
+- [ ] **Step 4: Bump version to 0.5.0a1**
+
+- [ ] **Step 5: Commit, tag, push**
+
+```bash
 git tag v0.5.0a1
 git push origin main --tags
 ```
 
-- [ ] **Step 5: Sync mini-1**
+- [ ] **Step 6: Sync mini-1**
 
 ```bash
-ssh mini-1 "export PATH=/opt/homebrew/bin:\$PATH && cd ~/projects/antfarm && git pull origin main"
+ssh mini-1 "cd ~/projects/antfarm && git pull origin main"
 ```
+
+---
+
+## Definition of Done
+
+Alpha.1 is done when:
+
+- [ ] Scheduler is singular — no backend-specific selection logic remains
+- [ ] Lifecycle states exist and are enforced — illegal transitions raise ValueError
+- [ ] Every failed attempt produces a classified FailureRecord
+- [ ] Retry policy is applied — INFRA retries, TEST kicks back, INVALID escalates
+- [ ] Stale recovery works — worker death → STALE attempt → re-queued task
+- [ ] Inbox explains blocked / stale / failed states with recommended actions
+- [ ] Dogfooding on antfarm repo with 2-3 workers passes
+- [ ] All tests pass, ruff clean
