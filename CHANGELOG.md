@@ -6,6 +6,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-05
+
+### Added
+- TUI dashboard with `rich` library (`antfarm scout --tui`) — 4-panel live display with color-coded tasks, workers, and merge queue
+- Colony failover with periodic rsync backup (`antfarm backup now/restore/status`, `colony --backup-dest`)
+- Rate limit awareness — workers report cooldown via heartbeat, scheduler skips rate-limited workers
+- Pin command — pin tasks to specific workers (`antfarm pin/unpin`)
+- Override-order command — override merge queue position (`antfarm override-order`)
+- `GET /status/full` endpoint — combined status + tasks + workers in one call
+- `GET /workers` endpoint — list all workers with rate limit status
+- `antfarm workers` CLI command
+
+### Changed
+- `rich>=13.0` added as core dependency
+- Heartbeat accepts optional rate limit fields (remaining, reset_at, cooldown_until)
+- Scheduler filters by worker capabilities AND pin assignment AND rate limit cooldown
+
 ## [0.2.0] - 2026-04-05
 
 ### Added
