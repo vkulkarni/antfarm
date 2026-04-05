@@ -85,7 +85,8 @@ class FileBackend(TaskBackend):
         return self._root / "tasks" / "done" / f"{task_id}.json"
 
     def _worker_path(self, worker_id: str) -> Path:
-        return self._root / "workers" / f"{worker_id}.json"
+        safe = worker_id.replace("/", "%2F")
+        return self._root / "workers" / f"{safe}.json"
 
     def _node_path(self, node_id: str) -> Path:
         return self._root / "nodes" / f"{node_id}.json"
