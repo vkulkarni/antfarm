@@ -2,10 +2,14 @@
 
 from antfarm.core.models import (
     Attempt,
+    AttemptState,
     AttemptStatus,
+    FailureRecord,
+    FailureType,
     Node,
     SignalEntry,
     Task,
+    TaskState,
     TaskStatus,
     TrailEntry,
     Worker,
@@ -238,3 +242,88 @@ def test_attempt_merged_status_roundtrip():
     )
     assert Attempt.from_dict(attempt.to_dict()) == attempt
     assert attempt.to_dict()["status"] == "merged"
+
+
+# ---------------------------------------------------------------------------
+# v0.5 enriched types
+# ---------------------------------------------------------------------------
+
+
+def test_task_state_values():
+    assert TaskState.QUEUED.value == "queued"
+    assert TaskState.HARVEST_PENDING.value == "harvest_pending"
+    assert TaskState.MERGE_READY.value == "merge_ready"
+    assert TaskState.KICKED_BACK.value == "kicked_back"
+    assert isinstance(TaskState.QUEUED, str)
+
+
+def test_attempt_state_values():
+    assert AttemptState.STARTED.value == "started"
+    assert AttemptState.HEARTBEATING.value == "heartbeating"
+    assert AttemptState.STALE.value == "stale"
+    assert AttemptState.ABANDONED.value == "abandoned"
+    assert isinstance(AttemptState.STARTED, str)
+
+
+def test_failure_type_values():
+    assert FailureType.AGENT_CRASH.value == "agent_crash"
+    assert FailureType.INVALID_TASK.value == "invalid_task"
+    assert FailureType.TEST_FAILURE.value == "test_failure"
+    assert isinstance(FailureType.AGENT_CRASH, str)
+
+
+def test_failure_record_roundtrip():
+    rec = FailureRecord(
+        task_id="task-001",
+        attempt_id="att-001",
+        worker_id="w1",
+        failure_type=FailureType.TEST_FAILURE,
+        message="test_auth failed",
+        retryable=False,
+        captured_at="2026-04-05T10:00:00Z",
+        stderr_summary="AssertionError: expected 200 got 401",
+        recommended_action="kickback",
+    )
+    d = rec.to_dict()
+    assert d["failure_type"] == "test_failure"
+    assert d["retryable"] is False
+
+    restored = FailureRecord.from_dict(d)
+    assert restored.failure_type == FailureType.TEST_FAILURE
+    assert restored.retryable is False
+    assert restored.message == "test_auth failed"
+    assert restored == rec
+
+
+def test_failure_record_with_verification_snapshot():
+    rec = FailureRecord(
+        task_id="task-002",
+        attempt_id="att-002",
+        worker_id="w2",
+        failure_type=FailureType.INFRA_FAILURE,
+        message="connection refused",
+        retryable=True,
+        captured_at="2026-04-05T10:00:00Z",
+        stderr_summary="ConnectionRefusedError",
+        verification_snapshot={"tests_ran": False, "lint_ran": False},
+        recommended_action="retry",
+    )
+    d = rec.to_dict()
+    restored = FailureRecord.from_dict(d)
+    assert restored.verification_snapshot == {"tests_ran": False, "lint_ran": False}
+    assert restored.recommended_action == "retry"
+
+
+def test_failure_record_defaults():
+    rec = FailureRecord(
+        task_id="t1",
+        attempt_id="a1",
+        worker_id="w1",
+        failure_type=FailureType.AGENT_CRASH,
+        message="crashed",
+        retryable=True,
+        captured_at="2026-04-05T10:00:00Z",
+        stderr_summary="Segfault",
+    )
+    assert rec.verification_snapshot == {}
+    assert rec.recommended_action == "kickback"

@@ -39,6 +39,60 @@ class WorkerStatus(StrEnum):
 
 
 # ---------------------------------------------------------------------------
+# v0.5 enriched lifecycle states
+# ---------------------------------------------------------------------------
+
+
+class TaskState(StrEnum):
+    """Enriched task lifecycle states (v0.5).
+
+    Maps to filesystem directories:
+    - QUEUED, KICKED_BACK → ready/
+    - BLOCKED → blocked/
+    - CLAIMED, ACTIVE, HARVEST_PENDING → active/
+    - DONE, MERGE_READY, MERGED, FAILED → done/
+    - PAUSED → paused/
+    """
+
+    QUEUED = "queued"
+    BLOCKED = "blocked"
+    CLAIMED = "claimed"
+    ACTIVE = "active"
+    HARVEST_PENDING = "harvest_pending"
+    DONE = "done"
+    KICKED_BACK = "kicked_back"
+    MERGE_READY = "merge_ready"
+    MERGED = "merged"
+    FAILED = "failed"
+    PAUSED = "paused"
+
+
+class AttemptState(StrEnum):
+    """Enriched attempt lifecycle states (v0.5)."""
+
+    STARTED = "started"
+    HEARTBEATING = "heartbeating"
+    AGENT_SUCCEEDED = "agent_succeeded"
+    AGENT_FAILED = "agent_failed"
+    HARVESTED = "harvested"
+    STALE = "stale"
+    ABANDONED = "abandoned"
+
+
+class FailureType(StrEnum):
+    """Classified failure types for structured failure records."""
+
+    AGENT_CRASH = "agent_crash"
+    AGENT_TIMEOUT = "agent_timeout"
+    TEST_FAILURE = "test_failure"
+    LINT_FAILURE = "lint_failure"
+    MERGE_CONFLICT = "merge_conflict"
+    BUILD_FAILURE = "build_failure"
+    INFRA_FAILURE = "infra_failure"
+    INVALID_TASK = "invalid_task"
+
+
+# ---------------------------------------------------------------------------
 # Simple entry types
 # ---------------------------------------------------------------------------
 
@@ -84,6 +138,56 @@ class SignalEntry:
             ts=data["ts"],
             worker_id=data["worker_id"],
             message=data["message"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# FailureRecord
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FailureRecord:
+    """Structured failure record for classified attempt failures (v0.5)."""
+
+    task_id: str
+    attempt_id: str
+    worker_id: str
+    failure_type: FailureType
+    message: str
+    retryable: bool
+    captured_at: str
+    stderr_summary: str
+    verification_snapshot: dict = field(default_factory=dict)
+    recommended_action: str = "kickback"
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id,
+            "worker_id": self.worker_id,
+            "failure_type": self.failure_type.value,
+            "message": self.message,
+            "retryable": self.retryable,
+            "captured_at": self.captured_at,
+            "stderr_summary": self.stderr_summary,
+            "verification_snapshot": dict(self.verification_snapshot),
+            "recommended_action": self.recommended_action,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> FailureRecord:
+        return cls(
+            task_id=data["task_id"],
+            attempt_id=data["attempt_id"],
+            worker_id=data["worker_id"],
+            failure_type=FailureType(data["failure_type"]),
+            message=data["message"],
+            retryable=data["retryable"],
+            captured_at=data["captured_at"],
+            stderr_summary=data["stderr_summary"],
+            verification_snapshot=data.get("verification_snapshot", {}),
+            recommended_action=data.get("recommended_action", "kickback"),
         )
 
 
