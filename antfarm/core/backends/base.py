@@ -158,6 +158,56 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
+    def pin_task(self, task_id: str, worker_id: str) -> None:
+        """Pin a ready task to a specific worker.
+
+        Args:
+            task_id: ID of the task to pin.
+            worker_id: Worker ID the task is pinned to.
+
+        Raises:
+            FileNotFoundError: If the task is not found in ready/.
+        """
+        ...
+
+    @abstractmethod
+    def unpin_task(self, task_id: str) -> None:
+        """Clear the pin on a ready task.
+
+        Args:
+            task_id: ID of the task to unpin.
+
+        Raises:
+            FileNotFoundError: If the task is not found in ready/.
+        """
+        ...
+
+    @abstractmethod
+    def override_merge_order(self, task_id: str, position: int) -> None:
+        """Set merge queue position override on a done task.
+
+        Args:
+            task_id: ID of the task to override.
+            position: Override position (lower = merges sooner, before non-overridden tasks).
+
+        Raises:
+            FileNotFoundError: If the task is not found in done/.
+        """
+        ...
+
+    @abstractmethod
+    def clear_merge_override(self, task_id: str) -> None:
+        """Clear merge queue position override on a done task.
+
+        Args:
+            task_id: ID of the task to clear override for.
+
+        Raises:
+            FileNotFoundError: If the task is not found in done/.
+        """
+        ...
+
+    @abstractmethod
     def unblock_task(self, task_id: str) -> None:
         """Unblock a blocked task. Moves task back to READY state.
 

@@ -13,15 +13,17 @@ def select_task(
     done_task_ids: set[str],
     active_tasks: list[Task],
     worker_capabilities: set[str] | None = None,
+    worker_id: str | None = None,
 ) -> Task | None:
     """Select next task using v0.1 scheduling policy.
 
     Policy (applied in order):
     1. Dependency check — skip if depends_on not all in done_task_ids
     2. Capability check — skip if capabilities_required not a subset of worker_capabilities
-    3. Scope preference — prefer non-overlapping touches with active tasks
-    4. Priority — lower number = higher priority
-    5. FIFO — oldest created_at first among equals
+    3. Pin check — skip if pinned_to is set and does not match worker_id
+    4. Scope preference — prefer non-overlapping touches with active tasks
+    5. Priority — lower number = higher priority
+    6. FIFO — oldest created_at first among equals
 
     Args:
         ready_tasks: Tasks with status READY that are candidates for scheduling.
@@ -29,6 +31,7 @@ def select_task(
         active_tasks: Tasks currently being executed by workers.
         worker_capabilities: Set of capabilities the worker has. If None, capability
             filtering is skipped (backward compatible).
+        worker_id: ID of the worker pulling tasks. If None, pin filtering is skipped.
 
     Returns:
         The selected Task, or None if no eligible task exists.
@@ -44,6 +47,13 @@ def select_task(
         eligible = [
             t for t in eligible
             if set(t.capabilities_required).issubset(worker_capabilities)
+        ]
+
+    # Step 3: Filter by pin — skip tasks pinned to a different worker
+    if worker_id is not None:
+        eligible = [
+            t for t in eligible
+            if t.pinned_to is None or t.pinned_to == worker_id
         ]
 
     if not eligible:

@@ -93,7 +93,25 @@ def main():
     envvar="ANTFARM_AUTH_TOKEN",
     help="Shared secret for bearer token auth. Enables auth on all endpoints except GET /status.",
 )
-def colony(port: int, host: str, data_dir: str, auth_token: str | None):
+@click.option(
+    "--backup-dest",
+    default=None,
+    help="rsync/scp backup destination (e.g. user@host:/path). Enables periodic backup.",
+)
+@click.option(
+    "--backup-interval",
+    default=300,
+    show_default=True,
+    help="Seconds between periodic backups (requires --backup-dest).",
+)
+def colony(
+    port: int,
+    host: str,
+    data_dir: str,
+    auth_token: str | None,
+    backup_dest: str | None,
+    backup_interval: int,
+):
     """Start the colony server."""
     import uvicorn
 
@@ -106,7 +124,95 @@ def colony(port: int, host: str, data_dir: str, auth_token: str | None):
         from antfarm.core.auth import generate_token
 
         click.echo(f"Auth enabled. Bearer token: {generate_token(auth_token)}")
+
+    if backup_dest:
+        from antfarm.core.failover import FailoverConfig, start_failover_daemon
+
+        config = FailoverConfig(backup_dest=backup_dest, interval_seconds=backup_interval)
+        start_failover_daemon(data_dir, config)
+        click.echo(
+            f"Failover enabled: backing up to {backup_dest} every {backup_interval}s"
+        )
+
     uvicorn.run(app, host=host, port=port)
+
+
+# ---------------------------------------------------------------------------
+# backup
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def backup():
+    """Backup and restore commands for colony data."""
+
+
+@backup.command("now")
+@click.option("--dest", required=True, help="rsync/scp destination (e.g. user@host:/path).")
+@click.option("--data-dir", default=".antfarm", show_default=True, help="Data directory.")
+@click.option(
+    "--method",
+    default="rsync",
+    show_default=True,
+    type=click.Choice(["rsync", "scp"]),
+    help="Transfer method.",
+)
+def backup_now(dest: str, data_dir: str, method: str):
+    """Run a one-shot backup of the colony data directory."""
+    from antfarm.core.failover import FailoverConfig, run_backup
+
+    config = FailoverConfig(backup_dest=dest, method=method)
+    click.echo(f"Backing up {data_dir} to {dest} via {method}...")
+    result = run_backup(data_dir, config)
+    if result.success:
+        click.echo(f"Backup succeeded at {result.timestamp}")
+        if result.bytes_transferred:
+            click.echo(f"Bytes transferred: {result.bytes_transferred}")
+    else:
+        click.echo(f"Backup failed: {result.message}", err=True)
+        raise SystemExit(1)
+
+
+@backup.command("restore")
+@click.option("--source", required=True, help="rsync source (e.g. user@host:/path).")
+@click.option("--data-dir", default=".antfarm", show_default=True, help="Data directory.")
+def backup_restore(source: str, data_dir: str):
+    """Restore colony data from a backup source."""
+    from antfarm.core.failover import restore_from_backup
+
+    click.echo(f"Restoring {data_dir} from {source}...")
+    ok = restore_from_backup(source, data_dir)
+    if ok:
+        click.echo("Restore succeeded.")
+    else:
+        click.echo("Restore failed.", err=True)
+        raise SystemExit(1)
+
+
+@backup.command("status")
+@click.option("--data-dir", default=".antfarm", show_default=True, help="Data directory.")
+def backup_status(data_dir: str):
+    """Show the last backup result from backup_status.json."""
+    import os
+
+    status_path = os.path.join(data_dir, "backup_status.json")
+    if not os.path.exists(status_path):
+        click.echo("No backup status found. Run 'antfarm backup now' first.")
+        return
+
+    with open(status_path) as f:
+        status = json.load(f)
+
+    ok = status.get("success", False)
+    ts = status.get("timestamp", "unknown")
+    msg = status.get("message", "")
+    transferred = status.get("bytes_transferred", 0)
+
+    icon = "OK" if ok else "FAIL"
+    click.echo(f"[{icon}] {ts}")
+    click.echo(f"  {msg}")
+    if transferred:
+        click.echo(f"  Bytes transferred: {transferred}")
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +640,48 @@ def unblock(task_id: str, colony_url: str, token: str | None):
     """Unblock a blocked task."""
     result = _post(colony_url, f"/tasks/{task_id}/unblock", {}, token=token)
     click.echo(f"Task unblocked: {result}")
+
+
+@main.command()
+@click.argument("task_id")
+@click.argument("worker_id")
+@TOKEN_OPTION
+@COLONY_URL_OPTION
+def pin(task_id: str, worker_id: str, token: str | None, colony_url: str):
+    """Pin a ready task to a specific worker."""
+    result = _post(colony_url, f"/tasks/{task_id}/pin", {"worker_id": worker_id}, token=token)
+    click.echo(f"Task pinned: {result}")
+
+
+@main.command()
+@click.argument("task_id")
+@TOKEN_OPTION
+@COLONY_URL_OPTION
+def unpin(task_id: str, token: str | None, colony_url: str):
+    """Clear the pin on a ready task."""
+    result = _post(colony_url, f"/tasks/{task_id}/unpin", {}, token=token)
+    click.echo(f"Task unpinned: {result}")
+
+
+@main.command("override-order")
+@click.argument("task_id")
+@click.argument("position", type=int)
+@TOKEN_OPTION
+@COLONY_URL_OPTION
+def override_order(task_id: str, position: int, token: str | None, colony_url: str):
+    """Override merge queue position for a done task. Lower position merges first."""
+    result = _post(colony_url, f"/tasks/{task_id}/override-order", {"position": position}, token=token)
+    click.echo(f"Merge order overridden: {result}")
+
+
+@main.command("clear-override-order")
+@click.argument("task_id")
+@TOKEN_OPTION
+@COLONY_URL_OPTION
+def clear_override_order(task_id: str, token: str | None, colony_url: str):
+    """Clear merge queue position override for a done task."""
+    _delete(colony_url, f"/tasks/{task_id}/override-order", token=token)
+    click.echo(f"Merge order override cleared for task: {task_id}")
 
 
 # ---------------------------------------------------------------------------
