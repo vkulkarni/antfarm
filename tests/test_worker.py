@@ -289,3 +289,48 @@ def test_ownership_loss_continues_gracefully(tc, runtime, backend):
     # task-002 should be done; task-001 stays active (ownership lost)
     r = tc.get("/tasks/task-002")
     assert r.json()["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Test 7: aider command construction
+# ---------------------------------------------------------------------------
+
+
+def test_aider_command_includes_yes_and_no_auto_commits(tmp_path, http_client):
+    """Aider agent_type builds cmd with --yes and --no-auto-commits flags."""
+    import subprocess
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-aider",
+        agent_type="aider",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        client=http_client,
+    )
+    rt.workspace_mgr.create = MagicMock(return_value=str(tmp_path / "ws"))
+
+    task = {
+        "id": "task-aider-001",
+        "title": "Test Aider Task",
+        "spec": "add a hello function",
+        "current_attempt": 1,
+    }
+
+    captured_cmd = []
+
+    def fake_run(cmd, **kwargs):
+        captured_cmd.extend(cmd)
+        return MagicMock(returncode=0, stdout="done", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        rt._launch_agent(task, str(tmp_path / "ws"))
+
+    assert captured_cmd[0] == "aider"
+    assert "--yes" in captured_cmd
+    assert "--no-auto-commits" in captured_cmd
+    assert "--message" in captured_cmd

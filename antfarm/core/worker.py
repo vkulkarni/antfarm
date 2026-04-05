@@ -218,7 +218,7 @@ class WorkerRuntime:
         elif self.agent_type == "codex":
             cmd = ["codex", "--prompt", prompt]
         elif self.agent_type == "aider":
-            cmd = ["aider", "--message", prompt]
+            cmd = ["aider", "--message", prompt, "--yes", "--no-auto-commits"]
         else:
             # generic: treat agent_type as the executable
             cmd = [self.agent_type, prompt]
