@@ -187,23 +187,48 @@ class WorkerRuntime:
             AgentResult with returncode, stdout, stderr, and branch name.
         """
         spec = task.get("spec", "")
+        title = task.get("title", "")
         branch = f"feat/{task['id']}-{task['current_attempt']}"
 
+        prompt = (
+            f"Task: {title}\n\n"
+            f"Spec: {spec}\n\n"
+            f"You are working in: {workspace}\n"
+            f"Branch: {branch}\n\n"
+            "Instructions:\n"
+            "1. Implement the task as specified\n"
+            "2. Run tests to verify your changes work\n"
+            "3. Commit all changes with a descriptive message\n"
+            "4. Push the branch: git push -u origin {branch}\n"
+        )
+
         if self.agent_type == "claude-code":
-            cmd = ["claude", "--print", spec]
+            cmd = [
+                "claude", "-p",
+                "--agent", "worker",
+                "--permission-mode", "bypassPermissions",
+                prompt,
+            ]
         elif self.agent_type == "codex":
-            cmd = ["codex", "--prompt", spec]
+            cmd = ["codex", "--prompt", prompt]
         elif self.agent_type == "aider":
-            cmd = ["aider", "--message", spec]
+            cmd = ["aider", "--message", prompt]
         else:
             # generic: treat agent_type as the executable
-            cmd = [self.agent_type, spec]
+            cmd = [self.agent_type, prompt]
+
+        env = {
+            **__import__("os").environ,
+            "ANTFARM_URL": self.colony.base_url,
+            "WORKER_ID": self.worker_id,
+        }
 
         proc = subprocess.run(
             cmd,
             cwd=workspace,
             capture_output=True,
             text=True,
+            env=env,
         )
 
         return AgentResult(
