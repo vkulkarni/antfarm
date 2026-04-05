@@ -1,8 +1,8 @@
-# v0.5.0-alpha.1 — Runtime Truth Implementation Plan
+# v0.5.1 — Runtime Foundation Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the runtime deterministic and observable — one scheduling brain, explicit lifecycle states, classified failures with retry policy, and operator visibility for stuck work.
+**Goal:** Make the runtime deterministic and observable — one scheduling brain, explicit lifecycle states, classified failures with retry policy, and operator visibility for stuck work. This is the foundation that v0.5.2 (artifact + review contract) and v0.5.3 (review execution) build on.
 
 **Architecture:** Five PRs in sequence: (1) model foundation with new states and types, (2) lifecycle enforcement in backends and worker, (3) canonical scheduler refactor, (4) failure classification with retry behavior, (5) initial operator inbox. Each PR is independently testable and leaves the system in a working state.
 
@@ -14,19 +14,20 @@
 
 ## Scope
 
-### In
+### In (v0.5.1)
 - Canonical scheduler (#72) — single scheduling brain
 - Task/attempt lifecycle + invariants — new states, transition rules, recovery semantics
 - Failure taxonomy + default retry policy (#83)
 - Initial inbox surfacing (#81 partial)
 
-### Out
-- TaskArtifact (alpha.2)
-- Soldier freshness gating (alpha.2)
-- Review packs (alpha.2)
-- Repo memory (alpha.3)
-- Conflict prevention weighting (alpha.3)
-- Planner (alpha.4)
+### Out (later slices)
+- TaskArtifact + ReviewVerdict contract (v0.5.2)
+- Soldier artifact + review gating + freshness checks (v0.5.2)
+- Review execution — review-as-task flow (v0.5.3 — THE GOAL)
+- Review packs (v0.5.2)
+- Repo memory (v0.5.4)
+- Conflict prevention weighting (v0.5.4)
+- Planner (v0.5.5)
 
 ---
 
@@ -657,12 +658,12 @@ Start colony, carry 3 tasks, run 2 workers. Verify:
 
 - [ ] **Step 3: Update CHANGELOG**
 
-- [ ] **Step 4: Bump version to 0.5.0a1**
+- [ ] **Step 4: Bump version to 0.5.1**
 
 - [ ] **Step 5: Commit, tag, push**
 
 ```bash
-git tag v0.5.0a1
+git tag v0.5.1
 git push origin main --tags
 ```
 
@@ -676,7 +677,7 @@ ssh mini-1 "cd ~/projects/antfarm && git pull origin main"
 
 ## Definition of Done
 
-Alpha.1 is done when:
+v0.5.1 is done when:
 
 - [ ] Scheduler is singular — no backend-specific selection logic remains
 - [ ] Lifecycle states exist and are enforced — illegal transitions raise ValueError
@@ -686,3 +687,14 @@ Alpha.1 is done when:
 - [ ] Inbox explains blocked / stale / failed states with recommended actions
 - [ ] Dogfooding on antfarm repo with 2-3 workers passes
 - [ ] All tests pass, ruff clean
+
+---
+
+## What's Next
+
+After v0.5.1 ships, the next implementation plans are:
+
+- **v0.5.2** — Artifact + Review Contract (TaskArtifact, ReviewVerdict, Soldier gating, review packs)
+- **v0.5.3** — Review Execution (THE GOAL — close the autonomous loop, review-as-task, no manual review)
+
+These plans will be written after v0.5.1 is complete, since they build on the runtime foundation.
