@@ -70,6 +70,7 @@ class WorkerRuntime:
         repo_path: str,
         integration_branch: str = "dev",
         heartbeat_interval: float = 30.0,
+        capabilities: list[str] | None = None,
         client: httpx.Client | None = None,
         token: str | None = None,
     ):
@@ -78,6 +79,7 @@ class WorkerRuntime:
         self.agent_type = agent_type
         self.workspace_root = workspace_root
         self.heartbeat_interval = heartbeat_interval
+        self.capabilities = capabilities or []
         self._token = token
 
         self.colony = ColonyClient(colony_url, client=client, token=token)
@@ -101,6 +103,7 @@ class WorkerRuntime:
             self.node_id,
             self.agent_type,
             self.workspace_root,
+            capabilities=self.capabilities,
         )
         logger.info("worker registered worker_id=%s", self.worker_id)
 
