@@ -124,8 +124,17 @@ class Soldier:
                 continue
             eligible.append(task)
 
-        # Sort by priority (lower = higher) then created_at (FIFO)
-        eligible.sort(key=lambda t: (t.get("priority", 10), t.get("created_at", "")))
+        # Sort: override tasks first (by override position), then by priority/FIFO
+        def _sort_key(t: dict) -> tuple:
+            mo = t.get("merge_override")
+            return (
+                0 if mo is not None else 1,
+                mo if mo is not None else 999,
+                t.get("priority", 10),
+                t.get("created_at", ""),
+            )
+
+        eligible.sort(key=_sort_key)
         return eligible
 
     def attempt_merge(self, task: dict) -> MergeResult:

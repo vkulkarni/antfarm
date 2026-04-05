@@ -413,3 +413,58 @@ def test_pinned_task_pulled_by_correct_worker(client):
     r = client.post("/tasks/pull", json={"worker_id": "worker-pinned"})
     assert r.status_code == 200
     assert r.json()["id"] == "task-001"
+
+
+# ---------------------------------------------------------------------------
+# Override order
+# ---------------------------------------------------------------------------
+
+
+def _carry_and_harvest_serve(client, task_id="task-001"):
+    """Carry a task, pull it as worker-1, and harvest it."""
+    _register_worker(client)
+    _carry(client, task_id=task_id)
+    forage_r = _forage(client)
+    assert forage_r.status_code == 200
+    task = forage_r.json()
+    client.post(
+        f"/tasks/{task_id}/harvest",
+        json={"attempt_id": task["current_attempt"], "pr": "pr", "branch": "branch"},
+    ).raise_for_status()
+    return task
+
+
+def test_override_order_sets_and_returns_ok(client):
+    """POST /tasks/{id}/override-order sets merge_override and returns ok."""
+    _carry_and_harvest_serve(client)
+    r = client.post("/tasks/task-001/override-order", json={"position": 3})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+    task = client.get("/tasks/task-001").json()
+    assert task["merge_override"] == 3
+
+
+def test_clear_override_order_resets_field(client):
+    """DELETE /tasks/{id}/override-order clears merge_override to None."""
+    _carry_and_harvest_serve(client)
+    client.post("/tasks/task-001/override-order", json={"position": 3}).raise_for_status()
+
+    r = client.delete("/tasks/task-001/override-order")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+    task = client.get("/tasks/task-001").json()
+    assert task["merge_override"] is None
+
+
+def test_override_order_not_found_returns_404(client):
+    """POST /tasks/{id}/override-order returns 404 for unknown task."""
+    r = client.post("/tasks/nonexistent/override-order", json={"position": 1})
+    assert r.status_code == 404
+
+
+def test_clear_override_order_not_found_returns_404(client):
+    """DELETE /tasks/{id}/override-order returns 404 for unknown task."""
+    r = client.delete("/tasks/nonexistent/override-order")
+    assert r.status_code == 404

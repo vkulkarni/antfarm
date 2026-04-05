@@ -670,7 +670,9 @@ def unpin(task_id: str, token: str | None, colony_url: str):
 @COLONY_URL_OPTION
 def override_order(task_id: str, position: int, token: str | None, colony_url: str):
     """Override merge queue position for a done task. Lower position merges first."""
-    result = _post(colony_url, f"/tasks/{task_id}/override-order", {"position": position}, token=token)
+    result = _post(
+        colony_url, f"/tasks/{task_id}/override-order", {"position": position}, token=token
+    )
     click.echo(f"Merge order overridden: {result}")
 
 
