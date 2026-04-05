@@ -1,9 +1,11 @@
 # Antfarm v0.6 — Specification
 
-**Status:** Draft
+**Status:** Draft (revised)
 **Date:** 2026-04-05
 **Prerequisite:** v0.5 shipped (canonical scheduler, structured artifacts, repo memory, planner, conflict prevention)
-**Goal:** Make Antfarm a first-class Claude Code experience — MCP server, plugin with slash commands, hooks, and subagents.
+**Goal:** Make Antfarm usable from Claude Code via MCP, with optional packaged plugin UX.
+
+**Build order:** MCP-first, slash commands second, hooks last.
 
 ---
 
@@ -22,10 +24,10 @@
 
 A Claude Code plugin that wraps Antfarm's HTTP API into native Claude Code experiences:
 
-1. **Slash commands** — `/antfarm-plan`, `/antfarm-status`, `/antfarm-review` etc.
-2. **MCP server** — Claude Code calls Antfarm tools directly (create tasks, claim work, report results)
-3. **Hooks** — after code changes, update artifact; on failure, classify and kickback
-4. **Subagents** — planner and reviewer roles as Claude Code agent definitions
+1. **MCP server** — Claude Code calls Antfarm tools directly (create tasks, claim work, report results)
+2. **Slash commands** — `/antfarm-plan`, `/antfarm-status`, `/antfarm-review` etc.
+3. **Subagents** — planner and reviewer roles as Claude Code agent definitions
+4. **Hooks** — heartbeat, failure trail (opt-in observation, never creates truth)
 
 The result: a developer opens Claude Code, types `/antfarm-plan "build auth system"`, and Antfarm decomposes it, assigns workers, and coordinates the build — all from within Claude Code.
 
@@ -97,22 +99,32 @@ The result: a developer opens Claude Code, types `/antfarm-plan "build auth syst
 | `antfarm_merge_ready` | `GET /tasks?status=done` | List tasks ready for merge |
 | `antfarm_workers` | `GET /workers` | List active workers |
 
-**Configuration:** Users point the MCP server at their colony:
+**Configuration:** The MCP server reads from the existing `.antfarm/config.json` — one config source, not two. This is the same config file that the FileBackend and colony already use. The MCP server reads `colony_url` and `token` from it.
+
+```json
+// .antfarm/config.json (existing, authoritative)
+{
+  "colony_url": "http://localhost:7433",
+  "token": "optional-bearer-token",
+  "repo": "vkulkarni/antfarm",
+  "integration_branch": "dev"
+}
+```
+
+Claude Code MCP server config references the Antfarm module, which reads `.antfarm/config.json` at startup:
 
 ```json
 {
   "mcpServers": {
     "antfarm": {
       "command": "python3",
-      "args": ["-m", "antfarm.mcp.server"],
-      "env": {
-        "ANTFARM_URL": "http://localhost:7433",
-        "ANTFARM_TOKEN": "optional-bearer-token"
-      }
+      "args": ["-m", "antfarm.mcp.server"]
     }
   }
 }
 ```
+
+Environment variables (`ANTFARM_URL`, `ANTFARM_TOKEN`) override `.antfarm/config.json` when set, for CI/remote use cases.
 
 **Protocol:** MCP stdio transport (standard for Claude Code MCP servers). The server reads JSON-RPC from stdin, calls the colony HTTP API, and writes results to stdout.
 
@@ -159,16 +171,24 @@ Takes a feature spec and decomposes it into Antfarm tasks.
 
 ### 3. Hooks
 
-**What:** Claude Code hooks that fire automatically to keep Antfarm in sync.
+**What:** Claude Code hooks that fire automatically to keep Antfarm informed. Hooks **observe and synchronize** — they never create canonical state. The final artifact and merge state come only from explicit, deterministic Antfarm flows (`/antfarm-done`, harvest API).
 
 **Location:** `antfarm/plugin/hooks/`
 
-| Hook | Event | What it does |
-|------|-------|-------------|
-| `heartbeat.sh` | PostToolUse | Sends heartbeat to colony (already exists in v0.4 adapter) |
-| `artifact_update.sh` | PostToolUse | After file edits, updates task artifact with changed files count |
-| `on_complete.sh` | Stop | On session end, harvests current task if in progress |
-| `on_failure.sh` | PostToolUseFailure | Classifies failure and trails it |
+| Hook | Event | What it does | Default |
+|------|-------|-------------|---------|
+| `heartbeat.sh` | PostToolUse | Sends heartbeat to colony | **On** |
+| `failure_trail.sh` | PostToolUseFailure | Logs failure context as a trail entry | **On** |
+| `workspace_observe.sh` | PostToolUse | Writes provisional changed-file observations to trail (not the artifact) | **Opt-in** |
+
+**Hooks that were considered and rejected:**
+
+| Hook | Why rejected |
+|------|-------------|
+| `artifact_update.sh` (mutate artifact on file edit) | The final TaskArtifact must be a harvest-time, deterministic record. Hooks should not keep mutating the canonical artifact during editing. |
+| `on_complete.sh` (auto-harvest on session stop) | A Claude session ending does not mean the task is complete. Auto-harvesting would silently produce bad state — half-done work marked done. This violates the trust model built in v0.5. On session stop, the safe actions are: trail a status update, finalize heartbeat, leave task active. Harvest requires explicit `/antfarm-done`. |
+
+**Design principle:** Hooks can write provisional observations, dirty-file hints, heartbeats, progress trail entries, and failure notes. They must **not** mutate the canonical final artifact or trigger state transitions (harvest, kickback, merge).
 
 **Complexity:** S
 
@@ -200,27 +220,31 @@ These are enhanced versions of the existing adapter agents — they use MCP tool
 
 **Structure:**
 ```
-antfarm/plugin/
-  package.json          # Plugin manifest
-  mcp/
-    server.py           # MCP server (stdio transport)
-    tools.py            # Tool definitions + handlers
-  skills/
-    antfarm-plan.md     # /antfarm-plan skill
-    antfarm-status.md   # /antfarm-status skill
-    antfarm-blockers.md # /antfarm-blockers skill
-    antfarm-review.md   # /antfarm-review skill
-    antfarm-start.md    # /antfarm-start skill
-    antfarm-done.md     # /antfarm-done skill
-  hooks/
-    heartbeat.sh
-    artifact_update.sh
-    on_complete.sh
-  agents/
-    worker.md
-    planner.md
-    reviewer.md
+antfarm/
+  mcp/                            # MCP server — part of Antfarm's integration layer, not plugin
+    __init__.py
+    server.py                     # MCP stdio server — reads JSON-RPC, calls colony API
+    tools.py                      # Tool definitions + handler dispatch
+  plugin/                         # Plugin assets — UX layer for Claude Code
+    package.json                  # Plugin manifest
+    skills/
+      antfarm-plan.md
+      antfarm-status.md
+      antfarm-blockers.md
+      antfarm-review.md
+      antfarm-start.md
+      antfarm-done.md
+    hooks/
+      heartbeat.sh                # PostToolUse: heartbeat (default on)
+      failure_trail.sh            # PostToolUseFailure: log failure to trail (default on)
+      workspace_observe.sh        # PostToolUse: observe workspace changes (opt-in)
+    agents/
+      worker.md
+      planner.md
+      reviewer.md
 ```
+
+**Architectural note:** The MCP server lives in `antfarm/mcp/`, not under `antfarm/plugin/`. The MCP bridge is part of Antfarm's integration layer — it has value independent of the plugin packaging. The plugin references the MCP server but does not contain it.
 
 **Installation:**
 ```bash
@@ -235,28 +259,30 @@ claude plugins install antfarm-plugin
 
 ---
 
-## Release Slices
+## Release Milestones
 
-### v0.6.0-alpha.1 — MCP Server
-- MCP server with stdio transport
-- 12 tool definitions mapping to colony API
+### Milestone 1 — MCP + Core Commands
+
+The true foundation. Antfarm is usable from Claude Code after this milestone.
+
+- MCP server with stdio transport (`antfarm/mcp/`)
+- Tool definitions mapping to colony API
+- Config reads from `.antfarm/config.json`
 - Tests with mock colony
-- Manual MCP config (users add to `.claude/settings.json`)
+- Core slash commands: `/antfarm-plan`, `/antfarm-status`, `/antfarm-start`, `/antfarm-review`
+- Review flow working end-to-end via MCP tools
+- Error handling: colony unavailable, auth failure, stale MCP connection, timeouts
 
-### v0.6.0-alpha.2 — Slash Commands
-- 7 skill definitions
-- Plugin package.json
-- `claude plugins install` workflow
+### Milestone 2 — Plugin UX
 
-### v0.6.0-alpha.3 — Hooks + Agents
-- 4 hooks (heartbeat, artifact_update, on_complete, on_failure)
-- 3 agent definitions (worker, planner, reviewer)
+Packaging, automation, and polish. Value is high but not blocking.
+
+- Plugin `package.json` + `claude plugins install` workflow
+- Remaining slash commands: `/antfarm-blockers`, `/antfarm-done`, `/antfarm-merge-ready`
+- Safe hooks: heartbeat (default on), failure trail (default on), workspace observe (opt-in)
+- Agent definitions: `worker.md`, `planner.md`, `reviewer.md`
 - End-to-end test: `/antfarm-plan` → workers build → `/antfarm-review` → merge
-
-### v0.6.0 — Polish
-- Documentation: plugin install guide, MCP configuration, skill reference
-- Error handling: colony down, auth failures, timeout
-- Bug fixes from alpha testing
+- Install docs and skill reference
 
 ---
 
@@ -273,6 +299,15 @@ User types `/antfarm-review task-42`. Claude Code fetches the review pack (artif
 
 ### Scenario D: Status at a Glance
 User types `/antfarm-status`. Sees: 2 workers active, 3 tasks done, 1 blocked (needs human decision), 1 ready.
+
+### Scenario E: Colony Unavailable
+Colony is down or auth fails. Claude Code surfaces a clear error ("Cannot reach Antfarm colony at http://localhost:7433 — is it running?") and does not leave the user guessing about plugin state. MCP tools return structured error responses, not silent failures.
+
+### Scenario F: Session Interruption
+Claude Code session stops mid-task (crash, user closes terminal, network drop). Antfarm does **not** falsely harvest the task. Task remains in `active/` status. Heartbeat expires naturally. Doctor detects the stale task and can recover it. Operator can resume or reassign cleanly.
+
+### Scenario G: Stale MCP Connection
+Colony restarts but MCP client has a cached connection. Next MCP tool call gets a connection error. MCP server retries with a fresh connection and surfaces the error clearly if retry also fails. No silent data loss or phantom success.
 
 ---
 
