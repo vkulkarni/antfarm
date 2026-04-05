@@ -108,6 +108,7 @@ def worker():
 @click.option("--workspace-root", default=None, help="Root directory for worktrees.")
 @click.option("--node", required=True, help="Node ID this worker belongs to.")
 @click.option("--repo-path", default=".", show_default=True, help="Path to git repo.")
+@click.option("--integration-branch", default="dev", show_default=True, help="Branch to create worktrees from.")
 @COLONY_URL_OPTION
 def worker_start(
     agent: str,
@@ -115,6 +116,7 @@ def worker_start(
     workspace_root: str | None,
     node: str,
     repo_path: str,
+    integration_branch: str,
     colony_url: str,
 ):
     """Start a worker and enter the forage loop."""
@@ -130,6 +132,7 @@ def worker_start(
         agent_type=agent,
         workspace_root=ws_root,
         repo_path=repo_path,
+        integration_branch=integration_branch,
     )
     runtime.run()
 
