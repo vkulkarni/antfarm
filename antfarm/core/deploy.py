@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,13 +67,13 @@ def _build_worker_command(
     """Build the antfarm worker start command for a remote node."""
     worker_name = f"{node.agent_type}-{worker_index}"
     return (
-        f"cd {node.repo_path} && "
+        f"cd {shlex.quote(node.repo_path)} && "
         f"antfarm worker start "
-        f"--agent {node.agent_type} "
-        f"--name {worker_name} "
-        f"--node {node.node_id} "
-        f"--colony-url {colony_url} "
-        f"--integration-branch {integration_branch}"
+        f"--agent {shlex.quote(node.agent_type)} "
+        f"--name {shlex.quote(worker_name)} "
+        f"--node {shlex.quote(node.node_id)} "
+        f"--colony-url {shlex.quote(colony_url)} "
+        f"--integration-branch {shlex.quote(integration_branch)}"
     )
 
 
@@ -85,8 +86,8 @@ def _build_ssh_command(
     """Build the full SSH command that launches a worker in a tmux session."""
     worker_cmd = _build_worker_command(node, worker_index, colony_url, integration_branch)
     session_name = f"antfarm-{node.node_id}-{node.agent_type}-{worker_index}"
-    # Create a new detached tmux session running the worker command
-    tmux_cmd = f"tmux new-session -d -s {session_name} '{worker_cmd}'"
+    # -A: attach-or-create to avoid duplicate session errors
+    tmux_cmd = f"tmux new-session -A -d -s {shlex.quote(session_name)} {shlex.quote(worker_cmd)}"
     return [
         "ssh",
         f"{node.ssh_user}@{node.host}",
@@ -168,7 +169,7 @@ def deploy_status(config_path: str) -> dict[str, list[str]]:
                 if line.strip()
             ]
             status[node.node_id] = sessions
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        except subprocess.TimeoutExpired:
             status[node.node_id] = []
 
     return status

@@ -125,7 +125,7 @@ def test_build_ssh_command():
     cmd = _build_ssh_command(node, 0, "http://colony:7433", "dev")
     assert cmd[0] == "ssh"
     assert cmd[1] == "deploy@10.0.0.1"
-    assert "tmux new-session -d -s antfarm-node-1-claude-code-0" in cmd[2]
+    assert "tmux new-session -A -d -s antfarm-node-1-claude-code-0" in cmd[2]
 
 
 # ---------------------------------------------------------------------------
