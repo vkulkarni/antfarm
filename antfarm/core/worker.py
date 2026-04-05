@@ -19,9 +19,106 @@ from dataclasses import dataclass
 import httpx
 
 from antfarm.core.colony_client import ColonyClient
+from antfarm.core.models import FailureRecord, FailureType
 from antfarm.core.workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Failure classification
+# ---------------------------------------------------------------------------
+
+RETRY_POLICIES: dict[FailureType, dict] = {
+    FailureType.INFRA_FAILURE: {"retryable": True, "max_retries": 3, "action": "retry"},
+    FailureType.AGENT_CRASH: {"retryable": True, "max_retries": 2, "action": "retry"},
+    FailureType.AGENT_TIMEOUT: {"retryable": True, "max_retries": 1, "action": "retry"},
+    FailureType.TEST_FAILURE: {"retryable": False, "max_retries": 0, "action": "kickback"},
+    FailureType.LINT_FAILURE: {"retryable": False, "max_retries": 0, "action": "kickback"},
+    FailureType.BUILD_FAILURE: {"retryable": True, "max_retries": 1, "action": "retry"},
+    FailureType.MERGE_CONFLICT: {"retryable": True, "max_retries": 1, "action": "retry"},
+    FailureType.INVALID_TASK: {"retryable": False, "max_retries": 0, "action": "escalate"},
+}
+
+
+def classify_failure(returncode: int, stderr: str, stdout: str) -> FailureType:
+    """Classify failure with strict precedence to avoid misclassification.
+
+    Order matters — earlier checks take priority. Lint/build/infra checks
+    come before test checks to prevent generic markers like 'error' or
+    'failed' from triggering false test-failure classifications.
+    """
+    combined = (stderr + stdout).lower()
+
+    # 1. Timeout (highest priority — clear signal)
+    if returncode in (-9, -15) or "timeout" in combined:
+        return FailureType.AGENT_TIMEOUT
+
+    # 2. Infrastructure (clear external failures)
+    infra_markers = [
+        "permission denied", "disk full", "connection refused",
+        "network unreachable", "enospc", "eacces",
+    ]
+    if any(m in combined for m in infra_markers):
+        return FailureType.INFRA_FAILURE
+
+    # 3. Lint (check before test — "ruff check: 3 errors in test_file.py" is lint, not test)
+    lint_markers = ["ruff", "flake8", "pylint", "mypy", "type error", "lint"]
+    if any(m in combined for m in lint_markers):
+        return FailureType.LINT_FAILURE
+
+    # 4. Build (check before test — "pip install failed" is build, not test)
+    build_markers = [
+        "build failed", "compilation error", "pip install",
+        "modulenotfounderror", "importerror",
+    ]
+    if any(m in combined for m in build_markers):
+        return FailureType.BUILD_FAILURE
+
+    # 5. Test (requires BOTH a test-specific marker AND a failure indicator)
+    test_contexts = ["pytest", "unittest", "test_", "tests/", "::test"]
+    test_failures = ["failed", "assert", "error"]
+    has_test_context = any(m in combined for m in test_contexts)
+    has_test_failure = any(m in combined for m in test_failures)
+    if has_test_context and has_test_failure:
+        return FailureType.TEST_FAILURE
+
+    # 6. Default: agent crash
+    return FailureType.AGENT_CRASH
+
+
+def get_retry_policy(failure_type: FailureType) -> dict:
+    """Return the default retry policy for a failure type."""
+    return RETRY_POLICIES.get(
+        failure_type, {"retryable": False, "max_retries": 0, "action": "kickback"}
+    )
+
+
+def build_failure_record(
+    task_id: str,
+    attempt_id: str,
+    worker_id: str,
+    returncode: int,
+    stderr: str,
+    stdout: str,
+) -> FailureRecord:
+    """Build a structured FailureRecord from agent output."""
+    from datetime import UTC, datetime
+
+    failure_type = classify_failure(returncode, stderr, stdout)
+    policy = get_retry_policy(failure_type)
+
+    return FailureRecord(
+        task_id=task_id,
+        attempt_id=attempt_id,
+        worker_id=worker_id,
+        failure_type=failure_type,
+        message=f"agent exited with code {returncode}",
+        retryable=policy["retryable"],
+        captured_at=datetime.now(UTC).isoformat(),
+        stderr_summary=stderr[:500],
+        recommended_action=policy["action"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -145,18 +242,27 @@ class WorkerRuntime:
             self._stop_heartbeat_loop()
 
         if result.returncode != 0:
-            # Agent failed — trail the failure, do NOT harvest. Task stays active
-            # so doctor can recover it (kickback to ready for next attempt).
+            # Agent failed — classify, record, and trail the failure.
+            failure = build_failure_record(
+                task_id=task_id,
+                attempt_id=attempt_id,
+                worker_id=self.worker_id,
+                returncode=result.returncode,
+                stderr=result.stderr,
+                stdout=result.stdout,
+            )
             logger.warning(
-                "agent failed task_id=%s returncode=%d stderr=%r",
+                "agent failed task_id=%s type=%s retryable=%s returncode=%d",
                 task_id,
+                failure.failure_type.value,
+                failure.retryable,
                 result.returncode,
-                result.stderr[:200],
             )
             self.colony.trail(
                 task_id,
                 self.worker_id,
-                f"agent exited with code {result.returncode}: {result.stderr[:200]}",
+                f"[{failure.failure_type.value}] {failure.message}: "
+                f"{result.stderr[:200]}",
             )
             return True
 
