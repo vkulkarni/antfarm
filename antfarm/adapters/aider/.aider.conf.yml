@@ -1,0 +1,21 @@
+# .aider.conf.yml — Antfarm Aider adapter conventions
+# Place this file in your project root (or let setup.sh symlink it).
+# Aider reads this automatically on startup.
+
+# Use main model for coding tasks
+#model: gpt-4o
+
+# Never auto-commit — Antfarm controls all commits
+auto-commits: false
+
+# Non-interactive: never prompt for confirmation
+yes: true
+
+# Stream output so Antfarm can tail logs in real time
+stream: true
+
+# Skip browser-based auth prompts
+no-show-model-warnings: true
+
+# Git settings
+gitignore: true
