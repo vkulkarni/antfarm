@@ -12,6 +12,16 @@
 
 **Spec:** `docs/SPEC_v06.md` (revised, frozen)
 
+**ColonyClient API audit:** All MCP handlers call verified `ColonyClient` methods. The full source (`antfarm/core/colony_client.py`, 179 lines) was read and signatures confirmed: `carry()`, `list_tasks()`, `forage()`, `trail()`, `harvest(artifact=)`, `get_task()`, `list_workers()`, `register_worker()`, `deregister_worker()`, `status()`. Only `status_full()` needs to be added (Task 1, Step 2).
+
+**Workspace setup ownership:** Workspace/worktree creation is local git behavior, not a colony API operation. The `/antfarm-start` skill handles it using `antfarm.core.workspace.WorkspaceManager` (already exists). This is intentional — MCP is the colony bridge, not a local git wrapper. The skill orchestrates: register worker → forage → WorkspaceManager.create() → begin work.
+
+**v0.5 required integration points:** When v0.5 ships, it must export these stable names for v0.6 MCP tools to consume:
+- `antfarm.core.planner.decompose_spec(spec: str, repo_context: str | None) -> list[dict]`
+- `antfarm.core.memory.get_repo_facts(query: str) -> dict`
+
+If v0.5 uses different names, update the `handle_plan_spec` and `handle_memory` handlers accordingly. The `try/except ImportError` fallback ensures v0.6 degrades gracefully if these aren't available yet.
+
 ---
 
 ## File Structure
@@ -469,6 +479,7 @@ Create `tests/test_mcp_tools.py`:
 
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from antfarm.mcp.tools import (
@@ -757,6 +768,21 @@ def test_deregister_worker(mock_client):
     result = handle_deregister_worker(mock_client, {"worker_id": "node-1/claude-1"})
     assert result["status"] == "ok"
     mock_client.deregister_worker.assert_called_once_with("node-1/claude-1")
+
+
+def test_register_duplicate_worker_rejected(mock_client):
+    """Duplicate worker registration fails with 409."""
+    response = httpx.Response(409, text="Worker node-1/claude-1 already registered")
+    mock_client.register_worker.side_effect = httpx.HTTPStatusError(
+        "409", request=httpx.Request("POST", "http://test"), response=response,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        handle_register_worker(mock_client, {
+            "worker_id": "node-1/claude-1",
+            "node_id": "node-1",
+        })
+    assert exc_info.value.response.status_code == 409
 
 
 def test_plan_spec_unavailable(mock_client):
@@ -2072,13 +2098,13 @@ Verify manually or via integration test:
 
 - [ ] **Step 5: Bump version**
 
-In `pyproject.toml`, update version from `"0.4.0"` to `"0.6.0"` (or appropriate version based on what shipped between 0.4 and now).
+In `pyproject.toml`, update version to `"0.6.0a1"` (alpha — bump to `0.6.0` only after Milestone 2 ships and passes dogfood).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add pyproject.toml
-git commit -m "chore: bump version for v0.6.0 MCP + Claude Code integration"
+git commit -m "chore: bump version to 0.6.0a1 for MCP integration alpha"
 ```
 
 ---
