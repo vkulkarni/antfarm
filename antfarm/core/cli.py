@@ -449,5 +449,52 @@ def unblock(task_id: str, colony_url: str, token: str | None):
     click.echo(f"Task unblocked: {result}")
 
 
+# ---------------------------------------------------------------------------
+# deploy
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option(
+    "--fleet-config",
+    default=".antfarm/fleet.json",
+    show_default=True,
+    help="Path to fleet configuration JSON file.",
+)
+@click.option("--status", "show_status", is_flag=True, default=False, help="Show deploy status.")
+@click.option(
+    "--integration-branch",
+    default="dev",
+    show_default=True,
+    help="Integration branch for workers.",
+)
+@COLONY_URL_OPTION
+def deploy(
+    fleet_config: str,
+    show_status: bool,
+    integration_branch: str,
+    colony_url: str,
+):
+    """Deploy workers to remote nodes via SSH, or check deploy status."""
+    from antfarm.core.deploy import deploy as run_deploy
+    from antfarm.core.deploy import deploy_status
+
+    if show_status:
+        status = deploy_status(fleet_config)
+        for node_id, sessions in status.items():
+            if sessions:
+                click.echo(f"{node_id}: {len(sessions)} session(s) running")
+                for s in sessions:
+                    click.echo(f"  - {s}")
+            else:
+                click.echo(f"{node_id}: no sessions running")
+        return
+
+    results = run_deploy(fleet_config, colony_url, integration_branch)
+    for r in results:
+        icon = "OK" if r.success else "FAIL"
+        click.echo(f"[{icon}] {r.node_id} ({r.host}) worker-{r.worker_index}: {r.message}")
+
+
 if __name__ == "__main__":
     main()
