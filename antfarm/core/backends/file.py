@@ -368,7 +368,9 @@ class FileBackend(TaskBackend):
                     break
 
             # Add failure trail entry
-            trail_entry = TrailEntry(ts=now, worker_id=worker_id, message=reason)
+            trail_entry = TrailEntry(
+                ts=now, worker_id=worker_id, message=reason, action_type="kickback"
+            )
             data.setdefault("trail", [])
             data["trail"].append(trail_entry.to_dict())
 
@@ -543,6 +545,7 @@ class FileBackend(TaskBackend):
                 ts=now,
                 worker_id="system",
                 message=f"Reassigned to {worker_id}",
+                action_type="reassign",
             )
             data.setdefault("trail", [])
             data["trail"].append(trail_entry.to_dict())
@@ -567,7 +570,9 @@ class FileBackend(TaskBackend):
             assert_task_transition(data["status"], TaskStatus.BLOCKED.value)
             now = _now_iso()
 
-            trail_entry = TrailEntry(ts=now, worker_id="system", message=f"Blocked: {reason}")
+            trail_entry = TrailEntry(
+                ts=now, worker_id="system", message=f"Blocked: {reason}", action_type="block"
+            )
             data.setdefault("trail", [])
             data["trail"].append(trail_entry.to_dict())
 
