@@ -6,7 +6,7 @@ Antfarm is a thin, self-hosted coordination layer that lets you distribute codin
 
 One machine hosts the colony. Workers connect, claim tasks, build, and open PRs. An integrator merges them safely. That's it.
 
-> **Status:** Antfarm is pre-release. The spec is frozen and implementation is underway. The README describes the intended v0.1 experience — some components are still under active development.
+> **Status:** **v0.1.0** — Core loop complete. Colony, workers, integrator, and CLI all functional.
 
 ---
 
@@ -126,7 +126,7 @@ antfarm carry --title "Build user dashboard" \
              --touches "frontend"
 
 # Start a worker
-antfarm worker start --agent claude-code
+antfarm worker start --agent claude-code --node node-1
 ```
 
 ### On other machines
@@ -135,10 +135,10 @@ antfarm worker start --agent claude-code
 export ANTFARM_URL=http://node-1:7433
 
 antfarm join --node node-2
-antfarm worker start --agent claude-code
+antfarm worker start --agent claude-code --node node-2
 
 # Or run a different agent
-antfarm worker start --agent codex --name codex-1
+antfarm worker start --agent codex --name codex-1 --node node-2
 ```
 
 ### Watch the colony
@@ -165,8 +165,8 @@ Antfarm is designed to work with any AI coding agent that can run shell commands
 
 | Agent | Integration | Status |
 |-------|-------------|--------|
-| Claude Code | Agent definitions + hooks | v0.1 reference adapter |
-| Generic (curl) | Shell scripts | v0.1 reference adapter |
+| Claude Code | Agent definitions + hooks | Shipped |
+| Generic (curl) | Shell scripts | Shipped |
 | Codex | CLI wrapper | Planned |
 | Aider | CLI wrapper | Planned |
 | Cursor | Extension | Future |
@@ -278,7 +278,7 @@ Each worker must use a separate git worktree or clone. Antfarm does not share wo
 ├─────────────────────────────────────────────────┤
 │                 adapters                        │
 │                                                 │
-│  Claude Code (v0.1) · Generic (v0.1)           │
+│  Claude Code (Shipped) · Generic (Shipped)     │
 │  Codex · Aider · Cursor (planned)              │
 │                                                 │
 ├─────────────────────────────────────────────────┤
@@ -293,7 +293,7 @@ Each worker must use a separate git worktree or clone. Antfarm does not share wo
 
 ## Status
 
-**Pre-release.** Spec frozen. Implementation underway.
+**v0.1.0** — Core loop complete. Colony, workers, integrator, and CLI all functional.
 
 See the project docs for details:
 
