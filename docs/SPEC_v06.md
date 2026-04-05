@@ -22,7 +22,7 @@
 
 ## What v0.6 IS
 
-A Claude Code plugin that wraps Antfarm's HTTP API into native Claude Code experiences:
+An MCP-first Claude Code integration, with optional packaged plugin UX:
 
 1. **MCP server** — Claude Code calls Antfarm tools directly (create tasks, claim work, report results)
 2. **Slash commands** — `/antfarm-plan`, `/antfarm-status`, `/antfarm-review` etc.
@@ -30,6 +30,8 @@ A Claude Code plugin that wraps Antfarm's HTTP API into native Claude Code exper
 4. **Hooks** — heartbeat, failure trail (opt-in observation, never creates truth)
 
 The result: a developer opens Claude Code, types `/antfarm-plan "build auth system"`, and Antfarm decomposes it, assigns workers, and coordinates the build — all from within Claude Code.
+
+**Implementation rule:** Important logic lives in Python handlers and colony code, not in prompt text or shell scripts. Skills and agents orchestrate MCP tool calls — they do not define system truth.
 
 ## What v0.6 IS NOT
 
@@ -126,6 +128,11 @@ Claude Code MCP server config references the Antfarm module, which reads `.antfa
 
 Environment variables (`ANTFARM_URL`, `ANTFARM_TOKEN`) override `.antfarm/config.json` when set, for CI/remote use cases.
 
+**Auth and error guarantees:**
+- Auth errors are surfaced as structured tool errors (not silent failures or generic exceptions)
+- Tokens are never printed in logs, trails, or tool output
+- Unauthorized calls do not partially mutate state — they fail atomically
+
 **Protocol:** MCP stdio transport (standard for Claude Code MCP servers). The server reads JSON-RPC from stdin, calls the colony HTTP API, and writes results to stdout.
 
 **Complexity:** M
@@ -144,7 +151,7 @@ Environment variables (`ANTFARM_URL`, `ANTFARM_TOKEN`) override `.antfarm/config
 | `/antfarm-status` | Shows colony status in a formatted view (nodes, workers, task counts, blockers) |
 | `/antfarm-blockers` | Lists blocked/failed/stale tasks that need attention |
 | `/antfarm-review` | Shows review pack for a specific task (or all done tasks) |
-| `/antfarm-start` | Registers as a worker, forages a task, sets up workspace — one command to start working |
+| `/antfarm-start` | Registers as a worker, forages a task, sets up workspace — one command to start working (see edge cases below) |
 | `/antfarm-done` | Harvests current task with artifact, forages next — one command to finish and continue |
 | `/antfarm-merge-ready` | Lists tasks ready for Soldier to merge |
 
@@ -164,6 +171,15 @@ Takes a feature spec and decomposes it into Antfarm tasks.
 5. On confirmation, call `antfarm_carry` for each task
 6. Show final task list with `antfarm_status`
 ```
+
+**`/antfarm-start` edge cases:**
+
+| Condition | Behavior |
+|-----------|----------|
+| No task available | Report "queue empty" clearly, do not register an idle worker |
+| Worker already active on a task | Refuse to start — surface current task ID, suggest `/antfarm-done` first |
+| Workspace setup fails (git error) | Trail the failure, deregister worker, surface error. Do not leave task claimed with no workspace |
+| Colony unreachable | Fail with clear error before any local side effects |
 
 **Complexity:** S per skill, M total
 
@@ -207,6 +223,8 @@ Takes a feature spec and decomposes it into Antfarm tasks.
 | `reviewer.md` | Reviewer | Read a PR diff, generate review pack via MCP tools |
 
 These are enhanced versions of the existing adapter agents — they use MCP tools instead of CLI commands, making them faster and more integrated.
+
+**`reviewer.md` depends on v0.5 review contract.** The reviewer agent consumes `ReviewVerdict` and the review pack generation from v0.5. The plugin UX is surfacing an existing trust primitive, not inventing a new one.
 
 **Complexity:** S
 
@@ -269,7 +287,7 @@ The true foundation. Antfarm is usable from Claude Code after this milestone.
 - Tool definitions mapping to colony API
 - Config reads from `.antfarm/config.json`
 - Tests with mock colony
-- Core slash commands: `/antfarm-plan`, `/antfarm-status`, `/antfarm-start`, `/antfarm-review`
+- Core slash commands: `/antfarm-plan`, `/antfarm-status`, `/antfarm-start`, `/antfarm-done`, `/antfarm-review`
 - Review flow working end-to-end via MCP tools
 - Error handling: colony unavailable, auth failure, stale MCP connection, timeouts
 
@@ -278,7 +296,7 @@ The true foundation. Antfarm is usable from Claude Code after this milestone.
 Packaging, automation, and polish. Value is high but not blocking.
 
 - Plugin `package.json` + `claude plugins install` workflow
-- Remaining slash commands: `/antfarm-blockers`, `/antfarm-done`, `/antfarm-merge-ready`
+- Remaining slash commands: `/antfarm-blockers`, `/antfarm-merge-ready`
 - Safe hooks: heartbeat (default on), failure trail (default on), workspace observe (opt-in)
 - Agent definitions: `worker.md`, `planner.md`, `reviewer.md`
 - End-to-end test: `/antfarm-plan` → workers build → `/antfarm-review` → merge
