@@ -468,3 +468,85 @@ def test_clear_override_order_not_found_returns_404(client):
     """DELETE /tasks/{id}/override-order returns 404 for unknown task."""
     r = client.delete("/tasks/nonexistent/override-order")
     assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Rate limit: heartbeat with rate limit fields
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_stores_rate_limit_fields(client):
+    """POST /workers/{id}/heartbeat persists remaining, reset_at, cooldown_until."""
+    from datetime import UTC, datetime, timedelta
+
+    _register_worker(client, "worker-rl")
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+
+    r = client.post(
+        "/workers/worker-rl/heartbeat",
+        json={
+            "status": {},
+            "remaining": 10,
+            "reset_at": "2026-01-01T00:00:00+00:00",
+            "cooldown_until": future,
+        },
+    )
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+    # Confirm the fields are reflected in the workers list
+    workers = client.get("/workers").json()
+    worker = next(w for w in workers if w["worker_id"] == "worker-rl")
+    assert worker["remaining"] == 10
+    assert worker["reset_at"] == "2026-01-01T00:00:00+00:00"
+    assert worker["cooldown_until"] == future
+
+
+def test_heartbeat_without_rate_limit_fields(client):
+    """POST /workers/{id}/heartbeat with no rate limit fields still succeeds."""
+    _register_worker(client, "worker-basic")
+    r = client.post("/workers/worker-basic/heartbeat", json={"status": {}})
+    assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Rate limit: GET /workers endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_workers_list_empty(client):
+    """GET /workers returns empty list when no workers registered."""
+    r = client.get("/workers")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_workers_list_returns_registered(client):
+    """GET /workers lists all registered workers."""
+    _register_worker(client, "worker-a")
+    _register_worker(client, "worker-b")
+
+    r = client.get("/workers")
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data) == 2
+    ids = {w["worker_id"] for w in data}
+    assert ids == {"worker-a", "worker-b"}
+
+
+def test_forage_skips_rate_limited_worker(client):
+    """POST /tasks/pull returns 204 when worker is in cooldown."""
+    from datetime import UTC, datetime, timedelta
+
+    _carry(client)
+    _register_worker(client, "worker-rl")
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+
+    # Set cooldown via heartbeat
+    client.post(
+        "/workers/worker-rl/heartbeat",
+        json={"status": {}, "cooldown_until": future},
+    ).raise_for_status()
+
+    r = client.post("/tasks/pull", json={"worker_id": "worker-rl"})
+    assert r.status_code == 204

@@ -56,9 +56,29 @@ class ColonyClient:
         r = self._client.delete(f"/workers/{worker_id}")
         r.raise_for_status()
 
-    def heartbeat(self, worker_id: str, status: dict | None = None) -> None:
-        r = self._client.post(f"/workers/{worker_id}/heartbeat", json={"status": status or {}})
+    def heartbeat(
+        self,
+        worker_id: str,
+        status: dict | None = None,
+        remaining: int | None = None,
+        reset_at: str | None = None,
+        cooldown_until: str | None = None,
+    ) -> None:
+        payload: dict = {"status": status or {}}
+        if remaining is not None:
+            payload["remaining"] = remaining
+        if reset_at is not None:
+            payload["reset_at"] = reset_at
+        if cooldown_until is not None:
+            payload["cooldown_until"] = cooldown_until
+        r = self._client.post(f"/workers/{worker_id}/heartbeat", json=payload)
         r.raise_for_status()
+
+    def list_workers(self) -> list[dict]:
+        """List all registered workers with their rate limit state."""
+        r = self._client.get("/workers")
+        r.raise_for_status()
+        return r.json()
 
     def forage(self, worker_id: str) -> dict | None:
         """Claim next task. Returns task dict or None if queue empty (204)."""

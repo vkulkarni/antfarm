@@ -687,6 +687,29 @@ def clear_override_order(task_id: str, token: str | None, colony_url: str):
 
 
 # ---------------------------------------------------------------------------
+# workers
+# ---------------------------------------------------------------------------
+
+
+@main.command("workers")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def workers_list(colony_url: str, token: str | None):
+    """List all registered workers and their rate limit status."""
+    data = _get(colony_url, "/workers", token=token)
+    if not data:
+        click.echo("No workers registered.")
+        return
+    click.echo(f"{'Worker ID':<35} {'Status':<10} {'Cooldown Until'}")
+    click.echo("-" * 75)
+    for w in data:
+        worker_id = w.get("worker_id", "unknown")
+        status = w.get("status", "unknown")
+        cooldown = w.get("cooldown_until") or "-"
+        click.echo(f"{worker_id:<35} {status:<10} {cooldown}")
+
+
+# ---------------------------------------------------------------------------
 # deploy
 # ---------------------------------------------------------------------------
 

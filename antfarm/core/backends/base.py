@@ -320,6 +320,15 @@ class TaskBackend(ABC):
     # --- Status ---
 
     @abstractmethod
+    def list_workers(self) -> list[dict]:
+        """List all registered workers with their current state.
+
+        Returns:
+            List of worker dicts, each including rate limit fields if present.
+        """
+        ...
+
+    @abstractmethod
     def status(self) -> dict:
         """Return backend status summary.
 
