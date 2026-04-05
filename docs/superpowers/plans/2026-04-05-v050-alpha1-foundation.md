@@ -42,8 +42,9 @@
 | `antfarm/core/scheduler.py` | Modify | Becomes sole scheduling authority |
 | `antfarm/core/worker.py` | Modify | HARVEST_PENDING state, failure classification, retry logic |
 | `antfarm/core/soldier.py` | Modify | Use failure type for kickback decisions |
-| `antfarm/core/tui.py` | Modify | Add inbox panel |
-| `antfarm/core/cli.py` | Modify | Add `antfarm inbox` command |
+| `antfarm/core/inbox.py` | Create | Inbox data collection (reusable by CLI + TUI) |
+| `antfarm/core/tui.py` | Modify | Add inbox panel using inbox.py |
+| `antfarm/core/cli.py` | Modify | Add `antfarm inbox` command using inbox.py |
 | `tests/test_models.py` | Modify | Roundtrip tests for new types |
 | `tests/test_lifecycle.py` | Create | Transition legality tests |
 | `tests/test_scheduler_integration.py` | Create | Verify pull() delegates to scheduler |
@@ -149,6 +150,30 @@ def assert_task_transition(from_state: str, to_state: str) -> None:
             f"Illegal task transition: {from_state} → {to_state}. "
             f"Legal: {LEGAL_TASK_TRANSITIONS.get(from_state, set())}"
         )
+
+
+# Legal attempt state transitions
+LEGAL_ATTEMPT_TRANSITIONS: dict[str, set[str]] = {
+    "started": {"heartbeating", "agent_failed", "stale"},
+    "heartbeating": {"agent_succeeded", "agent_failed", "stale"},
+    "agent_succeeded": {"harvested"},
+    "agent_failed": {"harvested"},  # failure record written at harvest
+    "harvested": set(),  # terminal
+    "stale": {"abandoned"},
+    "abandoned": set(),  # terminal
+}
+
+def validate_attempt_transition(from_state: str, to_state: str) -> bool:
+    """Return True if transition is legal, False otherwise."""
+    return to_state in LEGAL_ATTEMPT_TRANSITIONS.get(from_state, set())
+
+def assert_attempt_transition(from_state: str, to_state: str) -> None:
+    """Raise ValueError if transition is illegal."""
+    if not validate_attempt_transition(from_state, to_state):
+        raise ValueError(
+            f"Illegal attempt transition: {from_state} → {to_state}. "
+            f"Legal: {LEGAL_ATTEMPT_TRANSITIONS.get(from_state, set())}"
+        )
 ```
 
 ### Steps
@@ -230,6 +255,26 @@ def test_assert_passes_on_legal():
 def test_terminal_state_merged_has_no_transitions():
     assert validate_task_transition("merged", "queued") is False
     assert validate_task_transition("merged", "active") is False
+
+# --- Attempt transitions ---
+
+from antfarm.core.lifecycle import validate_attempt_transition, assert_attempt_transition
+
+def test_legal_attempt_started_to_heartbeating():
+    assert validate_attempt_transition("started", "heartbeating") is True
+
+def test_legal_attempt_heartbeating_to_succeeded():
+    assert validate_attempt_transition("heartbeating", "agent_succeeded") is True
+
+def test_illegal_attempt_started_to_harvested():
+    assert validate_attempt_transition("started", "harvested") is False
+
+def test_illegal_attempt_stale_to_succeeded():
+    assert validate_attempt_transition("stale", "agent_succeeded") is False
+
+def test_attempt_assert_raises_on_illegal():
+    with pytest.raises(ValueError, match="Illegal attempt transition"):
+        assert_attempt_transition("started", "harvested")
 ```
 
 - [ ] **Step 5: Run tests — verify they fail**
@@ -292,8 +337,8 @@ def test_worker_crash_before_harvest_marks_stale(backend, ...):
 def test_illegal_transition_raises(backend):
     """Backend rejects illegal state transitions."""
     backend.carry(_make_task("task-001"))
-    # Try to mark_merged on a READY task (skipping ACTIVE, DONE, MERGE_READY)
-    with pytest.raises(ValueError, match="Illegal"):
+    # Task is in QUEUED state — try to merge directly (skipping CLAIMED, ACTIVE, DONE, MERGE_READY)
+    with pytest.raises(ValueError, match="Illegal task transition"):
         backend.mark_merged("task-001", "nonexistent-attempt")
 ```
 
@@ -307,17 +352,73 @@ from antfarm.core.lifecycle import assert_task_transition
 assert_task_transition(current_status, new_status)
 ```
 
-- [ ] **Step 5: Add HARVEST_PENDING to worker**
+- [ ] **Step 5: Add HARVEST_PENDING as a real state mutation**
 
-In `_process_one_task()`, after agent finishes but before writing artifact:
+Add `mark_harvest_pending(self, task_id: str, attempt_id: str) -> None` to `backends/base.py` and `file.py`. This transitions `ACTIVE → HARVEST_PENDING` before the artifact/failure is written.
+
+In `_process_one_task()`, after agent finishes but before writing artifact or failure:
 ```python
-# Set task to HARVEST_PENDING
-self.colony.trail(task_id, self.worker_id, "[lifecycle] agent finished, writing result")
+# Real state transition — not just a trail message
+self.colony._client.post(
+    f"/tasks/{task_id}/harvest-pending",
+    json={"attempt_id": attempt_id},
+)
 ```
+
+Add `POST /tasks/{task_id}/harvest-pending` endpoint to `serve.py`.
+
+If worker dies between HARVEST_PENDING and DONE/FAILED, the inbox surfaces it as "harvest interrupted — needs manual recovery or re-attempt."
 
 - [ ] **Step 6: Run all tests — verify pass**
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Write backward-compatibility test for old persisted state**
+
+```python
+# tests/test_file_backend.py addition
+
+def test_old_state_loads_with_new_lifecycle(tmp_path):
+    """Existing task JSON with old 'ready'/'active'/'done' values loads correctly."""
+    import json, os
+
+    data_dir = tmp_path / ".antfarm"
+    ready_dir = data_dir / "tasks" / "ready"
+    ready_dir.mkdir(parents=True)
+
+    # Write old-format task JSON (uses "ready" not "queued")
+    old_task = {
+        "id": "task-old", "title": "Old task", "spec": "x",
+        "status": "ready",  # old state name
+        "complexity": "M", "priority": 10,
+        "depends_on": [], "touches": [],
+        "capabilities_required": [], "pinned_to": None,
+        "merge_override": None, "current_attempt": None,
+        "attempts": [], "trail": [], "signals": [],
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "created_by": "test",
+    }
+    (ready_dir / "task-old.json").write_text(json.dumps(old_task))
+
+    from antfarm.core.backends.file import FileBackend
+    backend = FileBackend(root=str(data_dir))
+
+    # Should load without error
+    tasks = backend.list_tasks()
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == "task-old"
+
+    # Should be pullable
+    backend.register_worker({"worker_id": "w1", "node_id": "n1",
+                             "agent_type": "generic", "workspace_root": "/tmp",
+                             "capabilities": []})
+    result = backend.pull("w1")
+    assert result is not None
+    assert result["id"] == "task-old"
+```
+
+- [ ] **Step 8: Run all tests — verify pass**
+
+- [ ] **Step 9: Commit**
 
 ```bash
 git commit -m "feat(core): enforce task/attempt lifecycle transitions in backends and worker"
@@ -460,6 +561,21 @@ def test_classify_failure_timeout():
 def test_classify_failure_infra():
     result = classify_failure(returncode=1, stderr="connection refused", stdout="")
     assert result == FailureType.INFRA_FAILURE
+
+def test_classify_failure_ambiguous_error_defaults_to_crash():
+    """Generic 'error' without test/lint markers should be AGENT_CRASH, not TEST_FAILURE."""
+    result = classify_failure(returncode=1, stderr="error occurred", stdout="")
+    assert result == FailureType.AGENT_CRASH
+
+def test_classify_failure_ambiguous_failed_defaults_to_crash():
+    """Generic 'failed' without test context should be AGENT_CRASH."""
+    result = classify_failure(returncode=1, stderr="operation failed", stdout="")
+    assert result == FailureType.AGENT_CRASH
+
+def test_classify_failure_lint_before_test():
+    """Lint markers take precedence over generic 'error' even if 'test' appears."""
+    result = classify_failure(returncode=1, stderr="", stdout="ruff check: 3 errors in test_file.py")
+    assert result == FailureType.LINT_FAILURE
 ```
 
 - [ ] **Step 2: Run tests — verify they fail**
@@ -468,21 +584,44 @@ def test_classify_failure_infra():
 
 ```python
 def classify_failure(returncode: int, stderr: str, stdout: str) -> FailureType:
+    """Classify failure with strict precedence to avoid misclassification.
+
+    Order matters — earlier checks take priority. Lint/build/infra checks
+    come before test checks to prevent generic markers like 'error' or
+    'failed' from triggering false test-failure classifications.
+    """
     combined = (stderr + stdout).lower()
+
+    # 1. Timeout (highest priority — clear signal)
     if returncode in (-9, -15) or "timeout" in combined:
         return FailureType.AGENT_TIMEOUT
-    test_markers = ["failed", "error", "assert", "pytest", "test_"]
-    if any(m in combined for m in test_markers) and "test" in combined:
-        return FailureType.TEST_FAILURE
-    lint_markers = ["ruff", "flake8", "pylint", "mypy", "lint"]
-    if any(m in combined for m in lint_markers):
-        return FailureType.LINT_FAILURE
-    build_markers = ["build failed", "pip install", "modulenotfounderror"]
-    if any(m in combined for m in build_markers):
-        return FailureType.BUILD_FAILURE
-    infra_markers = ["permission denied", "disk full", "connection refused", "network"]
+
+    # 2. Infrastructure (clear external failures)
+    infra_markers = ["permission denied", "disk full", "connection refused",
+                     "network unreachable", "enospc", "eacces"]
     if any(m in combined for m in infra_markers):
         return FailureType.INFRA_FAILURE
+
+    # 3. Lint (check before test — "ruff check: 3 errors in test_file.py" is lint, not test)
+    lint_markers = ["ruff", "flake8", "pylint", "mypy", "type error", "lint"]
+    if any(m in combined for m in lint_markers):
+        return FailureType.LINT_FAILURE
+
+    # 4. Build (check before test — "pip install failed" is build, not test)
+    build_markers = ["build failed", "compilation error", "pip install",
+                     "modulenotfounderror", "importerror"]
+    if any(m in combined for m in build_markers):
+        return FailureType.BUILD_FAILURE
+
+    # 5. Test (requires BOTH a test-specific marker AND a failure indicator)
+    test_contexts = ["pytest", "unittest", "test_", "tests/", "::test"]
+    test_failures = ["failed", "assert", "error"]
+    has_test_context = any(m in combined for m in test_contexts)
+    has_test_failure = any(m in combined for m in test_failures)
+    if has_test_context and has_test_failure:
+        return FailureType.TEST_FAILURE
+
+    # 6. Default: agent crash (generic non-zero exit with no recognizable pattern)
     return FailureType.AGENT_CRASH
 ```
 
@@ -591,18 +730,25 @@ def test_inbox_empty_when_healthy(backend):
 
 - [ ] **Step 3: Implement inbox data collector**
 
+Create `antfarm/core/inbox.py` (separate module so CLI + TUI both use it):
+
 ```python
-# In tui.py or a new inbox.py
+"""Inbox data collection — surfaces items needing operator attention."""
+
 
 def collect_inbox_items(status: dict, tasks: list, workers: list) -> list[dict]:
-    """Collect actionable items from colony state."""
+    """Collect actionable items from colony state.
+
+    Returns list of dicts with: severity, type, message, action, task_id/worker_id.
+    """
     items = []
     # Stale workers (heartbeat > TTL)
-    # Blocked tasks (deps not met)
-    # Failed tasks (has FailureRecord)
+    # Blocked tasks (deps not met) — show which dep is blocking
+    # Failed tasks (has FailureRecord) — show failure type + recommended action
     # Long-running active tasks (duration > threshold)
-    # Kicked-back tasks
-    # Tasks with signals
+    # Kicked-back tasks — show why soldier rejected
+    # Tasks with signals — show signal content
+    # HARVEST_PENDING tasks — interrupted harvest, needs recovery
     return items
 ```
 
