@@ -1,28 +1,30 @@
 # Antfarm v0.5 — Specification
 
-**Status:** Draft (revised with principal-engineer review feedback)
+**Status:** Draft
 **Date:** 2026-04-05
-**Goal:** Make the runtime trustworthy first, then make planning smarter.
+**Goal:** Consolidation, not expansion. Make Antfarm the safest, simplest way to run multiple coding agents against one real repo without merge chaos.
 **Philosophy:** Deterministic core, AI at the edges. Repo execution coordinator, not agent civilization simulator.
 
 ---
 
 ## What v0.5 IS
 
-Consolidation, not expansion. Every piece that already exists should work better together:
+Tighten the loop. Every piece that already exists should work better together.
+
+The product promise:
 
 1. Take a spec / issue / bug report
-2. Break it into good parallel tasks (planner — optional, manual carry remains first-class)
-3. Run multiple workers safely (conflict prevention)
-4. Produce clean review artifacts (structured output with hard evidence + advisory)
-5. Merge in a deterministic order (soldier with artifact gating + freshness checks)
-6. Leave enough memory that the next run is better (repo memory with trust levels)
-7. Give the operator clear visibility (TUI inbox — explain why anything is stuck)
+2. Break it into good parallel tasks
+3. Run multiple workers safely
+4. Produce clean review artifacts
+5. Merge in a deterministic order
+6. Leave enough memory that the next run is better
+7. Give the operator clear visibility
 
 ## What v0.5 IS NOT
 
 - No new backends (file + GitHub is enough)
-- No more auth/platform admin features
+- No more auth / platform admin features
 - No LLM-first Soldier
 - No recursive agent orchestration
 - No vector DB / semantic memory
@@ -30,79 +32,41 @@ Consolidation, not expansion. Every piece that already exists should work better
 
 ---
 
-## Non-Negotiable Invariants
+## Product Principle
 
-These rules are absolute. No feature in v0.5 may violate them.
+**Antfarm v0.5 makes the runtime trustworthy first, then makes planning smarter.**
+
+The system should be excellent at three things:
+
+1. Decomposing work into reasonably parallel tasks
+2. Avoiding needless collisions
+3. Producing reviewable, merge-safe outputs
+
+Everything in v0.5 should strengthen one of those three outcomes.
+
+---
+
+## Non-Negotiable Invariants
 
 1. **One scheduling brain only.**
    `scheduler.select_task()` is the sole authority for task eligibility and selection. Backends persist state; they do not implement scheduling policy.
 
 2. **Soldier gates only on deterministic evidence.**
-   Soldier may read AI-generated summaries, risks, or review notes, but merge decisions may only depend on hard signals: dependency completion, branch freshness, artifact completeness, tests/lint/build status, and explicit operator overrides.
+   Soldier may read AI-generated summaries, risks, or review notes, but merge decisions may only depend on dependency completion, branch freshness, artifact completeness, verification status, and explicit operator overrides.
 
 3. **AI may propose, but not authorize.**
-   AI can help decompose specs, suggest `touches`, summarize changes, and suggest review focus. It cannot decide merge eligibility, retries, or state transitions.
+   AI can help decompose specs, suggest `touches`, summarize changes, and suggest review focus. It cannot decide merge eligibility, retries, or core state transitions.
 
 4. **Every attempt ends in an artifact or a classified failure.**
-   A worker attempt must produce either a valid `TaskArtifact` or a terminal `FailureRecord` with `failure_type`. No silent exits.
+   A worker attempt must produce either:
+   - a valid `TaskArtifact`, or
+   - a terminal `FailureRecord` with `failure_type`
 
 5. **Recovery must be invariant-driven.**
-   Worker death, stale heartbeats, interrupted harvests, and stale branches must be recoverable without guesswork or manual state edits.
+   Worker death, stale heartbeats, interrupted harvests, and stale branches must be recoverable without guesswork or manual JSON edits.
 
 6. **Operator visibility is mandatory.**
    For any blocked, stale, failed, or merge-waiting task, Antfarm must be able to explain why it is in that state.
-
----
-
-## Task and Attempt Lifecycle
-
-Antfarm needs an explicit lifecycle contract so retries, recovery, and Soldier behavior remain predictable.
-
-### Task States
-
-```python
-class TaskState(StrEnum):
-    READY = "ready"                  # Eligible to be scheduled once deps are satisfied
-    BLOCKED = "blocked"              # Waiting on deps or operator unblock
-    ACTIVE = "active"                # Worker is executing the task
-    HARVEST_PENDING = "harvest_pending"  # Worker finished, artifact/failure being recorded
-    DONE = "done"                    # Harvested successfully; waiting for Soldier
-    KICKED_BACK = "kicked_back"      # Returned for rework
-    MERGE_READY = "merge_ready"      # Soldier approved for merge
-    MERGED = "merged"                # Integrated into target branch
-    FAILED = "failed"                # Terminal failure; no automatic retry remains
-    PAUSED = "paused"                # Operator pause
-```
-
-### Attempt States
-
-```python
-class AttemptState(StrEnum):
-    STARTED = "started"
-    HEARTBEATING = "heartbeating"
-    AGENT_SUCCEEDED = "agent_succeeded"
-    AGENT_FAILED = "agent_failed"
-    HARVESTED = "harvested"
-    STALE = "stale"
-    ABANDONED = "abandoned"
-```
-
-### State Transition Rules
-
-- `READY → ACTIVE` only through the canonical scheduler and forage path.
-- `ACTIVE → HARVEST_PENDING` only when worker execution ends.
-- `HARVEST_PENDING → DONE` only if a valid artifact is written.
-- `HARVEST_PENDING → FAILED` only if a classified failure is written.
-- `DONE → MERGE_READY → MERGED` only through Soldier.
-- `DONE → KICKED_BACK` when Soldier rejects for deterministic reasons: stale base, failed checks, missing artifact fields, or merge conflict.
-- Any stale `ACTIVE` attempt becomes `STALE`; the task is either re-queued or escalated based on retry policy.
-- No direct `ACTIVE → MERGED`, `READY → DONE`, or `FAILED → MERGED` transitions.
-
-### Recovery Semantics
-
-- If a worker dies before harvest, the attempt becomes `STALE`, never silently `DONE`.
-- If code changed but artifact write failed, the task remains `HARVEST_PENDING` and is surfaced in the inbox.
-- If Soldier sees the branch base is stale, the task becomes `KICKED_BACK`, not merged optimistically.
 
 ---
 
@@ -122,20 +86,73 @@ carry → queue → forage → work → harvest → soldier merge
 ### Target State (v0.5)
 
 ```
-spec → PLANNER (optional) → tasks with deps/touches/risks
-              ↓
-    carry → CONFLICT PREVENTION → overlap warnings, claim hints
-              ↓
-    queue → CANONICAL SCHEDULER (single brain) → forage
-              ↓
-         work → STRUCTURED OUTPUT → artifact (hard evidence + advisory)
-              ↓
-         harvest → SOLDIER (artifact gating + freshness check)
-              ↓
+spec → PLANNER → tasks with deps/touches/risks
+                    ↓
+         CONFLICT PREVENTION → overlap warnings, claim hints
+                    ↓
+    queue → CANONICAL SCHEDULER → forage
+                    ↓
+         work → STRUCTURED OUTPUT → review pack
+                    ↓
+         harvest → SOLDIER (with artifact gating)
+                    ↓
          merge → MEMORY (repo facts, outcomes, hotspots)
-              ↓
-         OPERATOR INBOX ← what needs attention and why?
+                    ↓
+         OPERATOR INBOX ← what needs attention?
 ```
+
+---
+
+## Task and Attempt Lifecycle
+
+Antfarm needs an explicit lifecycle contract so retries, recovery, and Soldier behavior remain predictable.
+
+### Task States
+
+```python
+class TaskState(StrEnum):
+    QUEUED = "queued"
+    BLOCKED = "blocked"
+    CLAIMED = "claimed"
+    ACTIVE = "active"
+    HARVEST_PENDING = "harvest_pending"
+    DONE = "done"
+    KICKED_BACK = "kicked_back"
+    MERGE_READY = "merge_ready"
+    MERGED = "merged"
+    FAILED = "failed"
+    PAUSED = "paused"
+```
+
+### Attempt States
+
+```python
+class AttemptState(StrEnum):
+    STARTED = "started"
+    HEARTBEATING = "heartbeating"
+    AGENT_SUCCEEDED = "agent_succeeded"
+    AGENT_FAILED = "agent_failed"
+    HARVESTED = "harvested"
+    STALE = "stale"
+    ABANDONED = "abandoned"
+```
+
+### State Transition Rules
+
+- `QUEUED → CLAIMED → ACTIVE` only through the canonical scheduler and forage path
+- `ACTIVE → HARVEST_PENDING` only when worker execution ends
+- `HARVEST_PENDING → DONE` only if a valid artifact is written
+- `HARVEST_PENDING → FAILED` only if a classified failure is written
+- `DONE → MERGE_READY → MERGED` only through Soldier
+- `DONE → KICKED_BACK` when Soldier rejects for deterministic reasons such as stale base, failed checks, missing artifact fields, or merge conflict
+- Any stale `ACTIVE` attempt becomes `STALE`; the task is either re-queued or escalated based on retry policy
+- No direct `ACTIVE → MERGED`, `QUEUED → DONE`, or `FAILED → MERGED` transitions
+
+### Recovery Semantics
+
+- If a worker dies before harvest, the attempt becomes `STALE`, never silently `DONE`
+- If code changed but artifact write failed, the task remains `HARVEST_PENDING` and is surfaced in the inbox
+- If Soldier sees the branch base is stale, the task becomes `KICKED_BACK`, not merged optimistically
 
 ---
 
@@ -143,19 +160,25 @@ spec → PLANNER (optional) → tasks with deps/touches/risks
 
 ### 1. Canonical Scheduler (#72)
 
-**Problem:** FileBackend.pull() has inline scheduling logic that duplicates scheduler.py. Two brains = drift.
+**Problem:** `FileBackend.pull()` has inline scheduling logic that duplicates `scheduler.py`. Two brains = drift.
 
 **Solution:**
-- Remove ALL scheduling logic from `file.py` pull()
-- pull() calls `scheduler.select_task()` with all parameters
-- scheduler.select_task() is the ONLY place that decides task eligibility
-- Backend is pure state persistence — no business logic
+
+- Remove all scheduling logic from `file.py` `pull()`
+- `pull()` calls `scheduler.select_task()` with all parameters
+- `scheduler.select_task()` is the only place that decides task eligibility
+- Backend is pure state persistence; no business logic
 
 **Files:**
-- `antfarm/core/scheduler.py` — add all filters (deps, caps, pin, rate limit, scope)
-- `antfarm/core/backends/file.py` — pull() becomes: read ready tasks, read active tasks, read worker info, call scheduler, move winner
 
-**Tests:** Verify that changing scheduling policy in scheduler.py affects pull() behavior (single source of truth)
+- `antfarm/core/scheduler.py` — all filters live here (deps, caps, pin, rate limit, scope, hotspot weighting)
+- `antfarm/core/backends/file.py` — `pull()` becomes: read ready tasks, read active tasks, read worker info, call scheduler, move winner
+
+**Tests:**
+
+- Changing scheduling policy in `scheduler.py` changes `pull()` behavior
+- No backend-specific selection logic remains
+- Active tasks are loaded and passed to scheduler for scope preference
 
 **Complexity:** M
 
@@ -163,9 +186,9 @@ spec → PLANNER (optional) → tasks with deps/touches/risks
 
 ### 2. Structured Task Output Contract (#77)
 
-**Problem:** Workers currently harvest with branch/PR information, but Antfarm lacks a structured, deterministic artifact for merge gating and review.
+**Problem:** Workers currently harvest with branch / PR information, but Antfarm lacks a structured, deterministic artifact for merge gating and review.
 
-**Solution:** Define a `TaskArtifact` with a strict split between **hard evidence** and **advisory commentary**.
+**Solution:** Define a `TaskArtifact` with a strict split between hard evidence and advisory commentary.
 
 ```python
 @dataclass
@@ -183,12 +206,12 @@ class TaskArtifact:
     target_branch: str
     target_branch_sha_at_harvest: str
 
-    # Change facts (deterministic)
+    # Change facts
     files_changed: list[str]
     lines_added: int
     lines_removed: int
 
-    # Verification facts (deterministic)
+    # Verification facts
     build_ran: bool
     build_passed: bool | None
     tests_ran: bool
@@ -207,30 +230,38 @@ class TaskArtifact:
     review_focus: list[str]
 ```
 
-**Artifact Rules:**
-- `base_commit_sha`, `head_commit_sha`, and `target_branch_sha_at_harvest` are required for Soldier freshness checks.
-- `summary`, `risks`, and `review_focus` are optional and may be AI-generated.
-- Soldier may **display** advisory fields but may not **gate** on them.
-- `merge_readiness="ready"` is necessary but not sufficient; Soldier still verifies freshness, dependencies, and deterministic checks.
+### Artifact Rules
 
-**Soldier Gating Rules:**
+- `base_commit_sha`, `head_commit_sha`, and `target_branch_sha_at_harvest` are required for Soldier freshness checks
+- `summary`, `risks`, and `review_focus` are optional and may be AI-generated
+- Soldier may display advisory fields but may not gate on them
+- `merge_readiness="ready"` is necessary but not sufficient
+
+### Soldier Gating Rules
+
 Soldier may merge only if:
-- All dependencies are merged or otherwise marked satisfied
-- Artifact exists and is valid
-- Branch is fresh against target branch (base SHA check)
-- Required verification signals passed (tests, lint, build)
-- No blocking reasons remain
-- No higher-priority serialization rule prevents merge
 
-**Worker changes:**
-- `_launch_agent()` collects git diff stat, SHAs, test results after agent completes
-- Builds TaskArtifact automatically (deterministic fields from git metadata)
-- AI-generated fields (summary, risks, review_focus) are optional — filled by Claude Code adapter, empty for generic
+- all dependencies are satisfied
+- artifact exists and is valid
+- branch freshness policy passes (base SHA check)
+- required verification signals passed
+- no blocking reasons remain
+- no serialization rule prevents merge
+
+**Integration:**
+
+- `mark_harvested()` accepts artifact dict alongside existing params
+- Artifact is stored on the attempt in task state
+- Worker collects deterministic fields automatically (git diff stat, SHAs, test results)
+- AI-generated fields filled by Claude Code adapter, empty for generic
+- TUI and CLI display artifact summary for completed tasks
 
 **Files:**
+
 - `antfarm/core/models.py` — add TaskArtifact dataclass
 - `antfarm/core/worker.py` — build artifact after agent completes
-- `antfarm/core/backends/base.py` + `file.py` — artifact in mark_harvested()
+- `antfarm/core/backends/base.py` — update mark_harvested() signature
+- `antfarm/core/backends/file.py` — store artifact on attempt
 - `antfarm/core/soldier.py` — artifact gating + freshness check
 - `antfarm/core/tui.py` — display artifact in TUI
 
@@ -238,11 +269,11 @@ Soldier may merge only if:
 
 ---
 
-### 3. Failure Taxonomy (#83)
+### 3. Failure Taxonomy + Retry Policy (#83)
 
-**Problem:** All failures look the same. A flaky test failure gets the same treatment as a real logic bug.
+**Problem:** All failures currently look too similar. A flaky infrastructure issue should not be treated the same way as a real implementation bug.
 
-**Solution:** Classify failures into categories:
+**Solution:** Classify failures and attach default system behavior.
 
 ```python
 class FailureType(StrEnum):
@@ -256,7 +287,7 @@ class FailureType(StrEnum):
     INVALID_TASK = "invalid_task"
 ```
 
-**Default Retry Policy:**
+### Default Retry Policy
 
 | Failure Type | Default Action |
 |-------------|---------------|
@@ -272,27 +303,31 @@ class FailureType(StrEnum):
 > Failure type controls default system behavior. Classification without policy is incomplete.
 
 **Integration:**
-- Worker classifies failure based on agent exit code, stderr, git status
-- Stored on attempt as `FailureRecord`
-- Soldier uses failure type to decide: retry, kickback, or escalate
+
+- Worker classifies failure based on exit code, stderr, git state, and verification signals
+- Failure type is stored on attempt as `FailureRecord`
+- Soldier and recovery logic use failure type to decide retry vs kickback vs escalation
 - Memory tracks failure patterns by type
-- TUI shows failure type in inbox
+- TUI inbox shows failure type and recommended action
 
 **Files:**
+
 - `antfarm/core/models.py` — add FailureType enum, FailureRecord, failure_type on Attempt
 - `antfarm/core/worker.py` — classify failure after agent exit
-- `antfarm/core/soldier.py` — use failure type in kickback/retry decision
-- `antfarm/core/memory.py` — track by type
+- `antfarm/core/soldier.py` — use failure type in retry/kickback decision
+- `antfarm/core/memory.py` — track failure patterns by type
 
-**Complexity:** S-M
+**Complexity:** S
 
 ---
 
+## P1 Features (Strongly Recommended)
+
 ### 4. Lightweight Repo Memory (#78)
 
-**Problem:** Every task starts from zero. Workers rediscover build commands, test commands, hot files, past failures.
+**Problem:** Every task starts from zero. Workers rediscover build commands, test commands, hot files, and past failures.
 
-**Solution:** JSONL-based memory in `.antfarm/memory/` with explicit trust levels:
+**Solution:** JSONL-based memory in `.antfarm/memory/`.
 
 ```
 .antfarm/memory/
@@ -303,24 +338,29 @@ class FailureType(StrEnum):
   touch_observations.jsonl  # HEURISTIC: actual files/scopes touched by completed tasks
 ```
 
-**Trust levels:**
-- `repo_facts.json` contains **trusted facts** (build command, test command, language, framework). Workers consume these as execution context.
-- `hotspots.json`, `failure_patterns.json`, and `touch_observations.jsonl` are **heuristics derived from runs** and may be noisy. Scheduler treats hotspots as a weighting signal, not a hard ban. Workers do NOT receive heuristics as context — only trusted repo facts.
+### Memory Trust Model
 
-**How it's populated:**
-- `repo_facts.json` — auto-detected on first run (scan for pyproject.toml, package.json, Makefile, etc.) + manually enrichable via `antfarm memory set-fact`
-- `task_outcomes.jsonl` — appended after every harvest
-- `hotspots.json` — computed periodically from task_outcomes
-- `failure_patterns.json` — grouped failure reasons with frequency
-- `touch_observations.jsonl` — actual files changed by completed tasks (from artifacts)
+- `repo_facts.json` contains **trusted facts**: build command, test command, language, framework. Operator-curated and auto-detected.
+- `task_outcomes.jsonl` is **append-only run history** — factual record of what happened.
+- `hotspots.json`, `failure_patterns.json`, and `touch_observations.jsonl` are **heuristics derived from prior runs** and may be noisy.
 
-**How it's consumed:**
-- Workers receive `repo_facts` as context in their prompt (test command, lint command, etc.)
-- Planner uses `touch_observations` and hotspots to improve future `touches` prediction
-- Scheduler treats hotspots as a weighting signal, not a hard ban
-- TUI shows hotspot warnings
+### How It's Populated
+
+- `repo_facts.json` — detect from repo structure (pyproject.toml, package.json, Makefile), then allow manual edits via `antfarm memory set-fact`
+- `task_outcomes.jsonl` — append after every completed or failed attempt
+- `hotspots.json` — computed from recent failed and conflicting work
+- `failure_patterns.json` — grouped recurring failure causes
+- `touch_observations.jsonl` — generated from completed task artifacts (actual files changed)
+
+### How It's Consumed
+
+- Workers receive `repo_facts` as execution context (trusted facts only, not heuristics)
+- Planner uses hotspots and observed touches to improve decomposition and `touches` prediction
+- Scheduler uses hotspots as a weighting signal, not a hard ban
+- TUI shows hotspot warnings and recent repeated failures
 
 **Files:**
+
 - NEW: `antfarm/core/memory.py` — MemoryStore class (~150 lines)
 - `antfarm/core/worker.py` — inject repo_facts into agent prompt, record outcome after harvest
 - `antfarm/core/cli.py` — `antfarm memory show`, `antfarm memory set-fact <key> <value>`
@@ -331,39 +371,48 @@ class FailureType(StrEnum):
 
 ### 5. Conflict Prevention Layer (#80)
 
-**Problem:** Two workers can claim tasks touching the same files. Conflicts found at merge time, not prevented.
+**Problem:** Two workers can claim tasks touching the same areas. Conflicts are found late instead of prevented early.
+
+**Solution:** Add conflict awareness to planning, carry, and scheduling.
 
 > `touches` are predictive hints, not exact file locks. Antfarm uses them to reduce conflict likelihood, not to claim perfect conflict freedom. Completed task artifacts feed observed changed files back into memory so future `touches` predictions improve over time.
 
-**Solution:** Add conflict awareness to the scheduling layer:
+### 5a. Overlap Warnings at Carry Time
 
-**5a. Overlap Warnings at Carry Time:**
+When a new task is carried, warn if it overlaps active task scopes.
+
 ```bash
 antfarm carry --title "Update auth" --touches "api,auth"
-# WARNING: Task "Build login" (active, worker node-1/claude-1) also touches: api, auth
-# Likely conflict. Consider waiting or serializing.
-# Carry anyway? [y/N]
+# WARNING: Active task "Build login" also touches: api, auth
+# Likely conflict. Carry anyway? [y/N]
 ```
 
-**5b. Hotspot Detection:**
-- Files that appear in >2 failed tasks in the last 10 outcomes are "hot"
-- Scheduler prefers serializing tasks that touch hot files (stronger scope preference)
-- TUI shows hotspot warnings
+### 5b. Hotspot Detection
 
-**5c. Module Claim Hints:**
-- When a worker forages, the scheduler records which `touches` scopes are "claimed"
-- Subsequent forage calls see claimed scopes and prefer non-overlapping tasks
+- Files or scopes that frequently correlate with failed or conflicting work are marked hot
+- Scheduler prefers serialization on hot scopes
+- TUI surfaces hotspot warnings
 
-**5d. Conflict Risk Score:**
-- Each task gets a `conflict_risk: float` (0.0-1.0) based on:
-  - How many active tasks share its touches
-  - Whether any touches are hotspots
-  - Whether dependencies are being actively worked on
-- TUI shows conflict risk. Operator can decide to pause risky tasks.
+### 5c. Module Claim Hints
+
+- When a worker forages, scheduler records which scopes are effectively claimed
+- Later forage calls prefer non-overlapping work
+- Claims remain soft guidance, not hard locks
+
+### 5d. Conflict Risk Score
+
+Each task gets a `conflict_risk: float` based on:
+
+- overlap with active tasks
+- whether touches map to hotspots
+- whether dependencies are actively changing nearby areas
+
+TUI shows conflict risk. Operator can decide to pause risky tasks.
 
 **Files:**
+
 - `antfarm/core/scheduler.py` — enhanced scope overlap + hotspot weighting
-- `antfarm/core/memory.py` — hotspot tracking + touch observations
+- `antfarm/core/memory.py` — hotspot tracking + touch observation feedback
 - `antfarm/core/cli.py` — overlap warning on carry
 - `antfarm/core/tui.py` — conflict risk display
 
@@ -371,27 +420,26 @@ antfarm carry --title "Update auth" --touches "api,auth"
 
 ---
 
-## P1 Features (Strongly Recommended)
-
 ### 6. Operator Inbox in TUI (#81)
 
-**Problem:** TUI shows status but doesn't highlight what needs attention or explain why.
+**Problem:** Status is visible, but what needs attention is not obvious.
 
-**Solution:** Add an "inbox" panel to the TUI that surfaces actionable items:
+**Solution:** Add an inbox panel to surface:
 
-- Tasks kicked back by Soldier (need re-work) — **why:** stale base / test failure / merge conflict
-- Tasks with signals (need human input) — **why:** worker escalated
-- Stale workers (heartbeat expired) — **why:** worker_id, last heartbeat time
-- Blocked tasks (dependency stuck) — **why:** which dep is blocking
-- High conflict-risk tasks — **why:** overlapping touches with active tasks
-- Failed harvest attempts — **why:** failure type classification
-- Tasks active for too long (may be stuck) — **why:** duration, worker_id
+- kicked-back tasks — **why:** stale base / test failure / merge conflict
+- stale workers — **why:** worker_id, last heartbeat time
+- blocked tasks — **why:** which dep is blocking
+- high conflict-risk tasks — **why:** overlapping touches with active tasks
+- failed harvest attempts — **why:** failure type classification
+- tasks active for too long — **why:** duration, worker_id
+- tasks waiting on human input or override — **why:** signal content
 
-Each item explains **what happened** and **what to do** (reassign, unblock, kill worker, retry).
+Each item explains: what happened, what likely action is needed, whether action is optional or urgent.
 
 **Files:**
+
 - `antfarm/core/tui.py` — add inbox panel
-- `antfarm/core/cli.py` — `antfarm inbox` as standalone command
+- `antfarm/core/cli.py` — `antfarm inbox` as standalone command (non-TUI)
 
 **Complexity:** S-M
 
@@ -399,9 +447,9 @@ Each item explains **what happened** and **what to do** (reassign, unblock, kill
 
 ### 7. Review Pack Generation (#82)
 
-**Problem:** When a task is done, reviewer gets a raw PR diff with no context.
+**Problem:** Reviewers get raw diffs without enough context.
 
-**Solution:** Auto-generate a review pack from the TaskArtifact:
+**Solution:** Generate a review pack from the `TaskArtifact`.
 
 ```markdown
 ## Review Pack: task-001 "Build auth middleware"
@@ -412,10 +460,10 @@ Added JWT auth middleware with token validation and route protection.
 ### Files Changed (4 files, +120 -5)
 - antfarm/core/auth.py (new, 81 lines)
 - antfarm/core/serve.py (modified, +13 -2)
-- antfarm/core/cli.py (modified, +25 -3)
 - tests/test_auth.py (new, 220 lines)
 
 ### Checks
+- Build: passed ✓
 - Tests: 155 passed, 0 failed ✓
 - Lint: clean ✓
 - Base SHA: fresh against target ✓
@@ -424,16 +472,18 @@ Added JWT auth middleware with token validation and route protection.
 - Token printed at colony startup (log exposure risk)
 
 ### Suggested Review Focus
-- auth.py: verify HMAC-SHA256 implementation
-- serve.py: middleware bypass for /status endpoint
+- auth.py: verify token validation logic
+- serve.py: middleware bypass for status endpoints
 ```
 
 **Integration:**
-- Generated from TaskArtifact deterministic fields
-- Posted as PR comment automatically (if GitHub backend or via `gh pr comment`)
-- Displayed in TUI for done tasks
+
+- Generated from artifact deterministic fields
+- Displayed in TUI / CLI for done tasks
+- Optionally posted as PR comment for GitHub workflows
 
 **Files:**
+
 - NEW: `antfarm/core/review_pack.py` — generate_review_pack(artifact) -> str
 - `antfarm/core/soldier.py` — post review pack as PR comment before merge decision
 - `antfarm/core/tui.py` — display review pack for selected task
@@ -442,67 +492,76 @@ Added JWT auth middleware with token validation and route protection.
 
 ---
 
-### 8. Planner/Decomposer (#79)
+### 8. Planner / Decomposer (#79)
 
-**Problem:** Tasks are created manually via `antfarm carry`. No automated decomposition from specs/issues.
+**Problem:** Tasks are created manually via `antfarm carry`. There is no assisted decomposition from specs or issues.
 
 > `antfarm plan` is optional. Manual `antfarm carry` remains a first-class workflow.
 
-**Solution:** `antfarm plan` command that takes a spec and produces tasks:
+**Solution:** Add `antfarm plan`.
 
 ```bash
 antfarm plan --spec "Build user authentication with JWT login, logout, and profile endpoints"
-# Or from a file
 antfarm plan --file feature_spec.md
-# Or from a GitHub issue
 antfarm plan --issue 42 --repo owner/repo
 ```
 
-**Output:**
+### Output
+
 ```
 Proposed tasks:
-  1. [api] JWT auth middleware          touches: api,auth      deps: none
-  2. [api] Login endpoint              touches: api,auth      deps: 1
-  3. [api] Logout endpoint             touches: api,auth      deps: 1
-  4. [api] Profile endpoint            touches: api            deps: 1
-  5. [test] Auth integration tests     touches: tests,auth     deps: 2,3,4
+  1. [api] JWT auth middleware       touches: api,auth   deps: none
+  2. [api] Login endpoint            touches: api,auth   deps: 1
+  3. [api] Logout endpoint           touches: api,auth   deps: 1
+  4. [api] Profile endpoint          touches: api        deps: 1
+  5. [test] Auth integration tests   touches: tests,auth deps: 2,3,4
 
 Conflict warnings:
-  - Tasks 2,3,4 all touch api/auth — consider serializing 2→3→4
+  - Tasks 2,3,4 all touch api/auth — consider serializing
   - Task 1 is a dependency for all others — merge first
 
 Carry these tasks? [y/N]
 ```
 
-**How it works:**
-- Uses Claude Code (or any AI agent) to decompose the spec
-- Generates task JSON with title, spec, depends_on, touches, priority
-- Uses repo_facts from memory to inform decomposition (language, structure, conventions)
-- Uses hotspots and touch_observations from memory to improve touches prediction
-- On confirmation, calls `antfarm carry` for each task
+### Planner Rules
 
-**Implementation:**
+- `antfarm plan` is optional; manual `antfarm carry` remains first-class
+- Planner proposes tasks into the same schema used by manual carry
+- Planner may use AI to produce a first draft
+- Planner is informed by `repo_facts`, hotspots, and `touch_observations`
+- Planner output is validated before carry
+
+### Implementation
+
+For v0.5, planner can remain simple:
+
+- Prompt an AI tool with a strict schema
+- Parse structured output
+- Validate `depends_on`, `touches`, and task shape
+- Let operator approve before carry
+
+**Files:**
+
 - NEW: `antfarm/core/planner.py` — PlannerEngine class
-- For v0.5: planner calls `claude -p` with a decomposition prompt. Not a complex framework — just a well-crafted prompt + structured output parsing.
 - `antfarm/core/cli.py` — `antfarm plan` command
 
-**Complexity:** L (but bounded — it's a prompt + JSON parser, not a reasoning engine)
+**Complexity:** L
 
 ---
 
 ### 9. Docs Rewrite (#73)
 
-**Problem:** README says "v0.1.0 core loop complete." Spec is frozen at v0.1. Code is at v0.4+.
+**Problem:** Docs describe an earlier version of the system and understate what Antfarm is now.
 
-**Solution:** Full docs rewrite:
+**Solution:**
 
-- README: what Antfarm is TODAY, what's shipped, how to use it
-- Architecture doc: how the pieces fit together (colony, scheduler, worker, soldier, memory, TUI)
-- Operator guide: day-to-day usage, monitoring, troubleshooting
-- Contributor guide: how to add adapters, backends, features
-- Deprecate/archive the v0.1 frozen spec
+- README: what Antfarm is today
+- Architecture doc: scheduler, worker, Soldier, memory, TUI, backends
+- Operator guide: day-to-day use, monitoring, recovery, troubleshooting
+- Contributor guide: how to extend safely
+- Archive / deprecate the frozen v0.1 framing
 
-**Complexity:** M (writing, not coding)
+**Complexity:** M
 
 ---
 
@@ -514,8 +573,8 @@ Make the runtime deterministic and observable.
 
 - Canonical scheduler (#72) — single scheduling brain
 - Failure taxonomy + default retry policy (#83)
-- Task/attempt lifecycle + invariants (new states, transition rules)
-- Initial inbox surfacing for stale/blocked/failed work (#81 partial)
+- Task / attempt lifecycle + invariants (new states, transition rules)
+- Initial inbox surfacing for stale / blocked / failed work (#81 partial)
 
 ### v0.5.0-alpha.2 — Artifact Gating
 
@@ -537,7 +596,7 @@ Make parallelism smarter with data.
 
 Add AI-assisted planning on top of a stable substrate.
 
-- Planner/decomposer (#79) — `antfarm plan` CLI
+- Planner / decomposer (#79) — `antfarm plan` CLI
 - Planner informed by repo facts + hotspots + observed touches
 - Conflict warnings in plan output
 
@@ -554,19 +613,36 @@ Add AI-assisted planning on top of a stable substrate.
 ## Success Criteria
 
 ### Scenario A: Runtime Integrity
+
 Given worker death, stale heartbeats, or interrupted harvest, Antfarm recovers the task without silent corruption or manual JSON edits. Every stuck task has an explanation visible in the inbox.
 
 ### Scenario B: Safe Parallel Execution
+
 With 3 workers on one repo, Antfarm materially reduces preventable overlap by preferring non-conflicting tasks and surfacing conflict risk early. Stale tasks are recovered automatically.
 
 ### Scenario C: Reviewable Output
-Every completed attempt produces either a valid `TaskArtifact` or a classified `FailureRecord`. Review packs are generated from artifacts, not raw diff guessing.
+
+Every completed attempt produces either:
+
+- a valid `TaskArtifact`, or
+- a classified `FailureRecord`
+
+Review packs are generated from artifacts, not raw diff guessing.
 
 ### Scenario D: Deterministic Merging
-Soldier merges only when: dependencies are satisfied, artifact is valid, freshness checks pass, required verification checks pass, merge readiness is "ready", and no blocking reasons remain.
+
+Soldier merges only when:
+
+- dependencies are satisfied
+- artifact is valid
+- freshness checks pass
+- required verification checks pass
+- `merge_readiness == "ready"`
+- no blocking reasons remain
 
 ### Scenario E: Useful Memory
-On the second run in the same repo, workers reuse repo facts (test/build commands), scheduler benefits from hotspot data, and planner proposes better `touches` based on prior observed changes.
+
+On the second run in the same repo, workers reuse repo facts, scheduler benefits from hotspot data, and planner proposes better `touches` based on prior observed changes.
 
 ---
 
@@ -585,8 +661,25 @@ On the second run in the same repo, workers reuse repo facts (test/build command
 
 ## Technical Debt to Address
 
-1. Untracked redis.py + test_redis_backend.py on local filesystem — clean up or gitignore
-2. Branch protection CI check "test" never runs — fix GitHub Actions or relax check
+1. Untracked `redis.py` + `test_redis_backend.py` on local filesystem — clean up or gitignore
+2. Branch protection CI check `test` never runs — fix GitHub Actions or relax check
 3. Engineer self-merge prevention — add to CLAUDE.md guardrails
 4. Multiple scheduling brains — the #1 refactor target (addressed by #72)
-5. TUI rendering bug — current_attempt is string ID not dict (worker_id extraction broken)
+5. TUI rendering bug — `current_attempt` is string ID not dict, worker_id extraction broken in `tui.py:205-209`
+
+---
+
+## Summary
+
+Antfarm v0.5 should not become broader. It should become more trustworthy.
+
+The order of operations is:
+
+1. Make scheduling singular
+2. Make task completion explicit and reviewable
+3. Make merge gating deterministic and freshness-aware
+4. Make memory lightweight and useful
+5. Make conflict prevention stronger
+6. Add planning on top of a stable runtime
+
+That keeps Antfarm lightweight while making it substantially more useful.
