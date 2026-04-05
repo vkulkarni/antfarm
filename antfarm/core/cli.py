@@ -893,5 +893,174 @@ def import_cmd(
     click.echo(f"{'[dry-run] Would import' if dry_run else 'Imported'} {len(tasks)} task(s).")
 
 
+# ---------------------------------------------------------------------------
+# plan
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option("--spec", default=None, help="Inline spec text to decompose.")
+@click.option("--file", "file_path", default=None, help="Read spec from file.")
+@click.option("--carry", "auto_carry", is_flag=True, help="Carry tasks after approval.")
+@click.option("--data-dir", default=".antfarm", help="Path to .antfarm directory.")
+@click.option("--agent", "agent_cmd", default=None, help="AI agent command (e.g. 'claude -p').")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def plan(
+    spec: str | None,
+    file_path: str | None,
+    auto_carry: bool,
+    data_dir: str,
+    agent_cmd: str | None,
+    colony_url: str,
+    token: str | None,
+):
+    """Decompose a spec into tasks with dependencies and scope hints."""
+    from antfarm.core.planner import PlannerEngine
+
+    if not spec and not file_path:
+        raise click.UsageError("Either --spec or --file is required.")
+
+    agent_command = agent_cmd.split() if agent_cmd else None
+    engine = PlannerEngine(data_dir=data_dir, agent_command=agent_command)
+
+    result = engine.plan_from_file(file_path) if file_path else engine.plan_from_spec(spec)
+
+    if not result.tasks:
+        click.echo("No tasks generated.")
+        if result.warnings:
+            for w in result.warnings:
+                click.echo(f"  WARNING: {w}")
+        return
+
+    # Validate
+    errors = engine.validate_plan(result)
+    if errors:
+        click.echo("Validation errors:")
+        for e in errors:
+            click.echo(f"  ERROR: {e}")
+        return
+
+    # Display proposed tasks
+    click.echo(f"\nProposed tasks ({len(result.tasks)}):")
+    for i, task in enumerate(result.tasks, 1):
+        deps = ", ".join(task.depends_on) if task.depends_on else "none"
+        touches = ", ".join(task.touches) if task.touches else "none"
+        click.echo(f"  {i}. [{task.complexity}] {task.title}")
+        click.echo(f"     touches: {touches}  deps: {deps}")
+
+    if result.warnings:
+        click.echo("\nWarnings:")
+        for w in result.warnings:
+            click.echo(f"  - {w}")
+
+    if not auto_carry:
+        click.echo("\nUse --carry to submit these tasks to the colony.")
+        return
+
+    # Carry tasks
+    click.echo("\nCarrying tasks...")
+    for i, task in enumerate(result.tasks, 1):
+        task_id = f"task-{int(time.time() * 1000)}-{i}"
+        payload = task.to_carry_dict(task_id)
+        try:
+            r = _post(colony_url, "/tasks", payload, token=token)
+            click.echo(f"  Created: {r}")
+        except Exception as exc:
+            click.echo(f"  Failed to carry task {i}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# memory
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def memory():
+    """View and manage repo memory."""
+    pass
+
+
+@memory.command("show")
+@click.option("--data-dir", default=".antfarm", help="Path to .antfarm directory.")
+def memory_show(data_dir: str):
+    """Show current repo memory state."""
+    from antfarm.core.memory import MemoryStore
+
+    store = MemoryStore(data_dir)
+
+    facts = store.get_facts()
+    click.echo("Repo Facts:")
+    if facts:
+        for k, v in facts.items():
+            click.echo(f"  {k}: {v}")
+    else:
+        click.echo("  (none)")
+
+    hotspots = store.get_hotspots()
+    click.echo("\nHotspots:")
+    if hotspots:
+        for scope, score in sorted(hotspots.items(), key=lambda x: -x[1]):
+            click.echo(f"  {scope}: {score:.3f}")
+    else:
+        click.echo("  (none)")
+
+    patterns = store.get_failure_patterns()
+    click.echo("\nFailure Patterns:")
+    if patterns:
+        for ft, count in sorted(patterns.items(), key=lambda x: -x[1]):
+            click.echo(f"  {ft}: {count}")
+    else:
+        click.echo("  (none)")
+
+    outcomes = store.get_outcomes(limit=5)
+    click.echo(f"\nRecent Outcomes ({len(outcomes)}):")
+    for o in outcomes:
+        status = "OK" if o.get("success") else "FAIL"
+        click.echo(f"  [{status}] {o.get('task_id')} ({o.get('failure_type', '-')})")
+
+
+@memory.command("set-fact")
+@click.argument("key")
+@click.argument("value")
+@click.option("--data-dir", default=".antfarm", help="Path to .antfarm directory.")
+def memory_set_fact(key: str, value: str, data_dir: str):
+    """Set a repo fact (e.g. language, test_command)."""
+    from antfarm.core.memory import MemoryStore
+
+    store = MemoryStore(data_dir)
+    store.set_fact(key, value)
+    click.echo(f"Set fact: {key} = {value}")
+
+
+@memory.command("detect")
+@click.option("--repo", default=".", help="Path to repo root.")
+@click.option("--data-dir", default=".antfarm", help="Path to .antfarm directory.")
+def memory_detect(repo: str, data_dir: str):
+    """Auto-detect repo facts from project structure."""
+    from antfarm.core.memory import MemoryStore
+
+    store = MemoryStore(data_dir)
+    detected = store.detect_facts(repo)
+    if detected:
+        click.echo("Detected facts:")
+        for k, v in detected.items():
+            click.echo(f"  {k}: {v}")
+    else:
+        click.echo("No facts detected.")
+
+
+@memory.command("recompute")
+@click.option("--data-dir", default=".antfarm", help="Path to .antfarm directory.")
+def memory_recompute(data_dir: str):
+    """Recompute hotspots and failure patterns from recent outcomes."""
+    from antfarm.core.memory import MemoryStore
+
+    store = MemoryStore(data_dir)
+    hotspots = store.recompute_hotspots()
+    patterns = store.recompute_failure_patterns()
+    click.echo(f"Recomputed: {len(hotspots)} hotspots, {len(patterns)} failure patterns.")
+
+
 if __name__ == "__main__":
     main()
