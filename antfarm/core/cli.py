@@ -104,6 +104,25 @@ def main():
     show_default=True,
     help="Seconds between periodic backups (requires --backup-dest).",
 )
+@click.option(
+    "--backend",
+    default="file",
+    show_default=True,
+    type=click.Choice(["file", "github"]),
+    help="Backend type: 'file' (default) or 'github' (GitHub Issues).",
+)
+@click.option(
+    "--github-repo",
+    default=None,
+    envvar="ANTFARM_GITHUB_REPO",
+    help="GitHub repository in 'owner/repo' format (required for --backend=github).",
+)
+@click.option(
+    "--github-token",
+    default=None,
+    envvar="ANTFARM_GITHUB_TOKEN",
+    help="GitHub personal access token (for --backend=github).",
+)
 def colony(
     port: int,
     host: str,
@@ -111,28 +130,41 @@ def colony(
     auth_token: str | None,
     backup_dest: str | None,
     backup_interval: int,
+    backend: str,
+    github_repo: str | None,
+    github_token: str | None,
 ):
     """Start the colony server."""
     import uvicorn
 
-    from antfarm.core.backends.file import FileBackend
+    from antfarm.core.backends import get_backend
     from antfarm.core.serve import get_app
 
-    backend = FileBackend(data_dir)
-    app = get_app(backend, auth_secret=auth_token)
+    if backend == "github":
+        if not github_repo:
+            raise click.UsageError("--github-repo is required when --backend=github")
+        task_backend = get_backend("github", repo=github_repo, token=github_token)
+        click.echo(f"Using GitHub Issues backend: {github_repo}")
+    else:
+        task_backend = get_backend("file", root=data_dir)
+
+    app = get_app(task_backend, auth_secret=auth_token)
     if auth_token:
         from antfarm.core.auth import generate_token
 
         click.echo(f"Auth enabled. Bearer token: {generate_token(auth_token)}")
 
     if backup_dest:
-        from antfarm.core.failover import FailoverConfig, start_failover_daemon
+        if backend == "github":
+            click.echo("Warning: --backup-dest is ignored when using the GitHub backend.")
+        else:
+            from antfarm.core.failover import FailoverConfig, start_failover_daemon
 
-        config = FailoverConfig(backup_dest=backup_dest, interval_seconds=backup_interval)
-        start_failover_daemon(data_dir, config)
-        click.echo(
-            f"Failover enabled: backing up to {backup_dest} every {backup_interval}s"
-        )
+            config = FailoverConfig(backup_dest=backup_dest, interval_seconds=backup_interval)
+            start_failover_daemon(data_dir, config)
+            click.echo(
+                f"Failover enabled: backing up to {backup_dest} every {backup_interval}s"
+            )
 
     uvicorn.run(app, host=host, port=port)
 
