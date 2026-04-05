@@ -38,7 +38,12 @@ class WorkspaceManager:
 
         Raises:
             subprocess.CalledProcessError: If any git command fails.
+            ValueError: If task_id or attempt_id contain path traversal characters.
         """
+        for name, value in [("task_id", task_id), ("attempt_id", attempt_id)]:
+            if ".." in value or os.sep in value or "/" in value:
+                raise ValueError(f"{name} contains unsafe path characters: {value!r}")
+
         subprocess.run(
             ["git", "fetch", "origin"],
             cwd=self.repo_path,

@@ -635,6 +635,38 @@ def check_state_consistency(backend) -> list[Finding]:
                     auto_fixable=False,
                 ))
 
+            # (e) done task with current_attempt pointing to non-existent attempt
+            current = data.get("current_attempt")
+            if current and folder_name == "done":
+                attempt_ids = {a.get("attempt_id") for a in data.get("attempts", [])}
+                if current not in attempt_ids:
+                    findings.append(Finding(
+                        severity="error",
+                        check="state_consistency",
+                        message=(
+                            f"Task '{task_id}' in done/ has current_attempt='{current}' "
+                            f"but no matching attempt exists"
+                        ),
+                        auto_fixable=False,
+                    ))
+
+            # (f) merged attempt is current_attempt while task status is ready
+            if current and folder_name == "ready":
+                for attempt in data.get("attempts", []):
+                    if (
+                        attempt.get("attempt_id") == current
+                        and attempt.get("status") == "merged"
+                    ):
+                        findings.append(Finding(
+                            severity="error",
+                            check="state_consistency",
+                            message=(
+                                f"Task '{task_id}' in ready/ has a merged attempt "
+                                f"as current_attempt — invalid state"
+                            ),
+                            auto_fixable=False,
+                        ))
+
     return findings
 
 

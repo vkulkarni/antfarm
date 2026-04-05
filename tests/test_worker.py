@@ -235,7 +235,7 @@ def test_exit_deregisters_on_empty_queue(tc, backend):
     assert not worker_file.exists()
 
 
-def test_exit_deregisters_on_exception(tc, runtime):
+def test_exit_deregisters_on_exception(tc, runtime, backend):
     """Worker deregisters even when an unexpected exception is raised."""
     _carry(tc, task_id="task-001")
 
@@ -250,10 +250,10 @@ def test_exit_deregisters_on_exception(tc, runtime):
     with pytest.raises(RuntimeError, match="unexpected crash"):
         runtime.run()
 
-    # Deregister still happened
-    r = tc.get("/status")
-    data = r.json()
-    assert data.get("worker_count", 0) == 0 or data.get("workers", 0) == 0
+    # Deregister still happened — verify worker file is gone
+    worker_dir = backend._root / "workers"
+    worker_files = list(worker_dir.glob("*.json"))
+    assert len(worker_files) == 0, f"Worker file still exists after exception: {worker_files}"
 
 
 # ---------------------------------------------------------------------------

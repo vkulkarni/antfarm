@@ -97,7 +97,6 @@ def test_validate_dirty(git_repo):
     path = mgr.create("task-003", "att-001")
 
     # Write an untracked file to make the tree dirty
-    (os.path.join(path, "dirty.txt"),)
     with open(os.path.join(path, "dirty.txt"), "w") as f:
         f.write("dirty")
 
