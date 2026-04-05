@@ -69,6 +69,8 @@ class FileBackend(TaskBackend):
             "tasks/ready",
             "tasks/active",
             "tasks/done",
+            "tasks/paused",
+            "tasks/blocked",
             "workers",
             "nodes",
             "guards",
@@ -83,6 +85,12 @@ class FileBackend(TaskBackend):
 
     def _done_path(self, task_id: str) -> Path:
         return self._root / "tasks" / "done" / f"{task_id}.json"
+
+    def _paused_path(self, task_id: str) -> Path:
+        return self._root / "tasks" / "paused" / f"{task_id}.json"
+
+    def _blocked_path(self, task_id: str) -> Path:
+        return self._root / "tasks" / "blocked" / f"{task_id}.json"
 
     def _worker_path(self, worker_id: str) -> Path:
         safe = worker_id.replace("/", "%2F")
@@ -106,7 +114,13 @@ class FileBackend(TaskBackend):
 
     def _find_task_path(self, task_id: str) -> Path | None:
         """Return the path to a task file regardless of which folder it lives in."""
-        for p in [self._ready_path(task_id), self._active_path(task_id), self._done_path(task_id)]:
+        for p in [
+            self._ready_path(task_id),
+            self._active_path(task_id),
+            self._done_path(task_id),
+            self._paused_path(task_id),
+            self._blocked_path(task_id),
+        ]:
             if p.exists():
                 return p
         return None
@@ -325,6 +339,128 @@ class FileBackend(TaskBackend):
             data["updated_at"] = _now_iso()
             self._write_json(done_path, data)
 
+    def pause_task(self, task_id: str) -> None:
+        """Pause an active task. Moves from active/ to paused/."""
+        with self._lock:
+            active_path = self._active_path(task_id)
+            if not active_path.exists():
+                if self._find_task_path(task_id) is None:
+                    raise FileNotFoundError(f"Task '{task_id}' not found")
+                raise ValueError(f"Task '{task_id}' is not in ACTIVE state")
+
+            data = self._read_json(active_path)
+            now = _now_iso()
+            data["status"] = TaskStatus.PAUSED.value
+            data["updated_at"] = now
+
+            self._write_json(active_path, data)
+            os.rename(active_path, self._paused_path(task_id))
+
+    def resume_task(self, task_id: str) -> None:
+        """Resume a paused task. Moves from paused/ to ready/.
+
+        Supersedes the current attempt so the task re-enters the queue cleanly.
+        """
+        with self._lock:
+            paused_path = self._paused_path(task_id)
+            if not paused_path.exists():
+                if self._find_task_path(task_id) is None:
+                    raise FileNotFoundError(f"Task '{task_id}' not found")
+                raise ValueError(f"Task '{task_id}' is not in PAUSED state")
+
+            data = self._read_json(paused_path)
+            now = _now_iso()
+
+            # Supersede current attempt so next pull creates a fresh one
+            current_attempt_id = data.get("current_attempt")
+            if current_attempt_id:
+                for a in data["attempts"]:
+                    if a["attempt_id"] == current_attempt_id:
+                        a["status"] = AttemptStatus.SUPERSEDED.value
+                        a["completed_at"] = now
+                        break
+                data["current_attempt"] = None
+
+            data["status"] = TaskStatus.READY.value
+            data["updated_at"] = now
+
+            self._write_json(paused_path, data)
+            os.rename(paused_path, self._ready_path(task_id))
+
+    def reassign_task(self, task_id: str, worker_id: str) -> None:
+        """Reassign an active task. Supersedes current attempt, returns to ready/."""
+        with self._lock:
+            active_path = self._active_path(task_id)
+            if not active_path.exists():
+                if self._find_task_path(task_id) is None:
+                    raise FileNotFoundError(f"Task '{task_id}' not found")
+                raise ValueError(f"Task '{task_id}' is not in ACTIVE state")
+
+            data = self._read_json(active_path)
+            now = _now_iso()
+
+            current_attempt_id = data.get("current_attempt")
+            if current_attempt_id:
+                for a in data["attempts"]:
+                    if a["attempt_id"] == current_attempt_id:
+                        a["status"] = AttemptStatus.SUPERSEDED.value
+                        a["completed_at"] = now
+                        break
+
+            trail_entry = TrailEntry(
+                ts=now,
+                worker_id="system",
+                message=f"Reassigned to {worker_id}",
+            )
+            data.setdefault("trail", [])
+            data["trail"].append(trail_entry.to_dict())
+
+            data["status"] = TaskStatus.READY.value
+            data["current_attempt"] = None
+            data["updated_at"] = now
+
+            self._write_json(active_path, data)
+            os.rename(active_path, self._ready_path(task_id))
+
+    def block_task(self, task_id: str, reason: str) -> None:
+        """Block a ready task. Moves from ready/ to blocked/."""
+        with self._lock:
+            ready_path = self._ready_path(task_id)
+            if not ready_path.exists():
+                if self._find_task_path(task_id) is None:
+                    raise FileNotFoundError(f"Task '{task_id}' not found")
+                raise ValueError(f"Task '{task_id}' is not in READY state")
+
+            data = self._read_json(ready_path)
+            now = _now_iso()
+
+            trail_entry = TrailEntry(ts=now, worker_id="system", message=f"Blocked: {reason}")
+            data.setdefault("trail", [])
+            data["trail"].append(trail_entry.to_dict())
+
+            data["status"] = TaskStatus.BLOCKED.value
+            data["updated_at"] = now
+
+            self._write_json(ready_path, data)
+            os.rename(ready_path, self._blocked_path(task_id))
+
+    def unblock_task(self, task_id: str) -> None:
+        """Unblock a blocked task. Moves from blocked/ to ready/."""
+        with self._lock:
+            blocked_path = self._blocked_path(task_id)
+            if not blocked_path.exists():
+                if self._find_task_path(task_id) is None:
+                    raise FileNotFoundError(f"Task '{task_id}' not found")
+                raise ValueError(f"Task '{task_id}' is not in BLOCKED state")
+
+            data = self._read_json(blocked_path)
+            now = _now_iso()
+            data["status"] = TaskStatus.READY.value
+            data["updated_at"] = now
+
+            self._write_json(blocked_path, data)
+            os.rename(blocked_path, self._ready_path(task_id))
+
     # ------------------------------------------------------------------
     # Query
     # ------------------------------------------------------------------
@@ -335,6 +471,8 @@ class FileBackend(TaskBackend):
             ("ready", self._root / "tasks" / "ready"),
             ("active", self._root / "tasks" / "active"),
             ("done", self._root / "tasks" / "done"),
+            ("paused", self._root / "tasks" / "paused"),
+            ("blocked", self._root / "tasks" / "blocked"),
         ]
         results = []
         for folder_status, folder in folders:
@@ -482,11 +620,19 @@ class FileBackend(TaskBackend):
         ready = len(list((self._root / "tasks" / "ready").glob("*.json")))
         active = len(list((self._root / "tasks" / "active").glob("*.json")))
         done = len(list((self._root / "tasks" / "done").glob("*.json")))
+        paused = len(list((self._root / "tasks" / "paused").glob("*.json")))
+        blocked = len(list((self._root / "tasks" / "blocked").glob("*.json")))
         workers = len(list((self._root / "workers").glob("*.json")))
         nodes = len(list((self._root / "nodes").glob("*.json")))
         guards = len(list((self._root / "guards").glob("*.lock")))
         return {
-            "tasks": {"ready": ready, "active": active, "done": done},
+            "tasks": {
+                "ready": ready,
+                "active": active,
+                "done": done,
+                "paused": paused,
+                "blocked": blocked,
+            },
             "workers": workers,
             "nodes": nodes,
             "guards": guards,

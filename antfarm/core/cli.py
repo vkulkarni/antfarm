@@ -392,5 +392,62 @@ def signal(task_id: str, message: str, worker_id: str, colony_url: str, token: s
     click.echo(f"Signal sent: {result}")
 
 
+# ---------------------------------------------------------------------------
+# Human override commands
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.argument("task_id")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def pause(task_id: str, colony_url: str, token: str | None):
+    """Pause an active task."""
+    result = _post(colony_url, f"/tasks/{task_id}/pause", {}, token=token)
+    click.echo(f"Task paused: {result}")
+
+
+@main.command()
+@click.argument("task_id")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def resume(task_id: str, colony_url: str, token: str | None):
+    """Resume a paused task."""
+    result = _post(colony_url, f"/tasks/{task_id}/resume", {}, token=token)
+    click.echo(f"Task resumed: {result}")
+
+
+@main.command()
+@click.argument("task_id")
+@click.argument("worker_id")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def reassign(task_id: str, worker_id: str, colony_url: str, token: str | None):
+    """Reassign an active task to a different worker."""
+    result = _post(colony_url, f"/tasks/{task_id}/reassign", {"worker_id": worker_id}, token=token)
+    click.echo(f"Task reassigned: {result}")
+
+
+@main.command()
+@click.argument("task_id")
+@click.argument("reason")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def block(task_id: str, reason: str, colony_url: str, token: str | None):
+    """Block a ready task with a reason."""
+    result = _post(colony_url, f"/tasks/{task_id}/block", {"reason": reason}, token=token)
+    click.echo(f"Task blocked: {result}")
+
+
+@main.command()
+@click.argument("task_id")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def unblock(task_id: str, colony_url: str, token: str | None):
+    """Unblock a blocked task."""
+    result = _post(colony_url, f"/tasks/{task_id}/unblock", {}, token=token)
+    click.echo(f"Task unblocked: {result}")
+
+
 if __name__ == "__main__":
     main()

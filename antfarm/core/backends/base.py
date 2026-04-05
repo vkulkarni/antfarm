@@ -104,6 +104,73 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
+    def pause_task(self, task_id: str) -> None:
+        """Pause an active task. Moves task to PAUSED state.
+
+        Args:
+            task_id: ID of the task to pause.
+
+        Raises:
+            FileNotFoundError: If the task is not found.
+            ValueError: If the task is not in ACTIVE state.
+        """
+        ...
+
+    @abstractmethod
+    def resume_task(self, task_id: str) -> None:
+        """Resume a paused task. Moves task back to READY state.
+
+        Args:
+            task_id: ID of the task to resume.
+
+        Raises:
+            FileNotFoundError: If the task is not found.
+            ValueError: If the task is not in PAUSED state.
+        """
+        ...
+
+    @abstractmethod
+    def reassign_task(self, task_id: str, worker_id: str) -> None:
+        """Reassign an active task. Supersedes current attempt, returns to READY.
+
+        Args:
+            task_id: ID of the task to reassign.
+            worker_id: New worker ID (recorded in trail for context).
+
+        Raises:
+            FileNotFoundError: If the task is not found.
+            ValueError: If the task is not in ACTIVE state.
+        """
+        ...
+
+    @abstractmethod
+    def block_task(self, task_id: str, reason: str) -> None:
+        """Block a task. Moves task to BLOCKED state with a reason.
+
+        Args:
+            task_id: ID of the task to block.
+            reason: Human-readable reason for blocking.
+
+        Raises:
+            FileNotFoundError: If the task is not found.
+            ValueError: If the task is not in READY state.
+        """
+        ...
+
+    @abstractmethod
+    def unblock_task(self, task_id: str) -> None:
+        """Unblock a blocked task. Moves task back to READY state.
+
+        Args:
+            task_id: ID of the task to unblock.
+
+        Raises:
+            FileNotFoundError: If the task is not found.
+            ValueError: If the task is not in BLOCKED state.
+        """
+        ...
+
+    @abstractmethod
     def list_tasks(self, status: str | None = None) -> list[dict]:
         """List tasks, optionally filtered by status.
 
