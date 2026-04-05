@@ -62,7 +62,14 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
-    def mark_harvested(self, task_id: str, attempt_id: str, pr: str, branch: str) -> None:
+    def mark_harvested(
+        self,
+        task_id: str,
+        attempt_id: str,
+        pr: str,
+        branch: str,
+        artifact: dict | None = None,
+    ) -> None:
         """Transition task to DONE, attempt to DONE.
 
         Idempotent: if task is already DONE with this attempt_id, no-op.
@@ -72,6 +79,7 @@ class TaskBackend(ABC):
             attempt_id: ID of the attempt being completed.
             pr: Pull request URL or identifier.
             branch: Branch name for the completed work.
+            artifact: Optional TaskArtifact dict to store on the attempt.
 
         Raises:
             ValueError: If attempt_id is not the current attempt on the task.

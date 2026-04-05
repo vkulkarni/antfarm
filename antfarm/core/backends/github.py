@@ -463,7 +463,14 @@ class GitHubBackend(TaskBackend):
             f"[signal] `{entry.get('worker_id', 'system')}`: {entry.get('message', '')}",
         )
 
-    def mark_harvested(self, task_id: str, attempt_id: str, pr: str, branch: str) -> None:
+    def mark_harvested(
+        self,
+        task_id: str,
+        attempt_id: str,
+        pr: str,
+        branch: str,
+        artifact: dict | None = None,
+    ) -> None:
         """Transition task to DONE. Swap label active -> done. Add result comment.
 
         Idempotent: if already DONE with matching attempt_id, no-op.
@@ -496,6 +503,8 @@ class GitHubBackend(TaskBackend):
                 a["pr"] = pr
                 a["branch"] = branch
                 a["completed_at"] = now
+                if artifact is not None:
+                    a["artifact"] = artifact
                 break
 
         task["status"] = TaskStatus.DONE.value

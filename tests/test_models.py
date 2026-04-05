@@ -7,8 +7,10 @@ from antfarm.core.models import (
     FailureRecord,
     FailureType,
     Node,
+    ReviewVerdict,
     SignalEntry,
     Task,
+    TaskArtifact,
     TaskState,
     TaskStatus,
     TrailEntry,
@@ -312,6 +314,87 @@ def test_failure_record_with_verification_snapshot():
     restored = FailureRecord.from_dict(d)
     assert restored.verification_snapshot == {"tests_ran": False, "lint_ran": False}
     assert restored.recommended_action == "retry"
+
+
+def test_task_artifact_roundtrip():
+    artifact = TaskArtifact(
+        task_id="t1",
+        attempt_id="a1",
+        worker_id="w1",
+        branch="feat/t1",
+        pr_url="https://github.com/org/repo/pull/1",
+        base_commit_sha="abc123",
+        head_commit_sha="def456",
+        target_branch="dev",
+        target_branch_sha_at_harvest="aaa111",
+        files_changed=["src/foo.py", "tests/test_foo.py"],
+        lines_added=50,
+        lines_removed=10,
+        tests_ran=True,
+        tests_passed=True,
+        lint_ran=True,
+        lint_passed=True,
+        merge_readiness="ready",
+        summary="Added foo feature",
+        risks=["might break bar"],
+        review_focus=["check foo.py line 42"],
+    )
+    d = artifact.to_dict()
+    restored = TaskArtifact.from_dict(d)
+    assert restored.task_id == "t1"
+    assert restored.files_changed == ["src/foo.py", "tests/test_foo.py"]
+    assert restored.merge_readiness == "ready"
+    assert restored.risks == ["might break bar"]
+    assert restored == artifact
+
+
+def test_task_artifact_defaults():
+    artifact = TaskArtifact(
+        task_id="t1",
+        attempt_id="a1",
+        worker_id="w1",
+        branch="feat/t1",
+        pr_url=None,
+        base_commit_sha="abc",
+        head_commit_sha="def",
+        target_branch="dev",
+        target_branch_sha_at_harvest="aaa",
+    )
+    assert artifact.files_changed == []
+    assert artifact.lines_added == 0
+    assert artifact.merge_readiness == "needs_review"
+    assert artifact.summary is None
+    assert artifact.risks == []
+
+
+def test_review_verdict_roundtrip():
+    verdict = ReviewVerdict(
+        provider="claude_code",
+        verdict="pass",
+        summary="LGTM",
+        findings=["minor: could add docstring"],
+        severity="low",
+        reviewed_commit_sha="def456",
+        reviewer_run_id="run-1",
+    )
+    d = verdict.to_dict()
+    restored = ReviewVerdict.from_dict(d)
+    assert restored.verdict == "pass"
+    assert restored.provider == "claude_code"
+    assert restored.findings == ["minor: could add docstring"]
+    assert restored == verdict
+
+
+def test_review_verdict_defaults():
+    verdict = ReviewVerdict(
+        provider="human",
+        verdict="needs_changes",
+        summary="Fix the bug",
+    )
+    assert verdict.findings == []
+    assert verdict.severity is None
+    assert verdict.reviewed_commit_sha == ""
+    assert verdict.reviewer_run_id is None
 
 
 def test_failure_record_defaults():

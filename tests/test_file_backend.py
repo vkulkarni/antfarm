@@ -812,3 +812,54 @@ def test_old_state_loads_with_new_lifecycle(tmp_path: Path) -> None:
     assert result is not None
     assert result["id"] == "task-old"
 
+
+# ---------------------------------------------------------------------------
+# v0.5.2: artifact storage on harvest
+# ---------------------------------------------------------------------------
+
+
+def test_harvest_stores_artifact(backend: FileBackend) -> None:
+    """mark_harvested() with artifact stores it on the attempt."""
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+
+    artifact = {
+        "task_id": "task-1",
+        "attempt_id": attempt_id,
+        "worker_id": "worker-1",
+        "branch": "feat/task-1",
+        "files_changed": ["src/foo.py"],
+        "lines_added": 10,
+        "merge_readiness": "ready",
+    }
+    backend.mark_harvested("task-1", attempt_id, pr="pr-1", branch="feat/t1", artifact=artifact)
+
+    task = backend.get_task("task-1")
+    assert task is not None
+    for a in task["attempts"]:
+        if a["attempt_id"] == attempt_id:
+            assert a.get("artifact") is not None
+            assert a["artifact"]["files_changed"] == ["src/foo.py"]
+            break
+    else:
+        pytest.fail("Attempt not found")
+
+
+def test_harvest_without_artifact_backward_compat(backend: FileBackend) -> None:
+    """mark_harvested() without artifact still works (no artifact key)."""
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+
+    backend.mark_harvested("task-1", attempt_id, pr="pr-1", branch="feat/t1")
+
+    task = backend.get_task("task-1")
+    assert task is not None
+    for a in task["attempts"]:
+        if a["attempt_id"] == attempt_id:
+            assert "artifact" not in a
+            break
+
