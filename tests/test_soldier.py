@@ -434,6 +434,44 @@ def test_cleanup_after_conflict(soldier_env):
     assert "antfarm/temp-merge" not in branches.stdout
 
 
+def test_override_order_sorts_before_normal(soldier_env):
+    """Tasks with merge_override sort before normal tasks in the merge queue."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    # Create two tasks with default priority — task-normal carries first (lower ts)
+    _carry_and_harvest(cc, repo, "task-normal", "feat/task-normal")
+    _carry_and_harvest(cc, repo, "task-override", "feat/task-override")
+
+    # Set merge_override=1 on the second task to force it to merge first
+    cc._client.post("/tasks/task-override/override-order", json={"position": 1}).raise_for_status()
+
+    queue = soldier.get_merge_queue()
+    ids = [t["id"] for t in queue]
+    assert ids[0] == "task-override", f"Expected task-override first, got {ids}"
+    assert "task-normal" in ids
+
+
+def test_clearing_override_restores_normal_order(soldier_env):
+    """Clearing merge_override returns task to normal priority/FIFO ordering."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-a", "feat/task-a2")
+    _carry_and_harvest(cc, repo, "task-b", "feat/task-b2")
+
+    # Set override on task-b, then clear it
+    cc._client.post("/tasks/task-b/override-order", json={"position": 1}).raise_for_status()
+    cc._client.delete("/tasks/task-b/override-order").raise_for_status()
+
+    queue = soldier.get_merge_queue()
+    ids = [t["id"] for t in queue]
+    # task-a was created first so should sort first after clearing override
+    assert ids[0] == "task-a", f"Expected task-a first after clearing override, got {ids}"
+
+
 def test_cleanup_after_test_failure(soldier_env):
     """After a test failure, working tree is clean and on integration branch."""
     cc = soldier_env["colony_client"]
