@@ -289,3 +289,49 @@ def test_ownership_loss_continues_gracefully(tc, runtime, backend):
     # task-002 should be done; task-001 stays active (ownership lost)
     r = tc.get("/tasks/task-002")
     assert r.json()["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Test 7: codex command construction
+# ---------------------------------------------------------------------------
+
+
+def test_codex_command_uses_approval_mode_full_auto(tmp_path, http_client):
+    """Codex agent_type builds cmd with --approval-mode full-auto --quiet flags."""
+    import subprocess
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-codex",
+        agent_type="codex",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        client=http_client,
+    )
+    rt.workspace_mgr.create = MagicMock(return_value=str(tmp_path / "ws"))
+
+    task = {
+        "id": "task-codex-001",
+        "title": "Test Codex Task",
+        "spec": "add a hello function",
+        "current_attempt": 1,
+    }
+
+    captured_cmd = []
+
+    def fake_run(cmd, **kwargs):
+        captured_cmd.extend(cmd)
+        return MagicMock(returncode=0, stdout="done", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        rt._launch_agent(task, str(tmp_path / "ws"))
+
+    assert captured_cmd[0] == "codex"
+    assert "--approval-mode" in captured_cmd
+    assert "full-auto" in captured_cmd
+    assert "--quiet" in captured_cmd
+    assert "--message" not in captured_cmd
