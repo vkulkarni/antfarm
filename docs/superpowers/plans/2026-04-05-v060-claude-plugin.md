@@ -1302,9 +1302,27 @@ def test_token_not_in_error_output():
     """Token never appears in error response text."""
     from antfarm.mcp.tools import _error_response
 
-    err = _error_response("Authentication failed — check your token")
+    err = _error_response("Authentication failed — check your token", code="auth_failed")
     # Verify the error message doesn't contain actual token values
     assert "test-secret-token" not in err.text
+
+
+def test_error_envelope_structure():
+    """Error responses use standard envelope with code, message, retryable."""
+    import json
+
+    from antfarm.mcp.tools import _error_response
+
+    err = _error_response("Colony down", code="connection_failed", retryable=True)
+    payload = json.loads(err.text)
+    assert "error" in payload
+    assert payload["error"]["code"] == "connection_failed"
+    assert payload["error"]["message"] == "Colony down"
+    assert payload["error"]["retryable"] is True
+
+    err2 = _error_response("Auth failed", code="auth_failed")
+    payload2 = json.loads(err2.text)
+    assert payload2["error"]["retryable"] is False
 
 
 def test_conflict_409(mock_client):
@@ -2074,7 +2092,7 @@ git commit -m "chore: bump version for v0.6.0 MCP + Claude Code integration"
 | Config loads from file | test_mcp_config | `.antfarm/config.json` is read correctly |
 | Env overrides file | test_mcp_config | `ANTFARM_URL`/`ANTFARM_TOKEN` take precedence |
 | Server creates | test_mcp_server | MCP server initializes with config |
-| 10 tools listed | test_mcp_server | All expected tools are registered |
+| 14 tools listed | test_mcp_server | All expected tools are registered |
 | All tools have handlers | test_mcp_server | No orphan tool definitions |
 | carry creates task | test_mcp_tools | `antfarm_carry` → `ColonyClient.carry()` |
 | forage returns task | test_mcp_tools | `antfarm_forage` → `ColonyClient.forage()` |
