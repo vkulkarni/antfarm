@@ -501,3 +501,117 @@ def test_pull_matches_tasks_with_met_capabilities(backend: FileBackend, tmp_path
     assert result is not None
     assert result["id"] == "task-gpu"
 
+
+# ---------------------------------------------------------------------------
+# Pin / unpin
+# ---------------------------------------------------------------------------
+
+
+def test_pin_task_sets_pinned_to(backend: FileBackend, tmp_path: Path) -> None:
+    """pin_task() writes pinned_to field on the ready task."""
+    backend.carry(_make_task("task-1"))
+    backend.pin_task("task-1", "worker-7")
+
+    data = backend.get_task("task-1")
+    assert data is not None
+    assert data["pinned_to"] == "worker-7"
+
+
+def test_unpin_task_clears_pinned_to(backend: FileBackend) -> None:
+    """unpin_task() clears pinned_to back to None."""
+    backend.carry(_make_task("task-1"))
+    backend.pin_task("task-1", "worker-7")
+    backend.unpin_task("task-1")
+
+    data = backend.get_task("task-1")
+    assert data is not None
+    assert data["pinned_to"] is None
+
+
+def test_pin_task_not_found_raises(backend: FileBackend) -> None:
+    """pin_task() raises FileNotFoundError for unknown task."""
+    with pytest.raises(FileNotFoundError):
+        backend.pin_task("no-such-task", "worker-1")
+
+
+def test_unpin_task_not_found_raises(backend: FileBackend) -> None:
+    """unpin_task() raises FileNotFoundError for unknown task."""
+    with pytest.raises(FileNotFoundError):
+        backend.unpin_task("no-such-task")
+
+
+def test_pull_skips_task_pinned_to_other_worker(backend: FileBackend) -> None:
+    """pull() skips tasks where pinned_to != worker_id."""
+    backend.carry(_make_task("task-1"))
+    backend.pin_task("task-1", "worker-pinned")
+
+    result = backend.pull("worker-other")
+    assert result is None
+
+
+def test_pull_returns_task_pinned_to_correct_worker(backend: FileBackend) -> None:
+    """pull() returns task when pinned_to matches worker_id."""
+    backend.carry(_make_task("task-1"))
+    backend.pin_task("task-1", "worker-pinned")
+
+    result = backend.pull("worker-pinned")
+    assert result is not None
+    assert result["id"] == "task-1"
+
+
+def test_pull_returns_unpinned_task_to_any_worker(backend: FileBackend) -> None:
+    """pull() returns tasks with pinned_to=None to any worker."""
+    backend.carry(_make_task("task-1"))
+
+    result = backend.pull("worker-any")
+    assert result is not None
+    assert result["id"] == "task-1"
+
+
+# ---------------------------------------------------------------------------
+# Override merge order
+# ---------------------------------------------------------------------------
+
+
+def _carry_harvest(backend: FileBackend, task_id: str) -> str:
+    """Carry a task, pull it, harvest it, and return the attempt_id."""
+    backend.carry(_make_task(task_id))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested(task_id, attempt_id, pr="pr", branch="branch")
+    return attempt_id
+
+
+def test_override_merge_order_sets_field(backend: FileBackend) -> None:
+    """override_merge_order() writes merge_override to the done task."""
+    _carry_harvest(backend, "task-1")
+    backend.override_merge_order("task-1", 1)
+
+    data = backend.get_task("task-1")
+    assert data is not None
+    assert data["merge_override"] == 1
+
+
+def test_clear_merge_override_resets_to_none(backend: FileBackend) -> None:
+    """clear_merge_override() sets merge_override back to None."""
+    _carry_harvest(backend, "task-1")
+    backend.override_merge_order("task-1", 2)
+    backend.clear_merge_override("task-1")
+
+    data = backend.get_task("task-1")
+    assert data is not None
+    assert data["merge_override"] is None
+
+
+def test_override_merge_order_not_found_raises(backend: FileBackend) -> None:
+    """override_merge_order() raises FileNotFoundError for unknown task."""
+    with pytest.raises(FileNotFoundError):
+        backend.override_merge_order("no-such-task", 1)
+
+
+def test_clear_merge_override_not_found_raises(backend: FileBackend) -> None:
+    """clear_merge_override() raises FileNotFoundError for unknown task."""
+    with pytest.raises(FileNotFoundError):
+        backend.clear_merge_override("no-such-task")
+

@@ -11,6 +11,7 @@ def make_task(
     depends_on: list[str] | None = None,
     touches: list[str] | None = None,
     capabilities_required: list[str] | None = None,
+    pinned_to: str | None = None,
     status: TaskStatus = TaskStatus.READY,
 ) -> Task:
     return Task(
@@ -24,6 +25,7 @@ def make_task(
         depends_on=depends_on or [],
         touches=touches or [],
         capabilities_required=capabilities_required or [],
+        pinned_to=pinned_to,
         status=status,
     )
 
@@ -173,5 +175,53 @@ def test_worker_capabilities_none_skips_filter():
         done_task_ids=set(),
         active_tasks=[],
         worker_capabilities=None,
+    )
+    assert result is t
+
+
+def test_pinned_task_skipped_for_wrong_worker():
+    """Task pinned to worker-A is not returned when worker-B pulls."""
+    t = make_task("t1", pinned_to="worker-A")
+    result = select_task(
+        [t],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_id="worker-B",
+    )
+    assert result is None
+
+
+def test_pinned_task_selected_for_correct_worker():
+    """Task pinned to worker-A is returned when worker-A pulls."""
+    t = make_task("t1", pinned_to="worker-A")
+    result = select_task(
+        [t],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_id="worker-A",
+    )
+    assert result is t
+
+
+def test_unpinned_task_available_to_any_worker():
+    """Task with no pin is returned to any worker regardless of worker_id."""
+    t = make_task("t1")
+    result = select_task(
+        [t],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_id="worker-X",
+    )
+    assert result is t
+
+
+def test_pin_filter_skipped_when_worker_id_none():
+    """When worker_id is None, pin filtering is skipped (backward compatible)."""
+    t = make_task("t1", pinned_to="worker-A")
+    result = select_task(
+        [t],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_id=None,
     )
     assert result is t

@@ -205,6 +205,12 @@ class FileBackend(TaskBackend):
                     if set(t.capabilities_required).issubset(worker_capabilities)
                 ]
 
+            # Filter by pin — skip tasks pinned to a different worker
+            eligible = [
+                t for t in eligible
+                if t.pinned_to is None or t.pinned_to == worker_id
+            ]
+
             if not eligible:
                 return None
 
@@ -357,6 +363,28 @@ class FileBackend(TaskBackend):
             data["updated_at"] = _now_iso()
             self._write_json(done_path, data)
 
+    def override_merge_order(self, task_id: str, position: int) -> None:
+        """Set merge_override on a task in done/."""
+        with self._lock:
+            done_path = self._done_path(task_id)
+            if not done_path.exists():
+                raise FileNotFoundError(f"Task '{task_id}' not found in done/")
+            data = self._read_json(done_path)
+            data["merge_override"] = position
+            data["updated_at"] = _now_iso()
+            self._write_json(done_path, data)
+
+    def clear_merge_override(self, task_id: str) -> None:
+        """Clear merge_override on a task in done/."""
+        with self._lock:
+            done_path = self._done_path(task_id)
+            if not done_path.exists():
+                raise FileNotFoundError(f"Task '{task_id}' not found in done/")
+            data = self._read_json(done_path)
+            data["merge_override"] = None
+            data["updated_at"] = _now_iso()
+            self._write_json(done_path, data)
+
     def pause_task(self, task_id: str) -> None:
         """Pause an active task. Moves from active/ to paused/."""
         with self._lock:
@@ -478,6 +506,28 @@ class FileBackend(TaskBackend):
 
             self._write_json(blocked_path, data)
             os.rename(blocked_path, self._ready_path(task_id))
+
+    def pin_task(self, task_id: str, worker_id: str) -> None:
+        """Pin a ready task to a specific worker."""
+        with self._lock:
+            ready_path = self._ready_path(task_id)
+            if not ready_path.exists():
+                raise FileNotFoundError(f"Task '{task_id}' not found in ready/")
+            data = self._read_json(ready_path)
+            data["pinned_to"] = worker_id
+            data["updated_at"] = _now_iso()
+            self._write_json(ready_path, data)
+
+    def unpin_task(self, task_id: str) -> None:
+        """Clear the pin on a ready task."""
+        with self._lock:
+            ready_path = self._ready_path(task_id)
+            if not ready_path.exists():
+                raise FileNotFoundError(f"Task '{task_id}' not found in ready/")
+            data = self._read_json(ready_path)
+            data["pinned_to"] = None
+            data["updated_at"] = _now_iso()
+            self._write_json(ready_path, data)
 
     # ------------------------------------------------------------------
     # Query
