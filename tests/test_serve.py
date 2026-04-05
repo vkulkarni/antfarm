@@ -301,6 +301,7 @@ def test_scent_new_entries(tmp_path):
     assert "late entry" in messages
 
 
+
 def test_carry_with_capabilities_and_pull_with_capable_worker(tmp_path):
     """carry accepts capabilities_required; capable worker gets the task, incapable gets none."""
     from antfarm.core.backends.file import FileBackend

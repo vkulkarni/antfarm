@@ -241,17 +241,60 @@ def carry(
 # scout
 # ---------------------------------------------------------------------------
 
+_WATCHED_FIELDS = (
+    "tasks_ready",
+    "tasks_active",
+    "tasks_done",
+    "tasks_paused",
+    "tasks_blocked",
+    "workers",
+    "nodes",
+)
 
-@main.command()
-@COLONY_URL_OPTION
-@TOKEN_OPTION
-def scout(colony_url: str, token: str | None):
-    """Show colony status as a table."""
-    status = _get(colony_url, "/status", token=token)
+
+def _render_scout(status: dict, prev: dict | None) -> None:
+    """Render a status table, highlighting changes vs prev snapshot."""
     click.echo(f"{'Field':<25} {'Value'}")
     click.echo("-" * 40)
     for key, value in status.items():
-        click.echo(f"{key:<25} {value}")
+        value_str = str(value)
+        if prev is not None and key in prev:
+            prev_val = prev[key]
+            if isinstance(value, (int, float)) and isinstance(prev_val, (int, float)):
+                if value > prev_val:
+                    value_str = click.style(value_str, fg="green")
+                elif value < prev_val:
+                    value_str = click.style(value_str, fg="red")
+        click.echo(f"{key:<25} {value_str}")
+
+
+@main.command()
+@click.option("--watch", is_flag=True, default=False, help="Re-poll continuously.")
+@click.option(
+    "--interval",
+    default=5,
+    show_default=True,
+    help="Seconds between polls (with --watch).",
+)
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def scout(watch: bool, interval: int, colony_url: str, token: str | None):
+    """Show colony status as a table."""
+    if not watch:
+        status = _get(colony_url, "/status", token=token)
+        _render_scout(status, None)
+        return
+
+    prev_status = None
+    try:
+        while True:
+            click.clear()
+            status = _get(colony_url, "/status", token=token)
+            _render_scout(status, prev_status)
+            prev_status = status
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
 
 
 # ---------------------------------------------------------------------------
