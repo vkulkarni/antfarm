@@ -124,6 +124,57 @@ def build_failure_record(
 
 
 # ---------------------------------------------------------------------------
+# Review verdict parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_review_verdict(output: str) -> dict | None:
+    """Extract a ReviewVerdict dict from agent output.
+
+    Looks for content between [REVIEW_VERDICT] and [/REVIEW_VERDICT] tags,
+    parses as JSON, and validates required fields.
+
+    Returns None if no valid verdict is found.
+    """
+    import re
+
+    match = re.search(
+        r"\[REVIEW_VERDICT\]\s*(.*?)\s*\[/REVIEW_VERDICT\]",
+        output,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+
+    try:
+        data = _json.loads(match.group(1))
+    except (ValueError, _json.JSONDecodeError):
+        return None
+
+    # Validate required fields
+    required = {"provider", "verdict", "summary"}
+    if not required.issubset(data.keys()):
+        return None
+
+    # Validate verdict value
+    if data["verdict"] not in ("pass", "needs_changes", "blocked"):
+        return None
+
+    return data
+
+
+def _extract_branch_from_spec(spec: str) -> str | None:
+    """Extract branch name from a review task spec ("Branch: xxx" line)."""
+    import re
+
+    match = re.search(r"^Branch:\s*(.+)$", spec, re.MULTILINE)
+    if match:
+        branch = match.group(1).strip()
+        return branch if branch else None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Agent result
 # ---------------------------------------------------------------------------
 
@@ -292,6 +343,31 @@ class WorkerRuntime:
                 exc,
             )
 
+        # For review tasks: parse verdict from output and store on original task
+        if task_id.startswith("review-") and result.returncode == 0:
+            original_task_id = task_id[len("review-"):]
+            verdict = _parse_review_verdict(result.stdout + result.stderr)
+            if verdict:
+                try:
+                    original = self.colony.get_task(original_task_id)
+                    if original and original.get("current_attempt"):
+                        self.colony.store_review_verdict(
+                            original_task_id,
+                            original["current_attempt"],
+                            verdict,
+                        )
+                        logger.info(
+                            "stored review verdict on %s verdict=%s",
+                            original_task_id,
+                            verdict.get("verdict"),
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "failed to store review verdict for %s: %s",
+                        original_task_id,
+                        exc,
+                    )
+
         return True
 
     # ------------------------------------------------------------------
@@ -312,24 +388,44 @@ class WorkerRuntime:
         """
         spec = task.get("spec", "")
         title = task.get("title", "")
-        branch = f"feat/{task['id']}-{task['current_attempt']}"
+        is_review = task["id"].startswith("review-")
+        branch = _extract_branch_from_spec(spec) if is_review else None
+        if not branch:
+            branch = f"feat/{task['id']}-{task['current_attempt']}"
 
-        prompt = (
-            f"Task: {title}\n\n"
-            f"Spec: {spec}\n\n"
-            f"You are working in: {workspace}\n"
-            f"Branch: {branch}\n\n"
-            "Instructions:\n"
-            "1. Implement the task as specified\n"
-            "2. Run tests to verify your changes work\n"
-            "3. Commit all changes with a descriptive message\n"
-            "4. Push the branch: git push -u origin {branch}\n"
-        )
+        if is_review:
+            prompt = (
+                f"Task: {title}\n\n"
+                f"Spec: {spec}\n\n"
+                f"You are working in: {workspace}\n"
+                f"Branch: {branch}\n\n"
+                "Instructions:\n"
+                "1. Read the PR diff for the branch above\n"
+                "2. Check for bugs, security issues, and design problems\n"
+                "3. Run tests to verify correctness\n"
+                "4. Output your verdict between tags:\n"
+                '   [REVIEW_VERDICT]{"provider":"<agent>","verdict":"pass",'
+                '"summary":"...","findings":[],'
+                '"reviewed_commit_sha":"..."}[/REVIEW_VERDICT]\n'
+            )
+        else:
+            prompt = (
+                f"Task: {title}\n\n"
+                f"Spec: {spec}\n\n"
+                f"You are working in: {workspace}\n"
+                f"Branch: {branch}\n\n"
+                "Instructions:\n"
+                "1. Implement the task as specified\n"
+                "2. Run tests to verify your changes work\n"
+                "3. Commit all changes with a descriptive message\n"
+                "4. Push the branch: git push -u origin {branch}\n"
+            )
 
+        agent_role = "reviewer" if is_review else "worker"
         if self.agent_type == "claude-code":
             cmd = [
                 "claude", "-p",
-                "--agent", "worker",
+                "--agent", agent_role,
                 "--permission-mode", "bypassPermissions",
                 prompt,
             ]

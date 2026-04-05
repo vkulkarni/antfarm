@@ -95,6 +95,11 @@ class KickbackRequest(BaseModel):
     reason: str
 
 
+class ReviewVerdictRequest(BaseModel):
+    attempt_id: str
+    verdict: dict
+
+
 class MergeRequest(BaseModel):
     attempt_id: str
 
@@ -314,6 +319,17 @@ def get_app(
         """Return a task to ready state with the given reason."""
         try:
             _backend.kickback(task_id, req.reason)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/review-verdict", status_code=200)
+    def store_review_verdict(task_id: str, req: ReviewVerdictRequest):
+        """Store a ReviewVerdict on the task's current attempt."""
+        try:
+            _backend.store_review_verdict(task_id, req.attempt_id, req.verdict)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"ok": True}

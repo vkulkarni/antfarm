@@ -600,6 +600,24 @@ class GitHubBackend(TaskBackend):
         self._api("PATCH", f"/issues/{issue_number}", json={"state": "closed"})
         self._add_comment(issue_number, "[merged] Task merged successfully.")
 
+    def store_review_verdict(
+        self, task_id: str, attempt_id: str, verdict: dict
+    ) -> None:
+        """Store a ReviewVerdict on the task's current attempt."""
+        task, issue_number = self._get_task_issue(task_id)
+        if issue_number is None:
+            raise FileNotFoundError(f"Task '{task_id}' not found")
+        if task.get("current_attempt") != attempt_id:
+            raise ValueError(
+                f"attempt_id '{attempt_id}' is not the current attempt"
+            )
+        for a in task["attempts"]:
+            if a["attempt_id"] == attempt_id:
+                a["review_verdict"] = verdict
+                break
+        task["updated_at"] = _now_iso()
+        self._update_task_body(issue_number, task)
+
     def pause_task(self, task_id: str) -> None:
         """Pause an active task. Swap label active -> paused."""
         task, issue_number = self._get_task_issue(task_id)
