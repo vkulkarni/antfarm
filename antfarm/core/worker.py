@@ -216,7 +216,7 @@ class WorkerRuntime:
                 prompt,
             ]
         elif self.agent_type == "codex":
-            cmd = ["codex", "--prompt", prompt]
+            cmd = ["codex", "--approval-mode", "full-auto", "--quiet", prompt]
         elif self.agent_type == "aider":
             cmd = ["aider", "--message", prompt, "--yes", "--no-auto-commits"]
         else:
