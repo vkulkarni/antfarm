@@ -92,6 +92,24 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
+    def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
+        """Transition task from ACTIVE to HARVEST_PENDING.
+
+        Called by the worker after agent execution completes but before
+        writing artifact/failure data. If the worker dies between this call
+        and mark_harvested/mark_failed, the inbox surfaces it.
+
+        Args:
+            task_id: ID of the task.
+            attempt_id: ID of the current attempt.
+
+        Raises:
+            ValueError: If attempt_id is not the current attempt.
+            FileNotFoundError: If the task is not found in active state.
+        """
+        ...
+
+    @abstractmethod
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
         """Mark attempt as MERGED. Task stays DONE in done/ folder.
 

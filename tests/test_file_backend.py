@@ -701,3 +701,114 @@ def test_list_workers_returns_all(backend: FileBackend) -> None:
     ids = {w["worker_id"] for w in workers}
     assert ids == {"worker-0", "worker-1", "worker-2"}
 
+
+# ---------------------------------------------------------------------------
+# v0.5.1: mark_harvest_pending
+# ---------------------------------------------------------------------------
+
+
+def test_mark_harvest_pending_updates_status(backend: FileBackend) -> None:
+    """mark_harvest_pending() transitions active task to harvest_pending."""
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+
+    backend.mark_harvest_pending("task-1", attempt_id)
+
+    task = backend.get_task("task-1")
+    assert task is not None
+    assert task["status"] == "harvest_pending"
+
+
+def test_mark_harvest_pending_wrong_attempt_raises(backend: FileBackend) -> None:
+    """mark_harvest_pending() rejects wrong attempt_id."""
+    backend.carry(_make_task("task-1"))
+    backend.pull("worker-1")
+
+    with pytest.raises(ValueError, match="not the current attempt"):
+        backend.mark_harvest_pending("task-1", "bogus-attempt")
+
+
+def test_mark_harvest_pending_not_active_raises(backend: FileBackend) -> None:
+    """mark_harvest_pending() raises for task not in active/."""
+    backend.carry(_make_task("task-1"))
+    with pytest.raises(FileNotFoundError):
+        backend.mark_harvest_pending("task-1", "att-1")
+
+
+def test_harvest_pending_then_harvested(backend: FileBackend) -> None:
+    """Full flow: active → harvest_pending → done (via mark_harvested)."""
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+
+    backend.mark_harvest_pending("task-1", attempt_id)
+    task = backend.get_task("task-1")
+    assert task["status"] == "harvest_pending"
+
+    # mark_harvested should still work from harvest_pending (file still in active/)
+    backend.mark_harvested("task-1", attempt_id, pr="pr-1", branch="feat/t1")
+    task = backend.get_task("task-1")
+    assert task["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# v0.5.1: backward compatibility for old persisted state
+# ---------------------------------------------------------------------------
+
+
+def test_old_state_loads_with_new_lifecycle(tmp_path: Path) -> None:
+    """Existing task JSON with old 'ready'/'active'/'done' values loads correctly."""
+    data_dir = tmp_path / ".antfarm"
+    ready_dir = data_dir / "tasks" / "ready"
+    ready_dir.mkdir(parents=True)
+    # Create minimal required dirs
+    for d in ["tasks/active", "tasks/done", "tasks/paused", "tasks/blocked",
+              "workers", "nodes", "guards"]:
+        (data_dir / d).mkdir(parents=True, exist_ok=True)
+
+    old_task = {
+        "id": "task-old",
+        "title": "Old task",
+        "spec": "x",
+        "status": "ready",  # old state name
+        "complexity": "M",
+        "priority": 10,
+        "depends_on": [],
+        "touches": [],
+        "capabilities_required": [],
+        "pinned_to": None,
+        "merge_override": None,
+        "current_attempt": None,
+        "attempts": [],
+        "trail": [],
+        "signals": [],
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "created_by": "test",
+    }
+    (ready_dir / "task-old.json").write_text(json.dumps(old_task))
+
+    backend = FileBackend(root=str(data_dir))
+
+    tasks = backend.list_tasks()
+    assert len(tasks) == 1
+    assert tasks[0]["id"] == "task-old"
+
+    # Should be pullable
+    backend.register_worker({
+        "worker_id": "w1",
+        "node_id": "n1",
+        "agent_type": "generic",
+        "workspace_root": "/tmp",
+        "capabilities": [],
+        "status": "idle",
+        "registered_at": "2026-01-01T00:00:00Z",
+        "last_heartbeat": "2026-01-01T00:00:00Z",
+    })
+    result = backend.pull("w1")
+    assert result is not None
+    assert result["id"] == "task-old"
+

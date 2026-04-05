@@ -346,6 +346,27 @@ class FileBackend(TaskBackend):
             self._write_json(done_path, data)
             os.rename(done_path, self._ready_path(task_id))
 
+    def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
+        """Transition task from ACTIVE to HARVEST_PENDING.
+
+        Task stays in active/ directory but status field changes.
+        """
+        with self._lock:
+            active_path = self._active_path(task_id)
+            if not active_path.exists():
+                raise FileNotFoundError(f"Task '{task_id}' not found in active/")
+
+            data = self._read_json(active_path)
+            if data.get("current_attempt") != attempt_id:
+                raise ValueError(
+                    f"attempt_id '{attempt_id}' is not the current attempt "
+                    f"(got '{data.get('current_attempt')}')"
+                )
+
+            data["status"] = "harvest_pending"
+            data["updated_at"] = _now_iso()
+            self._write_json(active_path, data)
+
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
         """Update attempt status to MERGED in done/ task file. Task stays DONE."""
         with self._lock:
