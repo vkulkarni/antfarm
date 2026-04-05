@@ -777,5 +777,60 @@ def deploy(
         click.echo(f"[{icon}] {r.node_id} ({r.host}) worker-{r.worker_index}: {r.message}")
 
 
+# ---------------------------------------------------------------------------
+# import
+# ---------------------------------------------------------------------------
+
+
+@main.command("import")
+@click.option("--from", "source", required=True, type=click.Choice(["github", "json"]))
+@click.option("--repo", default=None)
+@click.option("--file", "file_path", default=None)
+@click.option("--github-token", default=None, envvar="GITHUB_TOKEN")
+@click.option("--label", default=None, help="GitHub label filter")
+@click.option("--dry-run", is_flag=True)
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def import_cmd(
+    source: str,
+    repo: str | None,
+    file_path: str | None,
+    github_token: str | None,
+    label: str | None,
+    dry_run: bool,
+    colony_url: str,
+    token: str | None,
+):
+    """Import tasks from an external source into the colony."""
+    from antfarm.core.importers.github import GitHubImporter
+    from antfarm.core.importers.json_file import JsonFileImporter
+
+    if source == "github":
+        if not repo:
+            raise click.UsageError("--repo is required when --from=github")
+        importer = GitHubImporter(repo=repo, token=github_token, label=label)
+    else:
+        if not file_path:
+            raise click.UsageError("--file is required when --from=json")
+        importer = JsonFileImporter(file_path=file_path)
+
+    tasks = importer.import_tasks()
+
+    if not tasks:
+        click.echo("No tasks found.")
+        return
+
+    for task in tasks:
+        if dry_run:
+            click.echo(json.dumps(task, indent=2))
+        else:
+            if "id" not in task:
+                task["id"] = f"task-{int(time.time() * 1000)}"
+            result = _post(colony_url, "/tasks", task, token=token)
+            click.echo(f"Imported: {result}")
+
+    click.echo(f"{'[dry-run] Would import' if dry_run else 'Imported'} {len(tasks)} task(s).")
+
+
 if __name__ == "__main__":
     main()
