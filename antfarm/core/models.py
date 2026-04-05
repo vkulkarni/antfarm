@@ -103,13 +103,18 @@ class TrailEntry:
     ts: str
     worker_id: str
     message: str
+    action_type: str | None = None  # "carry", "forage", "harvest", "kickback",
+    # "merge", "review", "pause", "resume", "reassign", "block", "unblock", "failure"
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "ts": self.ts,
             "worker_id": self.worker_id,
             "message": self.message,
         }
+        if self.action_type is not None:
+            d["action_type"] = self.action_type
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> TrailEntry:
@@ -117,6 +122,7 @@ class TrailEntry:
             ts=data["ts"],
             worker_id=data["worker_id"],
             message=data["message"],
+            action_type=data.get("action_type"),
         )
 
 

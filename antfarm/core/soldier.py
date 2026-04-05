@@ -551,6 +551,23 @@ class Soldier:
                 return attempt.get("review_verdict")
         return None
 
+    @staticmethod
+    def _sha_match(sha_a: str, sha_b: str) -> bool:
+        """Compare two git SHAs, handling abbreviated forms.
+
+        Full SHAs (40+ chars): exact equality.
+        Abbreviated (7+ chars): prefix match.
+        Too short (< 7 chars): reject as unreliable.
+        """
+        if not sha_a or not sha_b:
+            return False
+        if len(sha_a) >= 40 and len(sha_b) >= 40:
+            return sha_a == sha_b
+        shorter, longer = sorted([sha_a, sha_b], key=len)
+        if len(shorter) < 7:
+            return False
+        return longer.startswith(shorter)
+
     def check_freshness(self, artifact_dict: dict) -> bool:
         """Check if the artifact's target branch SHA still matches current HEAD.
 
@@ -574,9 +591,7 @@ class Soldier:
             if r.returncode != 0:
                 return True  # can't check — allow
             current_sha = r.stdout.strip()
-            return current_sha.startswith(target_sha) or target_sha.startswith(
-                current_sha
-            )
+            return self._sha_match(current_sha, target_sha)
         except Exception:
             return True  # can't check — allow
 
@@ -602,10 +617,7 @@ class Soldier:
             if (
                 head_sha
                 and verdict.reviewed_commit_sha
-                and not (
-                    head_sha.startswith(verdict.reviewed_commit_sha)
-                    or verdict.reviewed_commit_sha.startswith(head_sha)
-                )
+                and not self._sha_match(head_sha, verdict.reviewed_commit_sha)
             ):
                 return (
                     False,

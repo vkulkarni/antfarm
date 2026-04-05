@@ -201,12 +201,14 @@ class AntfarmTUI:
             task_title = task.get("title", "")
             status = task.get("status", "")
 
-            # Get worker from current attempt
-            current_attempt = task.get("current_attempt") or {}
-            if isinstance(current_attempt, dict):
-                worker_id = current_attempt.get("worker_id", "")
-            else:
-                worker_id = ""
+            # Get worker from current attempt (current_attempt is a string ID)
+            current_attempt_id = task.get("current_attempt")
+            worker_id = ""
+            if current_attempt_id:
+                for attempt in task.get("attempts", []):
+                    if attempt.get("attempt_id") == current_attempt_id:
+                        worker_id = attempt.get("worker_id", "")
+                        break
 
             # Get last trail message
             trail = task.get("trail", [])

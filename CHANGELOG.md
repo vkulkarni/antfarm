@@ -6,6 +6,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-05
+
+### Added
+- Canonical scheduler — single scheduling brain, no inline scheduling in backends
+- Task/attempt lifecycle with enriched states (TaskState, AttemptState, HARVEST_PENDING)
+- Lifecycle transition validators with backward-compatible state mapping
+- Failure taxonomy: classify_failure() with 8 failure types and default retry policies
+- FailureRecord structured failure data persisted on attempts
+- Operator inbox (`antfarm inbox`) — surfaces stale workers, blocked/failed/kicked-back tasks
+- TaskArtifact: structured output with hard evidence + advisory split, freshness SHAs
+- ReviewVerdict contract for structured review outcomes
+- Review pack generation from artifacts (`review_pack.py`)
+- Review-as-task flow — Soldier creates review tasks, reviewer workers produce verdicts
+- Merge gating on artifact + freshness + review verdict (autonomous loop)
+- Reviewer agent definitions for Claude Code and Codex adapters
+- Repo memory — trusted facts, task outcomes, hotspots, failure patterns, touch observations
+- Conflict prevention — overlap warnings on carry, conflict risk scoring
+- Scheduler hotspot weighting (deprioritize hot scopes)
+- AI-assisted task decomposition (`antfarm plan --spec/--file`)
+- Memory CLI commands (`antfarm memory show/set-fact/detect/recompute`)
+- Audit trail enrichment with `action_type` on TrailEntry
+- Architecture and Operator Guide documentation
+- mark_harvest_pending endpoint and lifecycle state
+- task_id sanitization against path traversal
+- ColonyClient.carry() and store_review_verdict() methods
+
+### Fixed
+- TUI rendering bug — current_attempt is string ID, not dict
+- SHA comparison in check_freshness and check_review_verdict — proper matching with min 7 chars
+- Multiple scheduling brains consolidated to scheduler.select_task()
+
+### Changed
+- FileBackend.pull() delegates entirely to scheduler.select_task()
+- mark_harvested() accepts optional artifact dict
+- TrailEntry supports optional action_type field (backward compatible)
+
 ## [0.4.0] - 2026-04-05
 
 ### Added
