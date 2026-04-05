@@ -1,0 +1,213 @@
+"""Abstract base class for Antfarm task backends.
+
+Defines the TaskBackend interface with explicit mutation methods.
+No generic update(**fields) — each method enforces a valid state transition.
+
+Backend implementations: FileBackend (v0.1), PostgresBackend (v0.2+).
+"""
+
+from abc import ABC, abstractmethod
+
+
+class TaskBackend(ABC):
+    # --- Task lifecycle ---
+
+    @abstractmethod
+    def carry(self, task: dict) -> str:
+        """Add a task to the queue.
+
+        Args:
+            task: Task dict with at minimum 'id', 'title', 'spec', 'created_at',
+                  'updated_at', 'created_by'.
+
+        Returns:
+            The task ID.
+
+        Raises:
+            ValueError: If a task with the same ID already exists.
+        """
+        ...
+
+    @abstractmethod
+    def pull(self, worker_id: str) -> dict | None:
+        """Claim next eligible task for a worker. Creates a new attempt. Atomic.
+
+        Args:
+            worker_id: ID of the worker claiming the task.
+
+        Returns:
+            The claimed task dict (with a new ACTIVE attempt), or None if no
+            eligible task exists.
+        """
+        ...
+
+    @abstractmethod
+    def append_trail(self, task_id: str, entry: dict) -> None:
+        """Append a TrailEntry dict to the task's trail list.
+
+        Args:
+            task_id: ID of the task.
+            entry: TrailEntry dict with 'ts', 'worker_id', 'message'.
+        """
+        ...
+
+    @abstractmethod
+    def append_signal(self, task_id: str, entry: dict) -> None:
+        """Append a SignalEntry dict to the task's signals list.
+
+        Args:
+            task_id: ID of the task.
+            entry: SignalEntry dict with 'ts', 'worker_id', 'message'.
+        """
+        ...
+
+    @abstractmethod
+    def mark_harvested(self, task_id: str, attempt_id: str, pr: str, branch: str) -> None:
+        """Transition task to DONE, attempt to DONE.
+
+        Idempotent: if task is already DONE with this attempt_id, no-op.
+
+        Args:
+            task_id: ID of the task.
+            attempt_id: ID of the attempt being completed.
+            pr: Pull request URL or identifier.
+            branch: Branch name for the completed work.
+
+        Raises:
+            ValueError: If attempt_id is not the current attempt on the task.
+        """
+        ...
+
+    @abstractmethod
+    def kickback(self, task_id: str, reason: str) -> None:
+        """Transition task to READY, current attempt to SUPERSEDED.
+
+        Sets current_attempt to None. Next pull() creates a fresh attempt.
+        Adds a failure TrailEntry with the reason.
+
+        Args:
+            task_id: ID of the task.
+            reason: Human-readable reason for the kickback.
+        """
+        ...
+
+    @abstractmethod
+    def mark_merged(self, task_id: str, attempt_id: str) -> None:
+        """Mark attempt as MERGED. Task stays DONE in done/ folder.
+
+        Merged state is tracked on the attempt, not the task status.
+
+        Args:
+            task_id: ID of the task.
+            attempt_id: ID of the attempt that was merged.
+        """
+        ...
+
+    @abstractmethod
+    def list_tasks(self, status: str | None = None) -> list[dict]:
+        """List tasks, optionally filtered by status.
+
+        Args:
+            status: Optional status filter ('ready', 'active', 'done').
+
+        Returns:
+            List of task dicts.
+        """
+        ...
+
+    @abstractmethod
+    def get_task(self, task_id: str) -> dict | None:
+        """Get a single task by ID.
+
+        Args:
+            task_id: ID of the task.
+
+        Returns:
+            Task dict, or None if not found.
+        """
+        ...
+
+    # --- Guards (distributed locks) ---
+
+    @abstractmethod
+    def guard(self, resource: str, owner: str) -> bool:
+        """Acquire an exclusive guard on a resource.
+
+        Args:
+            resource: Resource identifier to lock.
+            owner: Worker ID acquiring the guard.
+
+        Returns:
+            True if guard was acquired, False if already held by another owner.
+        """
+        ...
+
+    @abstractmethod
+    def release_guard(self, resource: str, owner: str) -> None:
+        """Release a guard. Only the owner can release.
+
+        Args:
+            resource: Resource identifier to unlock.
+            owner: Worker ID that holds the guard.
+
+        Raises:
+            PermissionError: If owner does not match the guard's recorded owner.
+            FileNotFoundError: If no guard exists for the resource.
+        """
+        ...
+
+    # --- Nodes ---
+
+    @abstractmethod
+    def register_node(self, node: dict) -> None:
+        """Register a node. Idempotent — updates last_seen if already registered.
+
+        Args:
+            node: Node dict with 'node_id', 'joined_at', 'last_seen'.
+        """
+        ...
+
+    # --- Workers ---
+
+    @abstractmethod
+    def register_worker(self, worker: dict) -> None:
+        """Register a worker.
+
+        Args:
+            worker: Worker dict with 'worker_id', 'node_id', etc.
+
+        Raises:
+            ValueError: If a live (non-stale) worker with the same ID already exists.
+        """
+        ...
+
+    @abstractmethod
+    def deregister_worker(self, worker_id: str) -> None:
+        """Deregister a worker. No-op if the worker is not registered.
+
+        Args:
+            worker_id: ID of the worker to deregister.
+        """
+        ...
+
+    @abstractmethod
+    def heartbeat(self, worker_id: str, status: dict) -> None:
+        """Update worker presence and status.
+
+        Args:
+            worker_id: ID of the worker sending the heartbeat.
+            status: Status dict to persist (e.g. current task, state).
+        """
+        ...
+
+    # --- Status ---
+
+    @abstractmethod
+    def status(self) -> dict:
+        """Return backend status summary.
+
+        Returns:
+            Dict with counts and health info (e.g. ready/active/done task counts,
+            registered worker count).
+        """
+        ...
