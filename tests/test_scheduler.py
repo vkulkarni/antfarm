@@ -10,6 +10,7 @@ def make_task(
     created_at: str = "2026-01-01T00:00:00Z",
     depends_on: list[str] | None = None,
     touches: list[str] | None = None,
+    capabilities_required: list[str] | None = None,
     status: TaskStatus = TaskStatus.READY,
 ) -> Task:
     return Task(
@@ -22,6 +23,7 @@ def make_task(
         priority=priority,
         depends_on=depends_on or [],
         touches=touches or [],
+        capabilities_required=capabilities_required or [],
         status=status,
     )
 
@@ -125,3 +127,51 @@ def test_multiple_active_scopes():
     )
     # clean has no overlap, so it wins despite lower priority
     assert result is clean
+
+
+def test_capability_match_allows_task():
+    """Task is eligible when worker has all required capabilities."""
+    t = make_task("t1", capabilities_required=["gpu", "docker"])
+    result = select_task(
+        [t],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_capabilities={"gpu", "docker", "extra"},
+    )
+    assert result is t
+
+
+def test_capability_mismatch_skips_task():
+    """Task is skipped when worker is missing a required capability."""
+    t = make_task("t1", capabilities_required=["gpu"])
+    result = select_task(
+        [t],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_capabilities={"docker"},
+    )
+    assert result is None
+
+
+def test_no_capabilities_required_always_eligible():
+    """Task with no capabilities_required is eligible regardless of worker_capabilities."""
+    t = make_task("t1", capabilities_required=[])
+    result = select_task(
+        [t],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_capabilities=set(),
+    )
+    assert result is t
+
+
+def test_worker_capabilities_none_skips_filter():
+    """When worker_capabilities is None, capability filtering is skipped (backward compatible)."""
+    t = make_task("t1", capabilities_required=["gpu"])
+    result = select_task(
+        [t],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_capabilities=None,
+    )
+    assert result is t

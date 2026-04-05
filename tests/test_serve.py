@@ -299,3 +299,59 @@ def test_scent_new_entries(tmp_path):
 
     t.join(timeout=5)
     assert "late entry" in messages
+
+
+def test_carry_with_capabilities_and_pull_with_capable_worker(tmp_path):
+    """carry accepts capabilities_required; capable worker gets the task, incapable gets none."""
+    from antfarm.core.backends.file import FileBackend
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend)
+    client = TestClient(app)
+
+    # Submit a task requiring "gpu"
+    r = client.post(
+        "/tasks",
+        json={
+            "id": "task-gpu",
+            "title": "GPU task",
+            "spec": "needs gpu",
+            "capabilities_required": ["gpu"],
+        },
+    )
+    assert r.status_code == 201
+
+    # Register a capable worker
+    r = client.post(
+        "/workers/register",
+        json={
+            "worker_id": "worker-gpu",
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp",
+            "capabilities": ["gpu"],
+        },
+    )
+    assert r.status_code == 201
+
+    # Register a non-capable worker
+    r = client.post(
+        "/workers/register",
+        json={
+            "worker_id": "worker-cpu",
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp",
+            "capabilities": [],
+        },
+    )
+    assert r.status_code == 201
+
+    # Non-capable worker gets nothing
+    r = client.post("/tasks/pull", json={"worker_id": "worker-cpu"})
+    assert r.status_code == 204
+
+    # Capable worker gets the task
+    r = client.post("/tasks/pull", json={"worker_id": "worker-gpu"})
+    assert r.status_code == 200
+    assert r.json()["id"] == "task-gpu"
