@@ -7,15 +7,26 @@ import httpx
 class ColonyClient:
     """HTTP client for communicating with the Colony API server."""
 
-    def __init__(self, base_url: str, client: httpx.Client | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        client: httpx.Client | None = None,
+        token: str | None = None,
+    ):
         """Initialize client.
 
         Args:
             base_url: Colony server URL (e.g., "http://localhost:7433")
             client: Optional httpx.Client for dependency injection in tests.
+            token: Optional bearer token for authentication.
         """
         self.base_url = base_url.rstrip("/")
-        self._client = client or httpx.Client(base_url=self.base_url, timeout=30.0)
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        self._client = client or httpx.Client(
+            base_url=self.base_url, timeout=30.0, headers=headers
+        )
         self._owns_client = client is None  # only close if we created it
 
     def register_node(self, node_id: str) -> dict:

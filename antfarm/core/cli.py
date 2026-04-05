@@ -27,23 +27,44 @@ COLONY_URL_OPTION = click.option(
     help="Colony server URL.",
 )
 
+TOKEN_OPTION = click.option(
+    "--token",
+    default=None,
+    envvar="ANTFARM_TOKEN",
+    help="Bearer token for colony authentication.",
+)
 
-def _post(colony_url: str, path: str, payload: dict) -> dict | None:
-    r = httpx.post(f"{colony_url.rstrip('/')}{path}", json=payload)
+
+def _auth_headers(token: str | None) -> dict:
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
+def _post(
+    colony_url: str, path: str, payload: dict, token: str | None = None
+) -> dict | None:
+    r = httpx.post(
+        f"{colony_url.rstrip('/')}{path}", json=payload, headers=_auth_headers(token)
+    )
     r.raise_for_status()
     if r.status_code == 204:
         return None
     return r.json()
 
 
-def _get(colony_url: str, path: str) -> dict:
-    r = httpx.get(f"{colony_url.rstrip('/')}{path}")
+def _get(colony_url: str, path: str, token: str | None = None) -> dict:
+    r = httpx.get(f"{colony_url.rstrip('/')}{path}", headers=_auth_headers(token))
     r.raise_for_status()
     return r.json()
 
 
-def _delete(colony_url: str, path: str, params: dict | None = None) -> None:
-    r = httpx.delete(f"{colony_url.rstrip('/')}{path}", params=params or {})
+def _delete(
+    colony_url: str, path: str, params: dict | None = None, token: str | None = None
+) -> None:
+    r = httpx.delete(
+        f"{colony_url.rstrip('/')}{path}", params=params or {}, headers=_auth_headers(token)
+    )
     r.raise_for_status()
 
 
@@ -66,7 +87,13 @@ def main():
 @click.option("--port", default=7433, show_default=True, help="Port to listen on.")
 @click.option("--host", default="0.0.0.0", show_default=True, help="Host to bind.")
 @click.option("--data-dir", default=".antfarm", show_default=True, help="Data directory.")
-def colony(port: int, host: str, data_dir: str):
+@click.option(
+    "--auth-token",
+    default=None,
+    envvar="ANTFARM_AUTH_TOKEN",
+    help="Shared secret for bearer token auth. Enables auth on all endpoints except GET /status.",
+)
+def colony(port: int, host: str, data_dir: str, auth_token: str | None):
     """Start the colony server."""
     import uvicorn
 
@@ -74,7 +101,11 @@ def colony(port: int, host: str, data_dir: str):
     from antfarm.core.serve import get_app
 
     backend = FileBackend(data_dir)
-    app = get_app(backend)
+    app = get_app(backend, auth_secret=auth_token)
+    if auth_token:
+        from antfarm.core.auth import generate_token
+
+        click.echo(f"Auth enabled. Bearer token: {generate_token(auth_token)}")
     uvicorn.run(app, host=host, port=port)
 
 
@@ -86,9 +117,10 @@ def colony(port: int, host: str, data_dir: str):
 @main.command()
 @click.option("--node", required=True, help="Node ID to register.")
 @COLONY_URL_OPTION
-def join(node: str, colony_url: str):
+@TOKEN_OPTION
+def join(node: str, colony_url: str, token: str | None):
     """Register this node with the colony."""
-    result = _post(colony_url, "/nodes", {"node_id": node})
+    result = _post(colony_url, "/nodes", {"node_id": node}, token=token)
     click.echo(f"Joined colony as node '{node}': {result}")
 
 
@@ -108,8 +140,9 @@ def worker():
 @click.option("--workspace-root", default=None, help="Root directory for worktrees.")
 @click.option("--node", required=True, help="Node ID this worker belongs to.")
 @click.option("--repo-path", default=".", show_default=True, help="Path to git repo.")
-@click.option("--integration-branch", default="dev", show_default=True, help="Branch to create worktrees from.")
+@click.option("--integration-branch", default="dev", show_default=True, help="Integration branch.")
 @COLONY_URL_OPTION
+@TOKEN_OPTION
 def worker_start(
     agent: str,
     name: str | None,
@@ -118,6 +151,7 @@ def worker_start(
     repo_path: str,
     integration_branch: str,
     colony_url: str,
+    token: str | None,
 ):
     """Start a worker and enter the forage loop."""
     from antfarm.core.worker import WorkerRuntime
@@ -133,6 +167,7 @@ def worker_start(
         workspace_root=ws_root,
         repo_path=repo_path,
         integration_branch=integration_branch,
+        token=token,
     )
     runtime.run()
 
@@ -158,6 +193,7 @@ def worker_start(
 @click.option("--file", "file_path", default=None, help="JSON file with task payload.")
 @click.option("--id", "task_id", default=None, help="Task ID (auto-generated if omitted).")
 @COLONY_URL_OPTION
+@TOKEN_OPTION
 def carry(
     title: str | None,
     spec: str | None,
@@ -168,6 +204,7 @@ def carry(
     file_path: str | None,
     task_id: str | None,
     colony_url: str,
+    token: str | None,
 ):
     """Submit a task to the colony."""
     if file_path:
@@ -189,7 +226,7 @@ def carry(
         task_id = f"task-{int(time.time() * 1000)}"
     payload["id"] = task_id
 
-    result = _post(colony_url, "/tasks", payload)
+    result = _post(colony_url, "/tasks", payload, token=token)
     click.echo(f"Task created: {result}")
 
 
@@ -200,9 +237,10 @@ def carry(
 
 @main.command()
 @COLONY_URL_OPTION
-def scout(colony_url: str):
+@TOKEN_OPTION
+def scout(colony_url: str, token: str | None):
     """Show colony status as a table."""
-    status = _get(colony_url, "/status")
+    status = _get(colony_url, "/status", token=token)
     click.echo(f"{'Field':<25} {'Value'}")
     click.echo("-" * 40)
     for key, value in status.items():
@@ -246,7 +284,15 @@ def doctor(fix: bool, data_dir: str):
 @click.option("--agent", required=True, help="Agent type.")
 @click.option("--workspace-root", default=None, help="Workspace root directory.")
 @COLONY_URL_OPTION
-def hatch(name: str | None, node: str, agent: str, workspace_root: str | None, colony_url: str):
+@TOKEN_OPTION
+def hatch(
+    name: str | None,
+    node: str,
+    agent: str,
+    workspace_root: str | None,
+    colony_url: str,
+    token: str | None,
+):
     """Register a worker with the colony (low-level)."""
     worker_name = name or agent
     ws_root = workspace_root or f".antfarm/workspaces/{worker_name}"
@@ -256,16 +302,17 @@ def hatch(name: str | None, node: str, agent: str, workspace_root: str | None, c
         "node_id": node,
         "agent_type": agent,
         "workspace_root": ws_root,
-    })
+    }, token=token)
     click.echo(f"Worker registered: {result}")
 
 
 @main.command()
 @click.option("--worker-id", required=True, help="Worker ID.")
 @COLONY_URL_OPTION
-def forage(worker_id: str, colony_url: str):
+@TOKEN_OPTION
+def forage(worker_id: str, colony_url: str, token: str | None):
     """Pull the next available task (low-level)."""
-    result = _post(colony_url, "/tasks/pull", {"worker_id": worker_id})
+    result = _post(colony_url, "/tasks/pull", {"worker_id": worker_id}, token=token)
     if result is None:
         click.echo("No tasks available")
     else:
@@ -277,12 +324,13 @@ def forage(worker_id: str, colony_url: str):
 @click.argument("message")
 @click.option("--worker-id", required=True, help="Worker ID.")
 @COLONY_URL_OPTION
-def trail(task_id: str, message: str, worker_id: str, colony_url: str):
+@TOKEN_OPTION
+def trail(task_id: str, message: str, worker_id: str, colony_url: str, token: str | None):
     """Append a trail entry to a task (low-level)."""
     result = _post(colony_url, f"/tasks/{task_id}/trail", {
         "worker_id": worker_id,
         "message": message,
-    })
+    }, token=token)
     click.echo(f"Trail appended: {result}")
 
 
@@ -292,14 +340,18 @@ def trail(task_id: str, message: str, worker_id: str, colony_url: str):
 @click.option("--attempt", default=None, help="Attempt ID.")
 @click.option("--branch", default=None, help="Branch name.")
 @COLONY_URL_OPTION
-def harvest(task_id: str, pr: str, attempt: str | None, branch: str | None, colony_url: str):
+@TOKEN_OPTION
+def harvest(
+    task_id: str, pr: str, attempt: str | None, branch: str | None, colony_url: str,
+    token: str | None,
+):
     """Mark a task as harvested (completed) with a PR (low-level)."""
     payload: dict = {"pr": pr}
     if attempt:
         payload["attempt_id"] = attempt
     if branch:
         payload["branch"] = branch
-    result = _post(colony_url, f"/tasks/{task_id}/harvest", payload)
+    result = _post(colony_url, f"/tasks/{task_id}/harvest", payload, token=token)
     click.echo(f"Task harvested: {result}")
 
 
@@ -307,9 +359,10 @@ def harvest(task_id: str, pr: str, attempt: str | None, branch: str | None, colo
 @click.argument("resource")
 @click.option("--owner", required=True, help="Owner identifier for this guard.")
 @COLONY_URL_OPTION
-def guard(resource: str, owner: str, colony_url: str):
+@TOKEN_OPTION
+def guard(resource: str, owner: str, colony_url: str, token: str | None):
     """Acquire an exclusive guard lock on a resource (low-level)."""
-    result = _post(colony_url, f"/guards/{resource}", {"owner": owner})
+    result = _post(colony_url, f"/guards/{resource}", {"owner": owner}, token=token)
     click.echo(f"Guard acquired: {result}")
 
 
@@ -317,9 +370,10 @@ def guard(resource: str, owner: str, colony_url: str):
 @click.argument("resource")
 @click.option("--owner", required=True, help="Owner identifier releasing the guard.")
 @COLONY_URL_OPTION
-def release(resource: str, owner: str, colony_url: str):
+@TOKEN_OPTION
+def release(resource: str, owner: str, colony_url: str, token: str | None):
     """Release a guard lock on a resource (low-level)."""
-    _delete(colony_url, f"/guards/{resource}", params={"owner": owner})
+    _delete(colony_url, f"/guards/{resource}", params={"owner": owner}, token=token)
     click.echo(f"Guard released: {resource}")
 
 
@@ -328,12 +382,13 @@ def release(resource: str, owner: str, colony_url: str):
 @click.argument("message")
 @click.option("--worker-id", required=True, help="Worker ID.")
 @COLONY_URL_OPTION
-def signal(task_id: str, message: str, worker_id: str, colony_url: str):
+@TOKEN_OPTION
+def signal(task_id: str, message: str, worker_id: str, colony_url: str, token: str | None):
     """Send a signal message to a task (low-level)."""
     result = _post(colony_url, f"/tasks/{task_id}/signal", {
         "worker_id": worker_id,
         "message": message,
-    })
+    }, token=token)
     click.echo(f"Signal sent: {result}")
 
 

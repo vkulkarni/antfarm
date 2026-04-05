@@ -95,13 +95,19 @@ class GuardRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def get_app(backend: TaskBackend | None = None, data_dir: str = ".antfarm") -> FastAPI:
+def get_app(
+    backend: TaskBackend | None = None,
+    data_dir: str = ".antfarm",
+    auth_secret: str | None = None,
+) -> FastAPI:
     """Create and return the FastAPI application.
 
     Args:
         backend: TaskBackend instance to use. If None, a FileBackend rooted at
                  data_dir is created automatically.
         data_dir: Path to .antfarm directory (only used when backend is None).
+        auth_secret: Optional shared secret for bearer token auth. When set,
+                     all endpoints except GET /status require a valid token.
 
     Returns:
         Configured FastAPI application.
@@ -116,6 +122,11 @@ def get_app(backend: TaskBackend | None = None, data_dir: str = ".antfarm") -> F
         _backend = FileBackend(root=data_dir)
 
     app = FastAPI(title="Antfarm Colony")
+
+    if auth_secret:
+        from antfarm.core.auth import create_auth_middleware
+
+        app.middleware("http")(create_auth_middleware(auth_secret))
 
     # ------------------------------------------------------------------
     # Nodes

@@ -57,6 +57,7 @@ class WorkerRuntime:
         integration_branch: Branch new worktrees are created from.
         heartbeat_interval: Seconds between heartbeat posts (default 30).
         client: Optional httpx.Client for dependency injection in tests.
+        token: Optional bearer token for colony authentication.
     """
 
     def __init__(
@@ -70,14 +71,16 @@ class WorkerRuntime:
         integration_branch: str = "dev",
         heartbeat_interval: float = 30.0,
         client: httpx.Client | None = None,
+        token: str | None = None,
     ):
         self.worker_id = f"{node_id}/{name}"
         self.node_id = node_id
         self.agent_type = agent_type
         self.workspace_root = workspace_root
         self.heartbeat_interval = heartbeat_interval
+        self._token = token
 
-        self.colony = ColonyClient(colony_url, client=client)
+        self.colony = ColonyClient(colony_url, client=client, token=token)
         self.workspace_mgr = WorkspaceManager(workspace_root, repo_path, integration_branch)
 
         self._heartbeat_event = threading.Event()
@@ -222,6 +225,8 @@ class WorkerRuntime:
             "ANTFARM_URL": self.colony.base_url,
             "WORKER_ID": self.worker_id,
         }
+        if self._token:
+            env["ANTFARM_TOKEN"] = self._token
 
         proc = subprocess.run(
             cmd,
