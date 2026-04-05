@@ -1,8 +1,8 @@
 # Antfarm v0.5 — Specification
 
-**Status:** Draft
+**Status:** Draft (final)
 **Date:** 2026-04-05
-**Goal:** Consolidation, not expansion. Make Antfarm the safest, simplest way to run multiple coding agents against one real repo without merge chaos.
+**Goal:** Antfarm v0.5 should not become broader. It should become more trustworthy.
 **Philosophy:** Deterministic core, AI at the edges. Repo execution coordinator, not agent civilization simulator.
 
 ---
@@ -248,6 +248,31 @@ Soldier may merge only if:
 - no blocking reasons remain
 - no serialization rule prevents merge
 
+### Freshness Policy
+
+A branch is considered **fresh** if `target_branch_sha_at_harvest` still matches the current target branch HEAD at merge time. If they differ (another task merged since harvest), the task is `KICKED_BACK` for rebase and re-validation. Soldier does not merge optimistically on stale branches.
+
+### Idempotency
+
+- Repeated harvest calls for the same task+attempt must be safe (no-op if already harvested)
+- Repeated Soldier evaluations must not duplicate merges or PR comments
+- Retries after partial failure must not corrupt task state
+- Recovery paths must be safe to run multiple times
+
+### Operator Override Boundaries
+
+Operators may:
+- Override `needs_review` → `ready`
+- Requeue, pause, reassign, or unblock tasks
+- Force-harvest a stale task
+
+Operators may NOT (without explicit audit trail):
+- Bypass a missing artifact
+- Merge a task with unknown freshness
+- Skip verification checks
+
+Every operator override is recorded as a trail entry with the operator's identity and reason.
+
 **Integration:**
 
 - `mark_harvested()` accepts artifact dict alongside existing params
@@ -301,6 +326,25 @@ class FailureType(StrEnum):
 | `INVALID_TASK` | No automatic retry; escalate to planner/operator |
 
 > Failure type controls default system behavior. Classification without policy is incomplete.
+
+### FailureRecord Shape
+
+Since "artifact or failure record" is an invariant, both sides must be equally concrete:
+
+```python
+@dataclass
+class FailureRecord:
+    task_id: str
+    attempt_id: str
+    worker_id: str
+    failure_type: FailureType
+    message: str
+    retryable: bool
+    captured_at: str                # ISO 8601
+    stderr_summary: str             # first 500 chars of stderr
+    verification_snapshot: dict     # partial artifact data if available
+    recommended_action: str         # "retry", "kickback", "escalate", "quarantine_worker"
+```
 
 **Integration:**
 
