@@ -356,3 +356,60 @@ def test_carry_with_capabilities_and_pull_with_capable_worker(tmp_path):
     r = client.post("/tasks/pull", json={"worker_id": "worker-gpu"})
     assert r.status_code == 200
     assert r.json()["id"] == "task-gpu"
+
+
+# ---------------------------------------------------------------------------
+# Pin / unpin endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_pin_task_endpoint(client):
+    """POST /tasks/{id}/pin sets pinned_to and returns ok."""
+    _carry(client)
+    r = client.post("/tasks/task-001/pin", json={"worker_id": "worker-pinned"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+    task = client.get("/tasks/task-001").json()
+    assert task["pinned_to"] == "worker-pinned"
+
+
+def test_unpin_task_endpoint(client):
+    """POST /tasks/{id}/unpin clears pinned_to and returns ok."""
+    _carry(client)
+    client.post("/tasks/task-001/pin", json={"worker_id": "worker-pinned"})
+    r = client.post("/tasks/task-001/unpin")
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+    task = client.get("/tasks/task-001").json()
+    assert task["pinned_to"] is None
+
+
+def test_pin_nonexistent_task_returns_404(client):
+    """POST /tasks/{id}/pin returns 404 for unknown task."""
+    r = client.post("/tasks/no-such-task/pin", json={"worker_id": "worker-1"})
+    assert r.status_code == 404
+
+
+def test_unpin_nonexistent_task_returns_404(client):
+    """POST /tasks/{id}/unpin returns 404 for unknown task."""
+    r = client.post("/tasks/no-such-task/unpin")
+    assert r.status_code == 404
+
+
+def test_pinned_task_not_pulled_by_wrong_worker(client):
+    """Worker that doesn't match pinned_to gets 204 on pull."""
+    _carry(client)
+    client.post("/tasks/task-001/pin", json={"worker_id": "worker-pinned"})
+    r = client.post("/tasks/pull", json={"worker_id": "worker-other"})
+    assert r.status_code == 204
+
+
+def test_pinned_task_pulled_by_correct_worker(client):
+    """Worker matching pinned_to successfully pulls the task."""
+    _carry(client)
+    client.post("/tasks/task-001/pin", json={"worker_id": "worker-pinned"})
+    r = client.post("/tasks/pull", json={"worker_id": "worker-pinned"})
+    assert r.status_code == 200
+    assert r.json()["id"] == "task-001"

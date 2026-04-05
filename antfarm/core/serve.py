@@ -99,8 +99,16 @@ class BlockRequest(BaseModel):
     reason: str
 
 
+class PinRequest(BaseModel):
+    worker_id: str
+
+
 class GuardRequest(BaseModel):
     owner: str
+
+
+class OverrideOrderRequest(BaseModel):
+    position: int
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +350,42 @@ def get_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True}
 
+    @app.post("/tasks/{task_id}/pin", status_code=200)
+    def pin_task(task_id: str, req: PinRequest):
+        """Pin a ready task to a specific worker."""
+        try:
+            _backend.pin_task(task_id, req.worker_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/unpin", status_code=200)
+    def unpin_task(task_id: str):
+        """Clear the pin on a ready task."""
+        try:
+            _backend.unpin_task(task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/override-order", status_code=200)
+    def override_order(task_id: str, req: OverrideOrderRequest):
+        """Set merge queue position override on a done task."""
+        try:
+            _backend.override_merge_order(task_id, req.position)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.delete("/tasks/{task_id}/override-order", status_code=200)
+    def clear_override_order(task_id: str):
+        """Clear merge queue position override on a done task."""
+        try:
+            _backend.clear_merge_override(task_id)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True}
+
     @app.get("/tasks", status_code=200)
     def list_tasks(status: str | None = Query(default=None)):
         """List tasks with optional ?status= filter."""
@@ -425,5 +469,25 @@ def get_app(
     def colony_status():
         """Return colony status summary."""
         return _backend.status()
+
+    # ------------------------------------------------------------------
+    # Backup status
+    # ------------------------------------------------------------------
+
+    @app.get("/backup/status", status_code=200)
+    def backup_status():
+        """Return last backup result from backup_status.json.
+
+        Returns 404 if no backup has been run yet.
+        """
+        import os
+
+        status_path = os.path.join(data_dir, "backup_status.json")
+        if not os.path.exists(status_path):
+            raise HTTPException(
+                status_code=404, detail="No backup status found. Run a backup first."
+            )
+        with open(status_path) as f:
+            return json.load(f)
 
     return app

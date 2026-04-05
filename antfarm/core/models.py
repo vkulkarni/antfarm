@@ -144,6 +144,8 @@ class Task:
     depends_on: list[str] = field(default_factory=list)
     touches: list[str] = field(default_factory=list)
     capabilities_required: list[str] = field(default_factory=list)
+    pinned_to: str | None = None
+    merge_override: int | None = None
     status: TaskStatus = TaskStatus.READY
     current_attempt: str | None = None
     attempts: list[Attempt] = field(default_factory=list)
@@ -160,6 +162,8 @@ class Task:
             "depends_on": list(self.depends_on),
             "touches": list(self.touches),
             "capabilities_required": list(self.capabilities_required),
+            "pinned_to": self.pinned_to,
+            "merge_override": self.merge_override,
             "status": self.status.value,
             "current_attempt": self.current_attempt,
             "attempts": [a.to_dict() for a in self.attempts],
@@ -181,6 +185,8 @@ class Task:
             depends_on=list(data.get("depends_on", [])),
             touches=list(data.get("touches", [])),
             capabilities_required=list(data.get("capabilities_required", [])),
+            pinned_to=data.get("pinned_to"),
+            merge_override=data.get("merge_override"),
             status=TaskStatus(data.get("status", TaskStatus.READY)),
             current_attempt=data.get("current_attempt"),
             attempts=[Attempt.from_dict(a) for a in data.get("attempts", [])],
