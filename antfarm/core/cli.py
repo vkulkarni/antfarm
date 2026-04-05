@@ -376,16 +376,37 @@ def _render_scout(status: dict, prev: dict | None) -> None:
 
 @main.command()
 @click.option("--watch", is_flag=True, default=False, help="Re-poll continuously.")
+@click.option("--tui", is_flag=True, default=False, help="Launch rich TUI dashboard.")
 @click.option(
     "--interval",
     default=5,
     show_default=True,
     help="Seconds between polls (with --watch).",
 )
+@click.option(
+    "--refresh",
+    default=2.0,
+    show_default=True,
+    help="Seconds between TUI refreshes (with --tui).",
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
-def scout(watch: bool, interval: int, colony_url: str, token: str | None):
+def scout(
+    watch: bool,
+    tui: bool,
+    interval: int,
+    refresh: float,
+    colony_url: str,
+    token: str | None,
+):
     """Show colony status as a table."""
+    if tui:
+        from antfarm.core.tui import AntfarmTUI
+
+        dashboard = AntfarmTUI(colony_url=colony_url, token=token, refresh_interval=refresh)
+        dashboard.run()
+        return
+
     if not watch:
         status = _get(colony_url, "/status", token=token)
         _render_scout(status, None)

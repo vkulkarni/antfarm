@@ -486,6 +486,21 @@ def get_app(
         """Return colony status summary."""
         return _backend.status()
 
+    @app.get("/status/full", status_code=200)
+    def colony_status_full():
+        """Return colony status, all tasks, and all workers in one call.
+
+        Reduces polling overhead for TUI clients that need all three.
+
+        Returns:
+            Dict with 'status', 'tasks', and 'workers' keys.
+        """
+        return {
+            "status": _backend.status(),
+            "tasks": _backend.list_tasks(),
+            "workers": _backend.list_workers(),
+        }
+
     # ------------------------------------------------------------------
     # Backup status
     # ------------------------------------------------------------------
