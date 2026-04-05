@@ -298,6 +298,39 @@ def scout(watch: bool, interval: int, colony_url: str, token: str | None):
 
 
 # ---------------------------------------------------------------------------
+# scent
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.argument("task_id")
+@click.option("--poll-interval", default=1.0, show_default=True, help="Seconds between polls.")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def scent(task_id: str, poll_interval: float, colony_url: str, token: str | None):
+    """Stream real-time trail entries for a task (SSE)."""
+    url = f"{colony_url.rstrip('/')}/scent/{task_id}"
+    params = {"poll_interval": poll_interval}
+    headers = _auth_headers(token)
+    try:
+        with httpx.stream("GET", url, params=params, headers=headers) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line.startswith("data: "):
+                    raw = line[len("data: "):]
+                    try:
+                        entry = json.loads(raw)
+                        ts = entry.get("ts", "")
+                        worker = entry.get("worker_id", "")
+                        message = entry.get("message", "")
+                        click.echo(f"[{ts}] {worker}: {message}")
+                    except json.JSONDecodeError:
+                        click.echo(line)
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
 

@@ -10,10 +10,13 @@ Mutation-critical paths (pull, guard, trail, signal) are protected by _lock.
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from antfarm.core.backends.base import TaskBackend
@@ -373,6 +376,46 @@ def get_app(
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Scent (SSE trail streaming)
+    # ------------------------------------------------------------------
+
+    @app.get("/scent/{task_id}")
+    def scent_task(
+        task_id: str,
+        poll_interval: float = Query(default=1.0),
+        timeout: float = Query(default=0.0),
+    ):
+        """Stream trail entries for a task as Server-Sent Events.
+
+        Args:
+            task_id: Task to stream trail for.
+            poll_interval: Seconds between backend polls.
+            timeout: If > 0, stop streaming after this many seconds.
+        """
+        task = _backend.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+        def _generate():
+            seen = 0
+            start = time.monotonic()
+            try:
+                while True:
+                    if timeout > 0 and (time.monotonic() - start) >= timeout:
+                        break
+                    current = _backend.get_task(task_id)
+                    if current is not None:
+                        trail = current.get("trail", [])
+                        for entry in trail[seen:]:
+                            yield f"data: {json.dumps(entry)}\n\n"
+                        seen = len(trail)
+                    time.sleep(poll_interval)
+            except GeneratorExit:
+                pass
+
+        return StreamingResponse(_generate(), media_type="text/event-stream")
 
     # ------------------------------------------------------------------
     # Status
