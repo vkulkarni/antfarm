@@ -611,33 +611,36 @@ For v0.5, planner can remain simple:
 
 ## Release Slices
 
-### v0.5.1 — Review Integration (FIRST PRIORITY)
+**Top-level v0.5 goal:** Close the autonomous loop so Antfarm can be used for real development without manual review. Review integration is the #1 priority — but it depends on runtime truth and artifacts being in place first.
 
-Close the autonomous loop. Without this, all review is manual.
+### v0.5.1 — Runtime Foundation
 
-- ReviewVerdict contract (#85) — dataclass with provider, verdict, findings, reviewed SHA
-- Soldier review gating — verdict exists + pass + fresh SHA + no critical findings
-- Review-as-task flow — Soldier creates review task → reviewer worker produces verdict
-- Reviewer agent definitions for Claude Code and Codex adapters
-
-**Why first:** This is the #1 blocker for using Antfarm on real projects (BrahmaOS). Every other improvement is wasted if review is still manual.
-
-### v0.5.2 — Runtime Truth
-
-Make the runtime deterministic and observable.
+Make the runtime deterministic and observable. Everything else builds on this.
 
 - Canonical scheduler (#72) — single scheduling brain
-- Failure taxonomy + default retry policy (#83)
 - Task / attempt lifecycle + invariants (new states, transition rules)
+- Failure taxonomy + default retry policy (#83)
 - Initial inbox surfacing for stale / blocked / failed work (#81 partial)
 
-### v0.5.3 — Artifact Gating
+### v0.5.2 — Artifact + Review Contract
 
-Make merges safe with evidence-based gating.
+Define the evidence contracts that Soldier needs for safe merging and review gating.
 
-- Structured task output contract (#77) — hard evidence + advisory split
-- Soldier artifact gating — freshness checks, base SHA validation
+- Structured task output contract (#77) — hard evidence + advisory split, base/head SHA, freshness
+- ReviewVerdict contract (#85) — provider, verdict, findings, reviewed_commit_sha
+- Soldier gating — artifact exists + fresh + tests passed + review verdict pass
 - Review pack generation (#82)
+
+### v0.5.3 — Review Execution (THE GOAL)
+
+Close the autonomous loop. This is why v0.5 exists.
+
+- Review-as-task flow — Soldier creates review task → reviewer worker produces verdict → Soldier merges if pass + fresh
+- Reviewer agent definitions for Claude Code and Codex adapters
+- Merge only after fresh pass verdict
+- End-to-end test: carry → build → review → merge without human intervention
+
+**Why this is the goal:** Every other improvement is wasted if review is still manual. Once this ships, Antfarm can be used on BrahmaOS.
 
 ### v0.5.4 — Memory + Prevention
 
@@ -660,6 +663,8 @@ Add AI-assisted planning on top of a stable substrate.
 - Docs rewrite (#73)
 - Audit trail (#75)
 - Bug fixes from testing
+
+**Why this order:** Runtime truth first (v0.5.1), then evidence contracts (v0.5.2), then review execution (v0.5.3). Each slice builds on the previous. Review is the goal, not the starting point.
 
 **Why this order:** First make the runtime deterministic, then make merges safe, then make parallelism smarter, then add AI-assisted planning on top of a stable substrate.
 
@@ -694,6 +699,10 @@ Soldier merges only when:
 - required verification checks pass
 - `merge_readiness == "ready"`
 - no blocking reasons remain
+
+### Scenario F: Review Orchestration
+
+Given a completed task with artifact, Soldier creates a review task, a reviewer worker (Claude Code or Codex) produces a fresh `ReviewVerdict`, and Soldier merges only if verdict is `pass` and `reviewed_commit_sha` matches current `head_commit_sha`. No human intervention required.
 
 ### Scenario E: Useful Memory
 
