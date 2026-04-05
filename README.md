@@ -6,7 +6,7 @@ Antfarm is a thin, self-hosted coordination layer that lets you distribute codin
 
 One machine hosts the colony. Workers connect, claim tasks, build, and open PRs. An integrator merges them safely. That's it.
 
-> **Status:** **v0.1.0** — Core loop complete. Colony, workers, integrator, and CLI all functional.
+> **Status:** **v0.5.0** — Full autonomous loop: carry, build, review, merge. Memory, conflict prevention, and AI-assisted planning.
 
 ---
 
@@ -22,7 +22,11 @@ Antfarm gives you:
 - **Scope-aware scheduling** — avoids assigning overlapping work to different workers
 - **Progress visibility** — see what every worker is doing across every machine
 - **A merge queue** — an integrator that safely merges concurrent changes, resolves trivial conflicts, and escalates real ones
-- **Failure recovery** — stale workers are detected, tasks are re-queued
+- **Automated code review** — Soldier creates review tasks, reviewer workers produce verdicts, merge gates on pass + fresh SHA
+- **Repo memory** — learns from outcomes, tracks hotspots, improves scheduling over time
+- **Conflict prevention** — overlap warnings, hotspot-aware scheduling, conflict risk scoring
+- **AI-assisted planning** — decompose specs into tasks with dependencies and scope hints
+- **Failure recovery** — classified failure types, retry policies, stale task recovery
 
 ### What Antfarm is not
 
@@ -90,11 +94,12 @@ You carry tasks → Colony queues them → Workers claim and build → Integrato
 
 ### The flow
 
-1. **You carry tasks** — manually or via script
+1. **You carry tasks** — manually, via `antfarm plan`, or from a spec file
 2. **Workers claim tasks** — each worker runs `antfarm worker start`, which registers, claims the next available task, and launches your AI agent
-3. **Workers build** — they branch from the integration branch (e.g., `dev`), implement, test, open a PR, then claim the next task
-4. **Integrator merges** — merges PRs to a temp integration branch, runs tests, fast-forwards the integration branch if green, kicks back if red
-5. **You ship** — merge the integration branch to main when ready
+3. **Workers build** — they branch from the integration branch, implement, test, and harvest
+4. **Reviewer workers review** — the Soldier creates review tasks, reviewer workers produce ReviewVerdicts
+5. **Integrator merges** — merges to a temp branch, runs tests, fast-forwards if green + review passed, kicks back if red
+6. **You ship** — merge the integration branch to main when ready
 
 ---
 
@@ -102,7 +107,7 @@ You carry tasks → Colony queues them → Workers claim and build → Integrato
 
 ```bash
 # Clone and install (not yet on PyPI)
-git clone https://github.com/vkulkarni/antfarm.git
+git clone https://github.com/antfarm-ai/antfarm.git
 cd antfarm
 pip install -e .
 ```
@@ -273,19 +278,20 @@ Each worker must use a separate git worktree or clone. Antfarm does not share wo
 ┌─────────────────────────────────────────────────┐
 │                antfarm (core)                   │
 │                                                 │
-│  Colony server · Task scheduler · Merge queue   │
+│  Colony server · Scheduler · Merge queue        │
+│  Memory · Conflict prevention · Planner         │
+│  Review orchestration · Failure taxonomy        │
 │                                                 │
 ├─────────────────────────────────────────────────┤
 │                 adapters                        │
 │                                                 │
-│  Claude Code (Shipped) · Generic (Shipped)     │
-│  Codex · Aider · Cursor (planned)              │
+│  Claude Code (worker + reviewer) · Codex        │
+│  Generic (curl) · Aider (planned)              │
 │                                                 │
 ├─────────────────────────────────────────────────┤
 │                 backends                        │
 │                                                 │
-│  File (v0.1) · Redis (v0.2)                    │
-│  GitHub Issues · Jira (future)                 │
+│  File (default) · GitHub Issues                 │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -293,12 +299,23 @@ Each worker must use a separate git worktree or clone. Antfarm does not share wo
 
 ## Status
 
-**v0.1.0** — Core loop complete. Colony, workers, integrator, and CLI all functional.
+**v0.5.0** — Full autonomous loop with review integration, repo memory, conflict prevention, and AI-assisted planning.
+
+### What's new in v0.5
+
+- **Review execution** — Soldier creates review tasks, reviewer workers produce verdicts, merge gates on pass + fresh SHA
+- **Repo memory** — tracks outcomes, hotspots, failure patterns, touch observations
+- **Conflict prevention** — overlap warnings at carry time, hotspot-aware scheduling
+- **AI-assisted planning** — `antfarm plan` decomposes specs into tasks with deps and scope hints
+- **Structured lifecycle** — enriched task/attempt states with transition validation
+- **Failure taxonomy** — classified failure types with retry policies
+- **Operator inbox** — surfaces stale workers, blocked tasks, hotspot overlaps
 
 See the project docs for details:
 
-- [SPEC.md](docs/SPEC.md) — product and architecture spec
-- [IMPLEMENTATION.md](docs/IMPLEMENTATION.md) — v0.1 implementation plan
+- [SPEC.md](docs/SPEC.md) — v0.1 product and architecture spec
+- [SPEC_v05.md](docs/SPEC_v05.md) — v0.5 spec (review, memory, planning)
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — system architecture guide
 - [DEVELOPMENT.md](docs/DEVELOPMENT.md) — open-source development workflow
 
 ---
