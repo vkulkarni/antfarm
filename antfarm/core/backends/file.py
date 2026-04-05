@@ -35,6 +35,7 @@ from antfarm.core.models import (
     TaskStatus,
     TrailEntry,
 )
+from antfarm.core.rate_limiter import is_worker_rate_limited
 
 from .base import TaskBackend
 
@@ -173,12 +174,15 @@ class FileBackend(TaskBackend):
                 p.stem for p in (self._root / "tasks" / "done").iterdir() if p.suffix == ".json"
             }
 
-            # Read worker capabilities if worker file exists
+            # Read worker file — check rate limit and capabilities
             worker_capabilities: set[str] | None = None
             worker_path = self._worker_path(worker_id)
             if worker_path.exists():
                 try:
                     worker_data = self._read_json(worker_path)
+                    cooldown_until = worker_data.get("cooldown_until")
+                    if is_worker_rate_limited(cooldown_until):
+                        return None
                     worker_capabilities = set(worker_data.get("capabilities", []))
                 except (json.JSONDecodeError, KeyError):
                     pass
@@ -678,6 +682,23 @@ class FileBackend(TaskBackend):
         data["last_heartbeat"] = _now_iso()
         self._write_json(worker_path, data)
         # Touch to ensure mtime reflects now (write_json via replace does this)
+
+    # ------------------------------------------------------------------
+    # Workers (list)
+    # ------------------------------------------------------------------
+
+    def list_workers(self) -> list[dict]:
+        """Read all worker files from workers/ and return them as dicts."""
+        workers_dir = self._root / "workers"
+        results = []
+        for p in workers_dir.iterdir():
+            if p.suffix != ".json":
+                continue
+            try:
+                results.append(self._read_json(p))
+            except (json.JSONDecodeError, KeyError):
+                continue
+        return results
 
     # ------------------------------------------------------------------
     # Status

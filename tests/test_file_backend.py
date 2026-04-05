@@ -615,3 +615,89 @@ def test_clear_merge_override_not_found_raises(backend: FileBackend) -> None:
     with pytest.raises(FileNotFoundError):
         backend.clear_merge_override("no-such-task")
 
+
+# ---------------------------------------------------------------------------
+# Rate limit: pull() returns None for rate-limited worker
+# ---------------------------------------------------------------------------
+
+
+def test_pull_returns_none_for_rate_limited_worker(backend: FileBackend) -> None:
+    """pull() skips tasks when the worker has an active cooldown."""
+    from datetime import UTC, datetime, timedelta
+
+    backend.carry(_make_task("task-1"))
+
+    # Register the worker with a future cooldown
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+    backend.register_worker({
+        "worker_id": "worker-rl",
+        "node_id": "node-1",
+        "agent_type": "claude-code",
+        "workspace_root": "/tmp/ws",
+        "capabilities": [],
+        "status": "idle",
+        "registered_at": datetime.now(UTC).isoformat(),
+        "last_heartbeat": datetime.now(UTC).isoformat(),
+        "cooldown_until": future,
+    })
+
+    result = backend.pull("worker-rl")
+    assert result is None
+
+
+def test_pull_succeeds_after_cooldown_expires(backend: FileBackend) -> None:
+    """pull() claims a task when the worker's cooldown is in the past."""
+    from datetime import UTC, datetime, timedelta
+
+    backend.carry(_make_task("task-1"))
+
+    past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    backend.register_worker({
+        "worker_id": "worker-past",
+        "node_id": "node-1",
+        "agent_type": "claude-code",
+        "workspace_root": "/tmp/ws",
+        "capabilities": [],
+        "status": "idle",
+        "registered_at": datetime.now(UTC).isoformat(),
+        "last_heartbeat": datetime.now(UTC).isoformat(),
+        "cooldown_until": past,
+    })
+
+    result = backend.pull("worker-past")
+    assert result is not None
+    assert result["id"] == "task-1"
+
+
+# ---------------------------------------------------------------------------
+# Rate limit: list_workers() returns all worker dicts
+# ---------------------------------------------------------------------------
+
+
+def test_list_workers_empty(backend: FileBackend) -> None:
+    """list_workers() returns [] when no workers are registered."""
+    assert backend.list_workers() == []
+
+
+def test_list_workers_returns_all(backend: FileBackend) -> None:
+    """list_workers() returns one entry per registered worker."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    for i in range(3):
+        backend.register_worker({
+            "worker_id": f"worker-{i}",
+            "node_id": "node-1",
+            "agent_type": "claude-code",
+            "workspace_root": f"/tmp/ws-{i}",
+            "capabilities": [],
+            "status": "idle",
+            "registered_at": now,
+            "last_heartbeat": now,
+        })
+
+    workers = backend.list_workers()
+    assert len(workers) == 3
+    ids = {w["worker_id"] for w in workers}
+    assert ids == {"worker-0", "worker-1", "worker-2"}
+

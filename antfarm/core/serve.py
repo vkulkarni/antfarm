@@ -61,6 +61,9 @@ class WorkerRegisterRequest(BaseModel):
 
 class HeartbeatRequest(BaseModel):
     status: dict | None = None
+    remaining: int | None = None
+    reset_at: str | None = None
+    cooldown_until: str | None = None
 
 
 class PullRequest(BaseModel):
@@ -187,9 +190,22 @@ def get_app(
 
     @app.post("/workers/{worker_id:path}/heartbeat", status_code=200)
     def worker_heartbeat(worker_id: str, req: HeartbeatRequest):
-        """Update worker heartbeat. Accepts optional status dict."""
-        _backend.heartbeat(worker_id, req.status or {})
+        """Update worker heartbeat. Accepts optional status dict and rate limit fields."""
+        update: dict = dict(req.status or {})
+        if req.remaining is not None:
+            update["remaining"] = req.remaining
+        if req.reset_at is not None:
+            update["reset_at"] = req.reset_at
+        # Always persist cooldown_until (including None to clear it)
+        if req.cooldown_until is not None or "cooldown_until" not in (req.status or {}):
+            update["cooldown_until"] = req.cooldown_until
+        _backend.heartbeat(worker_id, update)
         return {"ok": True}
+
+    @app.get("/workers", status_code=200)
+    def list_workers():
+        """List all registered workers with their status and rate limit state."""
+        return _backend.list_workers()
 
     @app.delete("/workers/{worker_id:path}", status_code=200)
     def deregister_worker(worker_id: str):
