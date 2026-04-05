@@ -463,7 +463,14 @@ class GitHubBackend(TaskBackend):
             f"[signal] `{entry.get('worker_id', 'system')}`: {entry.get('message', '')}",
         )
 
-    def mark_harvested(self, task_id: str, attempt_id: str, pr: str, branch: str) -> None:
+    def mark_harvested(
+        self,
+        task_id: str,
+        attempt_id: str,
+        pr: str,
+        branch: str,
+        artifact: dict | None = None,
+    ) -> None:
         """Transition task to DONE. Swap label active -> done. Add result comment.
 
         Idempotent: if already DONE with matching attempt_id, no-op.
@@ -496,6 +503,8 @@ class GitHubBackend(TaskBackend):
                 a["pr"] = pr
                 a["branch"] = branch
                 a["completed_at"] = now
+                if artifact is not None:
+                    a["artifact"] = artifact
                 break
 
         task["status"] = TaskStatus.DONE.value
@@ -546,6 +555,20 @@ class GitHubBackend(TaskBackend):
         self._ensure_label(ready_label)
         self._swap_labels(issue_number, ["done"], "ready")
         self._add_comment(issue_number, f"[kickback] {reason}")
+
+    def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
+        """Mark task as harvest_pending. Updates status in issue body."""
+        task, issue_number = self._get_task_issue(task_id)
+        if issue_number is None:
+            raise FileNotFoundError(f"Task '{task_id}' not found in active")
+        if task.get("current_attempt") != attempt_id:
+            raise ValueError(
+                f"attempt_id '{attempt_id}' is not the current attempt "
+                f"(got '{task.get('current_attempt')}')"
+            )
+        task["status"] = "harvest_pending"
+        task["updated_at"] = _now_iso()
+        self._update_task_body(issue_number, task)
 
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
         """Close the issue, add antfarm:merged label.

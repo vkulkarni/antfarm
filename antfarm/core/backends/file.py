@@ -13,21 +13,20 @@ Stores task state as JSON files in a directory tree:
 
 All mutations that could race are protected by a threading.Lock().
 File renames (os.rename) are used for atomic state transitions.
-
-Scheduler note: pull() currently uses an inline scheduling policy
-(dependency check → priority → FIFO). Full scheduler integration will
-land when antfarm.core.scheduler is merged.
+Scheduling is delegated entirely to scheduler.select_task().
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from antfarm.core.lifecycle import assert_task_transition
 from antfarm.core.models import (
     Attempt,
     AttemptStatus,
@@ -36,6 +35,7 @@ from antfarm.core.models import (
     TrailEntry,
 )
 from antfarm.core.rate_limiter import is_worker_rate_limited
+from antfarm.core.scheduler import select_task
 
 from .base import TaskBackend
 
@@ -139,6 +139,10 @@ class FileBackend(TaskBackend):
             ValueError: If a task with this ID already exists in any state folder.
         """
         task_id = task["id"]
+        if not re.match(r"^[a-zA-Z0-9_-]+$", task_id):
+            raise ValueError(
+                f"Invalid task_id '{task_id}': must contain only alphanumeric, dash, underscore"
+            )
         with self._lock:
             if self._find_task_path(task_id) is not None:
                 raise ValueError(f"Task '{task_id}' already exists")
@@ -160,20 +164,13 @@ class FileBackend(TaskBackend):
     def pull(self, worker_id: str) -> dict | None:
         """Claim the next eligible task. Creates a new Attempt. Atomic.
 
-        Scheduling policy (inline, v0.1):
-        1. Dependency check — skip if depends_on not all in done_task_ids
-        2. Priority — lower number = higher priority
-        3. FIFO — oldest created_at first among equals
+        Delegates task selection entirely to scheduler.select_task().
+        Backend only handles state persistence and atomic file rename.
 
         Returns:
             The updated task dict with a new ACTIVE attempt, or None.
         """
         with self._lock:
-            # Collect done task IDs for dependency checking
-            done_task_ids = {
-                p.stem for p in (self._root / "tasks" / "done").iterdir() if p.suffix == ".json"
-            }
-
             # Read worker file — check rate limit and capabilities
             worker_capabilities: set[str] | None = None
             worker_path = self._worker_path(worker_id)
@@ -187,6 +184,11 @@ class FileBackend(TaskBackend):
                 except (json.JSONDecodeError, KeyError):
                     pass
 
+            # Collect done task IDs for dependency checking
+            done_task_ids = {
+                p.stem for p in (self._root / "tasks" / "done").iterdir() if p.suffix == ".json"
+            }
+
             # Load all ready tasks
             ready_dir = self._root / "tasks" / "ready"
             candidates: list[Task] = []
@@ -199,27 +201,31 @@ class FileBackend(TaskBackend):
                 except (json.JSONDecodeError, KeyError):
                     continue
 
-            # Select using inline scheduling policy
-            eligible = [t for t in candidates if all(dep in done_task_ids for dep in t.depends_on)]
+            # Load active tasks for scope preference
+            active_dir = self._root / "tasks" / "active"
+            active_tasks: list[Task] = []
+            for p in active_dir.iterdir():
+                if p.suffix != ".json":
+                    continue
+                try:
+                    data = self._read_json(p)
+                    active_tasks.append(Task.from_dict(data))
+                except (json.JSONDecodeError, KeyError):
+                    continue
 
-            # Filter by capability requirements
-            if worker_capabilities is not None:
-                eligible = [
-                    t for t in eligible
-                    if set(t.capabilities_required).issubset(worker_capabilities)
-                ]
+            # Delegate ALL scheduling to the canonical scheduler
+            chosen = select_task(
+                ready_tasks=candidates,
+                done_task_ids=done_task_ids,
+                active_tasks=active_tasks,
+                worker_capabilities=worker_capabilities,
+                worker_id=worker_id,
+            )
 
-            # Filter by pin — skip tasks pinned to a different worker
-            eligible = [
-                t for t in eligible
-                if t.pinned_to is None or t.pinned_to == worker_id
-            ]
-
-            if not eligible:
+            if chosen is None:
                 return None
 
-            eligible.sort(key=lambda t: (t.priority, t.created_at))
-            chosen = eligible[0]
+            assert_task_transition(chosen.status.value, TaskStatus.ACTIVE.value)
 
             # Create new attempt
             attempt = Attempt(
@@ -263,7 +269,14 @@ class FileBackend(TaskBackend):
             data["signals"].append(entry)
             self._write_json(path, data)
 
-    def mark_harvested(self, task_id: str, attempt_id: str, pr: str, branch: str) -> None:
+    def mark_harvested(
+        self,
+        task_id: str,
+        attempt_id: str,
+        pr: str,
+        branch: str,
+        artifact: dict | None = None,
+    ) -> None:
         """Move task from active/ to done/. Set task DONE, attempt DONE.
 
         Idempotent: if already in done/ with the same attempt_id, no-op.
@@ -294,6 +307,12 @@ class FileBackend(TaskBackend):
                     f"(got '{data.get('current_attempt')}')"
                 )
 
+            # Accept both active (legacy) and harvest_pending (v0.5 proper)
+            # since mark_harvest_pending is best-effort
+            current_status = data.get("status", "")
+            if current_status not in ("active", "harvest_pending"):
+                assert_task_transition(current_status, TaskStatus.DONE.value)
+
             # Update attempt
             now = _now_iso()
             for a in data["attempts"]:
@@ -302,6 +321,8 @@ class FileBackend(TaskBackend):
                     a["pr"] = pr
                     a["branch"] = branch
                     a["completed_at"] = now
+                    if artifact is not None:
+                        a["artifact"] = artifact
                     break
 
             data["status"] = TaskStatus.DONE.value
@@ -323,6 +344,7 @@ class FileBackend(TaskBackend):
                 raise FileNotFoundError(f"Task '{task_id}' not found in done/")
 
             data = self._read_json(done_path)
+            assert_task_transition(data["status"], TaskStatus.READY.value)
             now = _now_iso()
 
             current_attempt_id = data.get("current_attempt")
@@ -345,6 +367,28 @@ class FileBackend(TaskBackend):
 
             self._write_json(done_path, data)
             os.rename(done_path, self._ready_path(task_id))
+
+    def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
+        """Transition task from ACTIVE to HARVEST_PENDING.
+
+        Task stays in active/ directory but status field changes.
+        """
+        with self._lock:
+            active_path = self._active_path(task_id)
+            if not active_path.exists():
+                raise FileNotFoundError(f"Task '{task_id}' not found in active/")
+
+            data = self._read_json(active_path)
+            if data.get("current_attempt") != attempt_id:
+                raise ValueError(
+                    f"attempt_id '{attempt_id}' is not the current attempt "
+                    f"(got '{data.get('current_attempt')}')"
+                )
+
+            assert_task_transition(data["status"], "harvest_pending")
+            data["status"] = "harvest_pending"
+            data["updated_at"] = _now_iso()
+            self._write_json(active_path, data)
 
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
         """Update attempt status to MERGED in done/ task file. Task stays DONE."""
@@ -399,6 +443,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in ACTIVE state")
 
             data = self._read_json(active_path)
+            assert_task_transition(data["status"], TaskStatus.PAUSED.value)
             now = _now_iso()
             data["status"] = TaskStatus.PAUSED.value
             data["updated_at"] = now
@@ -419,6 +464,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in PAUSED state")
 
             data = self._read_json(paused_path)
+            assert_task_transition(data["status"], TaskStatus.READY.value)
             now = _now_iso()
 
             # Supersede current attempt so next pull creates a fresh one
@@ -447,6 +493,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in ACTIVE state")
 
             data = self._read_json(active_path)
+            # Skip lifecycle assertion — reassign is an operator override (active→ready)
             now = _now_iso()
 
             current_attempt_id = data.get("current_attempt")
@@ -482,6 +529,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in READY state")
 
             data = self._read_json(ready_path)
+            assert_task_transition(data["status"], TaskStatus.BLOCKED.value)
             now = _now_iso()
 
             trail_entry = TrailEntry(ts=now, worker_id="system", message=f"Blocked: {reason}")
@@ -504,6 +552,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in BLOCKED state")
 
             data = self._read_json(blocked_path)
+            assert_task_transition(data["status"], TaskStatus.READY.value)
             now = _now_iso()
             data["status"] = TaskStatus.READY.value
             data["updated_at"] = now

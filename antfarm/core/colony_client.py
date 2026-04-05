@@ -102,16 +102,53 @@ class ColonyClient:
         })
         r.raise_for_status()
 
-    def harvest(self, task_id: str, attempt_id: str, pr: str, branch: str) -> None:
-        r = self._client.post(f"/tasks/{task_id}/harvest", json={
+    def carry(
+        self,
+        task_id: str,
+        title: str,
+        spec: str,
+        depends_on: list[str] | None = None,
+        touches: list[str] | None = None,
+        priority: int = 10,
+        complexity: str = "M",
+    ) -> dict:
+        """Create a task in the colony."""
+        r = self._client.post("/tasks", json={
+            "id": task_id,
+            "title": title,
+            "spec": spec,
+            "depends_on": depends_on or [],
+            "touches": touches or [],
+            "priority": priority,
+            "complexity": complexity,
+        })
+        r.raise_for_status()
+        return r.json()
+
+    def harvest(
+        self,
+        task_id: str,
+        attempt_id: str,
+        pr: str,
+        branch: str,
+        artifact: dict | None = None,
+    ) -> None:
+        payload: dict = {
             "attempt_id": attempt_id,
             "pr": pr,
             "branch": branch,
-        })
+        }
+        if artifact is not None:
+            payload["artifact"] = artifact
+        r = self._client.post(f"/tasks/{task_id}/harvest", json=payload)
         r.raise_for_status()
 
     def kickback(self, task_id: str, reason: str) -> None:
         r = self._client.post(f"/tasks/{task_id}/kickback", json={"reason": reason})
+        r.raise_for_status()
+
+    def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
+        r = self._client.post(f"/tasks/{task_id}/harvest-pending", json={"attempt_id": attempt_id})
         r.raise_for_status()
 
     def mark_merged(self, task_id: str, attempt_id: str) -> None:

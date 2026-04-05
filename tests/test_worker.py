@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from antfarm.core.backends.file import FileBackend
+from antfarm.core.models import FailureType
 from antfarm.core.serve import get_app
 from antfarm.core.worker import AgentResult, WorkerRuntime
 
@@ -380,3 +381,131 @@ def test_aider_command_includes_yes_and_no_auto_commits(tmp_path, http_client):
     assert "--yes" in captured_cmd
     assert "--no-auto-commits" in captured_cmd
     assert "--message" in captured_cmd
+
+
+# ---------------------------------------------------------------------------
+# v0.5.1: Failure classification + retry policy
+# ---------------------------------------------------------------------------
+
+
+def test_classify_failure_agent_crash():
+    from antfarm.core.worker import classify_failure
+
+    result = classify_failure(returncode=1, stderr="Segmentation fault", stdout="")
+    assert result == FailureType.AGENT_CRASH
+
+
+def test_classify_failure_test_failure():
+    from antfarm.core.worker import classify_failure
+
+    result = classify_failure(returncode=1, stderr="", stdout="FAILED tests/test_foo.py::test_bar")
+    assert result == FailureType.TEST_FAILURE
+
+
+def test_classify_failure_lint_failure():
+    from antfarm.core.worker import classify_failure
+
+    result = classify_failure(returncode=1, stderr="", stdout="ruff check failed")
+    assert result == FailureType.LINT_FAILURE
+
+
+def test_classify_failure_timeout():
+    from antfarm.core.worker import classify_failure
+
+    result = classify_failure(returncode=-9, stderr="", stdout="")
+    assert result == FailureType.AGENT_TIMEOUT
+
+
+def test_classify_failure_infra():
+    from antfarm.core.worker import classify_failure
+
+    result = classify_failure(returncode=1, stderr="connection refused", stdout="")
+    assert result == FailureType.INFRA_FAILURE
+
+
+def test_classify_failure_build():
+    from antfarm.core.worker import classify_failure
+
+    result = classify_failure(
+        returncode=1, stderr="ModuleNotFoundError: No module named 'foo'", stdout=""
+    )
+    assert result == FailureType.BUILD_FAILURE
+
+
+def test_classify_failure_ambiguous_error_defaults_to_crash():
+    """Generic 'error' without test/lint markers should be AGENT_CRASH."""
+    from antfarm.core.worker import classify_failure
+
+    result = classify_failure(returncode=1, stderr="error occurred", stdout="")
+    assert result == FailureType.AGENT_CRASH
+
+
+def test_classify_failure_ambiguous_failed_defaults_to_crash():
+    """Generic 'failed' without test context should be AGENT_CRASH."""
+    from antfarm.core.worker import classify_failure
+
+    result = classify_failure(returncode=1, stderr="operation failed", stdout="")
+    assert result == FailureType.AGENT_CRASH
+
+
+def test_classify_failure_lint_before_test():
+    """Lint markers take precedence even if 'test' appears."""
+    from antfarm.core.worker import classify_failure
+
+    result = classify_failure(
+        returncode=1, stderr="", stdout="ruff check: 3 errors in test_file.py"
+    )
+    assert result == FailureType.LINT_FAILURE
+
+
+def test_infra_failure_is_retryable():
+    from antfarm.core.worker import get_retry_policy
+
+    policy = get_retry_policy(FailureType.INFRA_FAILURE)
+    assert policy["retryable"] is True
+    assert policy["max_retries"] > 0
+
+
+def test_test_failure_not_retryable():
+    from antfarm.core.worker import get_retry_policy
+
+    policy = get_retry_policy(FailureType.TEST_FAILURE)
+    assert policy["retryable"] is False
+    assert policy["action"] == "kickback"
+
+
+def test_invalid_task_escalates():
+    from antfarm.core.worker import get_retry_policy
+
+    policy = get_retry_policy(FailureType.INVALID_TASK)
+    assert policy["retryable"] is False
+    assert policy["action"] == "escalate"
+
+
+def test_build_failure_record():
+    from antfarm.core.worker import build_failure_record
+
+    rec = build_failure_record(
+        task_id="t1", attempt_id="a1", worker_id="w1",
+        returncode=1, stderr="connection refused", stdout="",
+    )
+    assert rec.failure_type == FailureType.INFRA_FAILURE
+    assert rec.retryable is True
+    assert rec.recommended_action == "retry"
+    assert rec.stderr_summary == "connection refused"
+
+
+def test_agent_crash_retry_policy():
+    from antfarm.core.worker import get_retry_policy
+
+    policy = get_retry_policy(FailureType.AGENT_CRASH)
+    assert policy["retryable"] is True
+    assert policy["max_retries"] == 2
+
+
+def test_merge_conflict_retry_policy():
+    from antfarm.core.worker import get_retry_policy
+
+    policy = get_retry_policy(FailureType.MERGE_CONFLICT)
+    assert policy["retryable"] is True
+    assert policy["max_retries"] == 1

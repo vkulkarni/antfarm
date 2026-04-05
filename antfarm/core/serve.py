@@ -80,10 +80,15 @@ class SignalRequest(BaseModel):
     message: str
 
 
+class HarvestPendingRequest(BaseModel):
+    attempt_id: str
+
+
 class HarvestRequest(BaseModel):
     attempt_id: str
     pr: str
     branch: str
+    artifact: dict | None = None
 
 
 class KickbackRequest(BaseModel):
@@ -284,7 +289,20 @@ def get_app(
         Returns 409 for wrong attempt.
         """
         try:
-            _backend.mark_harvested(task_id, req.attempt_id, req.pr, req.branch)
+            _backend.mark_harvested(
+                task_id, req.attempt_id, req.pr, req.branch, artifact=req.artifact
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/harvest-pending", status_code=200)
+    def mark_harvest_pending(task_id: str, req: HarvestPendingRequest):
+        """Transition task to HARVEST_PENDING before writing artifact/failure."""
+        try:
+            _backend.mark_harvest_pending(task_id, req.attempt_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
