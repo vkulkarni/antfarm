@@ -253,7 +253,23 @@ def get_app(
             task_id = _backend.carry(task)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"task_id": task_id}
+
+        # Check for overlap warnings with active tasks
+        warnings: list[str] = []
+        if req.touches:
+            try:
+                from antfarm.core.memory import MemoryStore
+
+                active = _backend.list_tasks(status="active")
+                memory = MemoryStore(data_dir)
+                warnings = memory.check_overlap_warnings(req.touches, active)
+            except Exception:
+                pass
+
+        result: dict = {"task_id": task_id}
+        if warnings:
+            result["warnings"] = warnings
+        return result
 
     @app.post("/tasks/pull")
     def forage(req: PullRequest, response: Response):
