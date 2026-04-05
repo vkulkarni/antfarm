@@ -231,7 +231,13 @@ class FileBackend(TaskBackend):
         with self._lock:
             done_path = self._done_path(task_id)
             if done_path.exists():
-                # Already harvested — idempotent no-op
+                # Already harvested — idempotent no-op only if attempt_id matches
+                data = self._read_json(done_path)
+                if data.get("current_attempt") != attempt_id:
+                    raise ValueError(
+                        f"attempt_id '{attempt_id}' is not the current attempt "
+                        f"(got '{data.get('current_attempt')}')"
+                    )
                 return
 
             active_path = self._active_path(task_id)
@@ -262,16 +268,18 @@ class FileBackend(TaskBackend):
             os.rename(active_path, done_path)
 
     def kickback(self, task_id: str, reason: str) -> None:
-        """Move task from active/ to ready/. SUPERSEDE current attempt.
+        """Move task from done/ to ready/. SUPERSEDE current attempt.
 
+        Soldier calls kickback after a failed integration merge. The task
+        is in done/ at that point (harvested but not yet merged).
         Sets current_attempt to None. Adds failure TrailEntry.
         """
         with self._lock:
-            active_path = self._active_path(task_id)
-            if not active_path.exists():
-                raise FileNotFoundError(f"Task '{task_id}' not found in active/")
+            done_path = self._done_path(task_id)
+            if not done_path.exists():
+                raise FileNotFoundError(f"Task '{task_id}' not found in done/")
 
-            data = self._read_json(active_path)
+            data = self._read_json(done_path)
             now = _now_iso()
 
             current_attempt_id = data.get("current_attempt")
@@ -292,8 +300,8 @@ class FileBackend(TaskBackend):
             data["current_attempt"] = None
             data["updated_at"] = now
 
-            self._write_json(active_path, data)
-            os.rename(active_path, self._ready_path(task_id))
+            self._write_json(done_path, data)
+            os.rename(done_path, self._ready_path(task_id))
 
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
         """Update attempt status to MERGED in done/ task file. Task stays DONE."""
@@ -303,10 +311,15 @@ class FileBackend(TaskBackend):
                 raise FileNotFoundError(f"Task '{task_id}' not found in done/")
 
             data = self._read_json(done_path)
+            matched = False
             for a in data["attempts"]:
                 if a["attempt_id"] == attempt_id:
                     a["status"] = AttemptStatus.MERGED.value
+                    matched = True
                     break
+
+            if not matched:
+                raise ValueError(f"attempt_id '{attempt_id}' not found on task '{task_id}'")
 
             data["updated_at"] = _now_iso()
             self._write_json(done_path, data)

@@ -173,16 +173,19 @@ def test_mark_harvested(backend: FileBackend, tmp_path: Path) -> None:
 
 
 def test_kickback(backend: FileBackend, tmp_path: Path) -> None:
+    """Kickback moves done→ready (Soldier calls it after failed integration)."""
     backend.carry(_make_task("task-1"))
     pulled = backend.pull("worker-1")
     assert pulled is not None
 
     attempt_id = pulled["current_attempt"]
+    # Harvest first (task moves to done/) — then kickback
+    backend.mark_harvested("task-1", attempt_id, pr="https://gh/pr/1", branch="feat/task-1")
     backend.kickback("task-1", reason="tests failed")
 
-    active_file = tmp_path / ".antfarm" / "tasks" / "active" / "task-1.json"
+    done_file = tmp_path / ".antfarm" / "tasks" / "done" / "task-1.json"
     ready_file = tmp_path / ".antfarm" / "tasks" / "ready" / "task-1.json"
-    assert not active_file.exists()
+    assert not done_file.exists()
     assert ready_file.exists()
 
     data = json.loads(ready_file.read_text())
@@ -376,3 +379,58 @@ def test_heartbeat_updates(backend: FileBackend) -> None:
     # Heartbeat for unregistered worker creates the file
     backend.heartbeat("new-worker", {"status": "idle"})
     assert backend._worker_path("new-worker").exists()
+
+
+# ---------------------------------------------------------------------------
+# Bug fix regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_mark_harvested_idempotent_wrong_attempt_rejects(backend: FileBackend) -> None:
+    """BUG 2 regression: already-done task with wrong attempt_id must raise, not silently no-op."""
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
+
+    # Second call with correct attempt_id is idempotent (no-op)
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
+
+    # Second call with wrong attempt_id must raise
+    with pytest.raises(ValueError, match="not the current attempt"):
+        backend.mark_harvested("task-1", "wrong-attempt-id", pr="pr", branch="branch")
+
+
+def test_mark_merged_unknown_attempt_rejects(backend: FileBackend) -> None:
+    """BUG 3 regression: mark_merged with unknown attempt_id must raise ValueError."""
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
+
+    with pytest.raises(ValueError, match="not found on task"):
+        backend.mark_merged("task-1", "nonexistent-attempt-id")
+
+
+def test_kickback_requires_done_not_active(backend: FileBackend) -> None:
+    """BUG 1 regression: kickback must operate on done/ tasks, not active/ tasks."""
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+
+    # Task is in active/ — kickback should raise (not in done/)
+    with pytest.raises(FileNotFoundError):
+        backend.kickback("task-1", reason="should fail")
+
+    # After harvesting (task moves to done/), kickback succeeds
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
+    backend.kickback("task-1", reason="integration failed")
+
+    data = backend.get_task("task-1")
+    assert data is not None
+    assert data["status"] == TaskStatus.READY.value
