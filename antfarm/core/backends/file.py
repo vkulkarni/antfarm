@@ -213,6 +213,16 @@ class FileBackend(TaskBackend):
                 except (json.JSONDecodeError, KeyError):
                     continue
 
+            # Load hotspot data for scheduler weighting
+            hotspots: dict[str, float] | None = None
+            try:
+                from antfarm.core.memory import MemoryStore
+
+                memory = MemoryStore(self._root)
+                hotspots = memory.get_hotspots() or None
+            except Exception:
+                pass
+
             # Delegate ALL scheduling to the canonical scheduler
             chosen = select_task(
                 ready_tasks=candidates,
@@ -220,6 +230,7 @@ class FileBackend(TaskBackend):
                 active_tasks=active_tasks,
                 worker_capabilities=worker_capabilities,
                 worker_id=worker_id,
+                hotspots=hotspots,
             )
 
             if chosen is None:
