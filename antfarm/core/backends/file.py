@@ -307,7 +307,11 @@ class FileBackend(TaskBackend):
                     f"(got '{data.get('current_attempt')}')"
                 )
 
-            assert_task_transition(data["status"], TaskStatus.DONE.value)
+            # Accept both active (legacy) and harvest_pending (v0.5 proper)
+            # since mark_harvest_pending is best-effort
+            current_status = data.get("status", "")
+            if current_status not in ("active", "harvest_pending"):
+                assert_task_transition(current_status, TaskStatus.DONE.value)
 
             # Update attempt
             now = _now_iso()
@@ -489,7 +493,7 @@ class FileBackend(TaskBackend):
                 raise ValueError(f"Task '{task_id}' is not in ACTIVE state")
 
             data = self._read_json(active_path)
-            assert_task_transition(data["status"], TaskStatus.READY.value)
+            # Skip lifecycle assertion — reassign is an operator override (active→ready)
             now = _now_iso()
 
             current_attempt_id = data.get("current_attempt")

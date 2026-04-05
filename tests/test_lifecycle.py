@@ -97,9 +97,9 @@ def test_illegal_transition_merged_to_anything():
     assert validate_task_transition("merged", "done") is False
 
 
-def test_legacy_transition_active_to_done_directly():
-    """Active → done is allowed as a legacy transition for backward compat."""
-    assert validate_task_transition("active", "done") is True
+def test_illegal_transition_active_to_done_directly():
+    """Active must go through harvest_pending first."""
+    assert validate_task_transition("active", "done") is False
 
 
 def test_illegal_transition_queued_to_merged():

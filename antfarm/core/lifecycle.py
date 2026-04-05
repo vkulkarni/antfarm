@@ -48,8 +48,7 @@ LEGAL_TASK_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"claimed", "blocked", "paused", "active"},  # "active" = legacy pull (ready→active)
     "blocked": {"queued", "paused"},
     "claimed": {"active"},
-    # "done" = legacy harvest (active→done), "queued" = legacy reassign (active→ready)
-    "active": {"harvest_pending", "paused", "queued", "done"},
+    "active": {"harvest_pending", "paused"},
     "harvest_pending": {"done", "failed"},
     "done": {"merge_ready", "kicked_back", "queued"},  # "queued" = legacy kickback (done→ready)
     "kicked_back": {"queued"},
