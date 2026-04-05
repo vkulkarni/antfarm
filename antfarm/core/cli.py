@@ -141,6 +141,7 @@ def worker():
 @click.option("--node", required=True, help="Node ID this worker belongs to.")
 @click.option("--repo-path", default=".", show_default=True, help="Path to git repo.")
 @click.option("--integration-branch", default="dev", show_default=True, help="Integration branch.")
+@click.option("--capabilities", default=None, help="Comma-separated worker capabilities (e.g. gpu,docker).")  # noqa: E501
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def worker_start(
@@ -150,6 +151,7 @@ def worker_start(
     node: str,
     repo_path: str,
     integration_branch: str,
+    capabilities: str | None,
     colony_url: str,
     token: str | None,
 ):
@@ -158,6 +160,7 @@ def worker_start(
 
     worker_name = name or agent
     ws_root = workspace_root or f".antfarm/workspaces/{worker_name}"
+    caps = [c.strip() for c in capabilities.split(",")] if capabilities else []
 
     runtime = WorkerRuntime(
         colony_url=colony_url,
@@ -167,6 +170,7 @@ def worker_start(
         workspace_root=ws_root,
         repo_path=repo_path,
         integration_branch=integration_branch,
+        capabilities=caps,
         token=token,
     )
     runtime.run()
@@ -182,6 +186,7 @@ def worker_start(
 @click.option("--spec", default=None, help="Task specification.")
 @click.option("--depends-on", multiple=True, help="Task IDs this task depends on.")
 @click.option("--touches", default=None, help="Comma-separated scope tags (e.g. api,db).")
+@click.option("--capabilities", default=None, help="Comma-separated capabilities required (e.g. gpu,docker).")  # noqa: E501
 @click.option("--priority", type=int, default=10, show_default=True, help="Priority (lower=higher).")  # noqa: E501
 @click.option(
     "--complexity",
@@ -199,6 +204,7 @@ def carry(
     spec: str | None,
     depends_on: tuple,
     touches: str | None,
+    capabilities: str | None,
     priority: int,
     complexity: str,
     file_path: str | None,
@@ -218,6 +224,7 @@ def carry(
             "spec": spec,
             "depends_on": list(depends_on),
             "touches": [t.strip() for t in touches.split(",")] if touches else [],
+            "capabilities_required": [c.strip() for c in capabilities.split(",")] if capabilities else [],  # noqa: E501
             "priority": priority,
             "complexity": complexity,
         }
@@ -245,6 +252,39 @@ def scout(colony_url: str, token: str | None):
     click.echo("-" * 40)
     for key, value in status.items():
         click.echo(f"{key:<25} {value}")
+
+
+# ---------------------------------------------------------------------------
+# scent
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.argument("task_id")
+@click.option("--poll-interval", default=1.0, show_default=True, help="Seconds between polls.")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def scent(task_id: str, poll_interval: float, colony_url: str, token: str | None):
+    """Stream real-time trail entries for a task (SSE)."""
+    url = f"{colony_url.rstrip('/')}/scent/{task_id}"
+    params = {"poll_interval": poll_interval}
+    headers = _auth_headers(token)
+    try:
+        with httpx.stream("GET", url, params=params, headers=headers) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if line.startswith("data: "):
+                    raw = line[len("data: "):]
+                    try:
+                        entry = json.loads(raw)
+                        ts = entry.get("ts", "")
+                        worker = entry.get("worker_id", "")
+                        message = entry.get("message", "")
+                        click.echo(f"[{ts}] {worker}: {message}")
+                    except json.JSONDecodeError:
+                        click.echo(line)
+    except KeyboardInterrupt:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +323,7 @@ def doctor(fix: bool, data_dir: str):
 @click.option("--node", required=True, help="Node ID.")
 @click.option("--agent", required=True, help="Agent type.")
 @click.option("--workspace-root", default=None, help="Workspace root directory.")
+@click.option("--capabilities", default=None, help="Comma-separated worker capabilities (e.g. gpu,docker).")  # noqa: E501
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def hatch(
@@ -290,6 +331,7 @@ def hatch(
     node: str,
     agent: str,
     workspace_root: str | None,
+    capabilities: str | None,
     colony_url: str,
     token: str | None,
 ):
@@ -297,11 +339,13 @@ def hatch(
     worker_name = name or agent
     ws_root = workspace_root or f".antfarm/workspaces/{worker_name}"
     worker_id = f"{node}/{worker_name}"
+    caps = [c.strip() for c in capabilities.split(",")] if capabilities else []
     result = _post(colony_url, "/workers/register", {
         "worker_id": worker_id,
         "node_id": node,
         "agent_type": agent,
         "workspace_root": ws_root,
+        "capabilities": caps,
     }, token=token)
     click.echo(f"Worker registered: {result}")
 

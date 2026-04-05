@@ -5,6 +5,9 @@ Uses FastAPI TestClient with a fresh FileBackend per test via tmp_path fixture.
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -221,3 +224,78 @@ def test_signal_appends(client):
     assert len(signals) == 1
     assert signals[0]["message"] == "task needs re-scoping"
     assert signals[0]["worker_id"] == "worker-1"
+
+
+# ---------------------------------------------------------------------------
+# Scent (SSE) tests
+# ---------------------------------------------------------------------------
+
+
+def test_scent_returns_sse_stream(tmp_path):
+    """Carry a task, add a trail entry, then verify it appears in SSE output."""
+    from antfarm.core.backends.file import FileBackend
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend)
+    client = TestClient(app)
+
+    _carry(client)
+    task = _forage(client).json()
+    task_id = task["id"]
+
+    client.post(
+        f"/tasks/{task_id}/trail",
+        json={"worker_id": "worker-1", "message": "step one done"},
+    )
+
+    with client.stream("GET", f"/scent/{task_id}?timeout=2") as r:
+        assert r.status_code == 200
+        assert "text/event-stream" in r.headers["content-type"]
+        lines = []
+        for line in r.iter_lines():
+            if line.startswith("data: "):
+                lines.append(line)
+        assert any("step one done" in line for line in lines)
+
+
+def test_scent_404_unknown_task(client):
+    """GET /scent/{nonexistent} returns 404."""
+    r = client.get("/scent/nonexistent?timeout=1")
+    assert r.status_code == 404
+
+
+def test_scent_new_entries(tmp_path):
+    """Entries appended mid-stream appear in SSE output."""
+    import json
+
+    from antfarm.core.backends.file import FileBackend
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend)
+    client = TestClient(app)
+
+    _carry(client)
+    task = _forage(client).json()
+    task_id = task["id"]
+
+    # Append a trail entry from a background thread after a short delay
+    def _append_later():
+        time.sleep(0.5)
+        client.post(
+            f"/tasks/{task_id}/trail",
+            json={"worker_id": "worker-1", "message": "late entry"},
+        )
+
+    t = threading.Thread(target=_append_later, daemon=True)
+    t.start()
+
+    messages = []
+    with client.stream("GET", f"/scent/{task_id}?timeout=3&poll_interval=0.2") as r:
+        assert r.status_code == 200
+        for line in r.iter_lines():
+            if line.startswith("data: "):
+                entry = json.loads(line[len("data: "):])
+                messages.append(entry.get("message", ""))
+
+    t.join(timeout=5)
+    assert "late entry" in messages

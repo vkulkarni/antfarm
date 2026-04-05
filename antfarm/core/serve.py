@@ -10,10 +10,13 @@ Mutation-critical paths (pull, guard, trail, signal) are protected by _lock.
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from antfarm.core.backends.base import TaskBackend
@@ -40,6 +43,7 @@ class CarryRequest(BaseModel):
     priority: int = 10
     depends_on: list[str] = []
     touches: list[str] = []
+    capabilities_required: list[str] = []
     created_by: str = "api"
 
 
@@ -52,6 +56,7 @@ class WorkerRegisterRequest(BaseModel):
     node_id: str
     agent_type: str
     workspace_root: str
+    capabilities: list[str] = []
 
 
 class HeartbeatRequest(BaseModel):
@@ -161,6 +166,7 @@ def get_app(
             "node_id": req.node_id,
             "agent_type": req.agent_type,
             "workspace_root": req.workspace_root,
+            "capabilities": req.capabilities,
             "status": "idle",
             "registered_at": now,
             "last_heartbeat": now,
@@ -199,6 +205,7 @@ def get_app(
             "priority": req.priority,
             "depends_on": req.depends_on,
             "touches": req.touches,
+            "capabilities_required": req.capabilities_required,
             "created_by": req.created_by,
             "status": "ready",
             "current_attempt": None,
@@ -369,6 +376,46 @@ def get_app(
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Scent (SSE trail streaming)
+    # ------------------------------------------------------------------
+
+    @app.get("/scent/{task_id}")
+    def scent_task(
+        task_id: str,
+        poll_interval: float = Query(default=1.0),
+        timeout: float = Query(default=0.0),
+    ):
+        """Stream trail entries for a task as Server-Sent Events.
+
+        Args:
+            task_id: Task to stream trail for.
+            poll_interval: Seconds between backend polls.
+            timeout: If > 0, stop streaming after this many seconds.
+        """
+        task = _backend.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+        def _generate():
+            seen = 0
+            start = time.monotonic()
+            try:
+                while True:
+                    if timeout > 0 and (time.monotonic() - start) >= timeout:
+                        break
+                    current = _backend.get_task(task_id)
+                    if current is not None:
+                        trail = current.get("trail", [])
+                        for entry in trail[seen:]:
+                            yield f"data: {json.dumps(entry)}\n\n"
+                        seen = len(trail)
+                    time.sleep(poll_interval)
+            except GeneratorExit:
+                pass
+
+        return StreamingResponse(_generate(), media_type="text/event-stream")
 
     # ------------------------------------------------------------------
     # Status
