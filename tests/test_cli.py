@@ -180,6 +180,57 @@ def test_cli_scout_uses_env_url(monkeypatch):
         assert "my-colony:8000" in call_url
 
 
+def test_scout_watch_basic():
+    """--watch polls repeatedly; KeyboardInterrupt after first sleep exits cleanly."""
+    runner = CliRunner()
+
+    status_data = {
+        "tasks_ready": 3,
+        "tasks_active": 1,
+        "tasks_done": 7,
+        "workers": 2,
+        "nodes": 1,
+    }
+
+    with (
+        patch("antfarm.core.cli.httpx.get") as mock_get,
+        patch("antfarm.core.cli.time.sleep", side_effect=KeyboardInterrupt),
+    ):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = status_data
+        mock_get.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            ["scout", "--watch", "--interval", "1", "--colony-url", "http://localhost:7433"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "tasks_ready" in result.output
+        assert "3" in result.output
+        mock_get.assert_called_once()
+
+
+def test_scout_oneshot_unchanged():
+    """Without --watch, scout performs exactly one GET and exits."""
+    runner = CliRunner()
+
+    status_data = {"nodes": 2, "workers": 3, "tasks_ready": 5}
+
+    with patch("antfarm.core.cli.httpx.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = status_data
+        mock_get.return_value = mock_resp
+
+        result = runner.invoke(main, ["scout", "--colony-url", "http://localhost:7433"])
+
+        assert result.exit_code == 0, result.output
+        assert "nodes" in result.output
+        mock_get.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------
