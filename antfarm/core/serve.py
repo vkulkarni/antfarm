@@ -40,6 +40,7 @@ class CarryRequest(BaseModel):
     priority: int = 10
     depends_on: list[str] = []
     touches: list[str] = []
+    capabilities_required: list[str] = []
     created_by: str = "api"
 
 
@@ -52,6 +53,7 @@ class WorkerRegisterRequest(BaseModel):
     node_id: str
     agent_type: str
     workspace_root: str
+    capabilities: list[str] = []
 
 
 class HeartbeatRequest(BaseModel):
@@ -161,6 +163,7 @@ def get_app(
             "node_id": req.node_id,
             "agent_type": req.agent_type,
             "workspace_root": req.workspace_root,
+            "capabilities": req.capabilities,
             "status": "idle",
             "registered_at": now,
             "last_heartbeat": now,
@@ -199,6 +202,7 @@ def get_app(
             "priority": req.priority,
             "depends_on": req.depends_on,
             "touches": req.touches,
+            "capabilities_required": req.capabilities_required,
             "created_by": req.created_by,
             "status": "ready",
             "current_attempt": None,

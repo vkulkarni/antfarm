@@ -434,3 +434,70 @@ def test_kickback_requires_done_not_active(backend: FileBackend) -> None:
     data = backend.get_task("task-1")
     assert data is not None
     assert data["status"] == TaskStatus.READY.value
+
+
+# ---------------------------------------------------------------------------
+# Capability filtering in pull()
+# ---------------------------------------------------------------------------
+
+
+def _make_task_with_caps(task_id: str, capabilities_required: list) -> dict:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "id": task_id,
+        "title": f"Task {task_id}",
+        "spec": "Do something",
+        "complexity": "M",
+        "priority": 10,
+        "depends_on": [],
+        "touches": [],
+        "capabilities_required": capabilities_required,
+        "created_at": now,
+        "updated_at": now,
+        "created_by": "test",
+    }
+
+
+def test_pull_skips_tasks_with_unmet_capabilities(backend: FileBackend, tmp_path: Path) -> None:
+    """pull() skips a task requiring capabilities the worker doesn't have."""
+    # Register a worker with no capabilities
+    worker_data = {
+        "worker_id": "worker-1",
+        "node_id": "node-1",
+        "agent_type": "generic",
+        "workspace_root": "/tmp",
+        "capabilities": [],
+        "status": "idle",
+        "registered_at": datetime.now(UTC).isoformat(),
+        "last_heartbeat": datetime.now(UTC).isoformat(),
+    }
+    backend.register_worker(worker_data)
+
+    # Carry a task requiring "gpu"
+    backend.carry(_make_task_with_caps("task-gpu", ["gpu"]))
+
+    # Worker without gpu should get nothing
+    result = backend.pull("worker-1")
+    assert result is None
+
+
+def test_pull_matches_tasks_with_met_capabilities(backend: FileBackend, tmp_path: Path) -> None:
+    """pull() returns a task when worker has all required capabilities."""
+    worker_data = {
+        "worker_id": "worker-2",
+        "node_id": "node-1",
+        "agent_type": "generic",
+        "workspace_root": "/tmp",
+        "capabilities": ["gpu", "docker"],
+        "status": "idle",
+        "registered_at": datetime.now(UTC).isoformat(),
+        "last_heartbeat": datetime.now(UTC).isoformat(),
+    }
+    backend.register_worker(worker_data)
+
+    backend.carry(_make_task_with_caps("task-gpu", ["gpu"]))
+
+    result = backend.pull("worker-2")
+    assert result is not None
+    assert result["id"] == "task-gpu"
+

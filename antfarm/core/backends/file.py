@@ -173,6 +173,16 @@ class FileBackend(TaskBackend):
                 p.stem for p in (self._root / "tasks" / "done").iterdir() if p.suffix == ".json"
             }
 
+            # Read worker capabilities if worker file exists
+            worker_capabilities: set[str] | None = None
+            worker_path = self._worker_path(worker_id)
+            if worker_path.exists():
+                try:
+                    worker_data = self._read_json(worker_path)
+                    worker_capabilities = set(worker_data.get("capabilities", []))
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
             # Load all ready tasks
             ready_dir = self._root / "tasks" / "ready"
             candidates: list[Task] = []
@@ -187,6 +197,14 @@ class FileBackend(TaskBackend):
 
             # Select using inline scheduling policy
             eligible = [t for t in candidates if all(dep in done_task_ids for dep in t.depends_on)]
+
+            # Filter by capability requirements
+            if worker_capabilities is not None:
+                eligible = [
+                    t for t in eligible
+                    if set(t.capabilities_required).issubset(worker_capabilities)
+                ]
+
             if not eligible:
                 return None
 

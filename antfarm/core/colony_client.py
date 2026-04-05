@@ -35,13 +35,19 @@ class ColonyClient:
         return r.json()
 
     def register_worker(
-        self, worker_id: str, node_id: str, agent_type: str, workspace_root: str
+        self,
+        worker_id: str,
+        node_id: str,
+        agent_type: str,
+        workspace_root: str,
+        capabilities: list[str] | None = None,
     ) -> dict:
         r = self._client.post("/workers/register", json={
             "worker_id": worker_id,
             "node_id": node_id,
             "agent_type": agent_type,
             "workspace_root": workspace_root,
+            "capabilities": capabilities or [],
         })
         r.raise_for_status()
         return r.json()
