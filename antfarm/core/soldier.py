@@ -3,15 +3,21 @@
 Deterministic merge gate: polls the colony for done tasks and merges them into
 the integration branch via a temp branch. No AI, no auto-fix.
 
-Policy (v0.1):
-- Clean merge + green tests → fast-forward integration branch and mark merged
-- Any conflict or test failure → kickback immediately
+v0.5.3 additions:
+- Review orchestration: Soldier creates review tasks for done tasks, waits for
+  ReviewVerdict, gates merge on artifact + review + freshness.
+- Review-as-task: review tasks are regular tasks that reviewer workers forage.
+
+Policy:
+- Clean merge + green tests + passing review → fast-forward and mark merged
+- Any conflict, test failure, or review rejection → kickback immediately
 - Dependent tasks stay ineligible until upstream is merged
 - Independent tasks continue merging (queue not globally blocked)
 """
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import time
 from enum import StrEnum
@@ -19,10 +25,13 @@ from enum import StrEnum
 from antfarm.core.colony_client import ColonyClient
 from antfarm.core.models import ReviewVerdict
 
+logger = logging.getLogger(__name__)
+
 
 class MergeResult(StrEnum):
     MERGED = "merged"
     FAILED = "failed"
+    NEEDS_REVIEW = "needs_review"
 
 
 class Soldier:
@@ -47,6 +56,7 @@ class Soldier:
         integration_branch: str = "dev",
         test_command: list[str] | None = None,
         poll_interval: float = 30.0,
+        require_review: bool = False,
         client=None,
     ):
         self.colony = ColonyClient(colony_url, client=client)
@@ -54,6 +64,7 @@ class Soldier:
         self.integration_branch = integration_branch
         self.test_command = test_command or ["pytest", "-x", "-q"]
         self.poll_interval = poll_interval
+        self.require_review = require_review
         self.last_failure_reason = ""
 
     # ------------------------------------------------------------------
@@ -63,6 +74,8 @@ class Soldier:
     def run(self) -> None:
         """Main soldier loop. Runs indefinitely until interrupted."""
         while True:
+            if self.require_review:
+                self.process_done_tasks()
             queue = self.get_merge_queue()
             if not queue:
                 time.sleep(self.poll_interval)
@@ -81,6 +94,8 @@ class Soldier:
         Returns:
             List of (task_id, MergeResult) tuples for each task processed.
         """
+        if self.require_review:
+            self.process_done_tasks()
         results = []
         queue = self.get_merge_queue()
         for task in queue:
@@ -91,6 +106,171 @@ class Soldier:
             else:
                 self.colony.kickback(task["id"], self.last_failure_reason)
             results.append((task["id"], result))
+        return results
+
+    def process_done_tasks(self) -> list[str]:
+        """Scan done tasks and create review tasks for those missing verdicts.
+
+        Skips review tasks (id starts with "review-") and tasks that already
+        have a review verdict on the current attempt.
+
+        Returns:
+            List of review task IDs that were created.
+        """
+        created: list[str] = []
+        all_tasks = self.colony.list_tasks()
+
+        for task in all_tasks:
+            if task.get("status") != "done":
+                continue
+            task_id = task.get("id", "")
+            if task_id.startswith("review-"):
+                continue
+            if self._has_merged_attempt(task):
+                continue
+            # Skip if already has a verdict
+            if self._get_review_verdict(task) is not None:
+                continue
+            review_id = self.create_review_task(task)
+            if review_id:
+                logger.info("created review task %s for %s", review_id, task_id)
+                created.append(review_id)
+        return created
+
+    def _get_done_candidates(self) -> list[dict]:
+        """Get done tasks eligible for review+merge processing.
+
+        Like get_merge_queue() but does NOT gate on review verdict,
+        since run_once_with_review() handles that itself.
+        """
+        all_tasks = self.colony.list_tasks()
+
+        merged_task_ids: set[str] = set()
+        for t in all_tasks:
+            if self._has_merged_attempt(t):
+                merged_task_ids.add(t["id"])
+
+        eligible = []
+        for task in all_tasks:
+            if task.get("status") != "done":
+                continue
+            if task.get("id", "").startswith("review-"):
+                continue
+            if self._has_merged_attempt(task):
+                continue
+            if not self._get_attempt_branch(task):
+                continue
+            deps = task.get("depends_on") or []
+            if not all(dep in merged_task_ids for dep in deps):
+                continue
+            eligible.append(task)
+
+        def _sort_key(t: dict) -> tuple:
+            mo = t.get("merge_override")
+            return (
+                0 if mo is not None else 1,
+                mo if mo is not None else 999,
+                t.get("priority", 10),
+                t.get("created_at", ""),
+            )
+
+        eligible.sort(key=_sort_key)
+        return eligible
+
+    def run_once_with_review(self) -> list[tuple[str, MergeResult]]:
+        """Process the merge queue with review orchestration.
+
+        For each done task:
+        1. If no review task exists, create one and skip (NEEDS_REVIEW).
+        2. If review task exists but not done, skip (NEEDS_REVIEW).
+        3. If review verdict is "pass" + fresh SHA, proceed to merge.
+        4. If review verdict is not "pass", kickback the original task.
+
+        Returns:
+            List of (task_id, MergeResult) tuples.
+        """
+        results: list[tuple[str, MergeResult]] = []
+        queue = self._get_done_candidates()
+        all_tasks = self.colony.list_tasks()
+
+        # Build lookup of review tasks and their state
+        review_tasks: dict[str, dict] = {}
+        for t in all_tasks:
+            tid = t.get("id", "")
+            if tid.startswith("review-"):
+                review_tasks[tid] = t
+
+        for task in queue:
+            task_id = task["id"]
+            attempt_id = task["current_attempt"]
+            review_task_id = f"review-{task_id}"
+
+            # Check if review verdict is already stored on the attempt
+            verdict_dict = self._get_review_verdict(task)
+            if verdict_dict is not None:
+                passed, reason = self.check_review_verdict(task)
+                if passed:
+                    result = self.attempt_merge(task)
+                    if result == MergeResult.MERGED:
+                        self.colony.mark_merged(task_id, attempt_id)
+                    else:
+                        self.colony.kickback(task_id, self.last_failure_reason)
+                    results.append((task_id, result))
+                else:
+                    self.colony.kickback(task_id, f"review failed: {reason}")
+                    results.append((task_id, MergeResult.FAILED))
+                continue
+
+            # Check if review task exists
+            review_task = review_tasks.get(review_task_id)
+            if review_task is None:
+                # Create the review task
+                created_id = self.create_review_task(task)
+                if created_id:
+                    logger.info("created review task %s for %s", created_id, task_id)
+                else:
+                    logger.warning("failed to create review task for %s", task_id)
+                results.append((task_id, MergeResult.NEEDS_REVIEW))
+                continue
+
+            # Review task exists — check if it's done with a verdict
+            review_status = review_task.get("status", "")
+            if review_status != "done":
+                # Still in progress
+                results.append((task_id, MergeResult.NEEDS_REVIEW))
+                continue
+
+            # Review task is done — extract verdict from review task's artifact
+            review_verdict = self._extract_verdict_from_review_task(review_task)
+            if review_verdict is None:
+                # Review done but no verdict — treat as failure
+                self.colony.kickback(
+                    task_id, "review task completed without a ReviewVerdict"
+                )
+                results.append((task_id, MergeResult.FAILED))
+                continue
+
+            # Store verdict on the original task's attempt
+            self.colony.store_review_verdict(task_id, attempt_id, review_verdict)
+
+            # Re-check with the stored verdict
+            task_updated = self.colony.get_task(task_id)
+            if task_updated is None:
+                results.append((task_id, MergeResult.FAILED))
+                continue
+
+            passed, reason = self.check_review_verdict(task_updated)
+            if passed:
+                result = self.attempt_merge(task_updated)
+                if result == MergeResult.MERGED:
+                    self.colony.mark_merged(task_id, attempt_id)
+                else:
+                    self.colony.kickback(task_id, self.last_failure_reason)
+                results.append((task_id, result))
+            else:
+                self.colony.kickback(task_id, f"review failed: {reason}")
+                results.append((task_id, MergeResult.FAILED))
+
         return results
 
     def get_merge_queue(self) -> list[dict]:
@@ -113,9 +293,15 @@ class Soldier:
                 merged_task_ids.add(t["id"])
 
         # Filter to done tasks with a branch and satisfied deps
+        # Exclude review tasks (id starts with "review-") — they are informational
         eligible = []
         for task in all_tasks:
             if task.get("status") != "done":
+                continue
+            if task.get("id", "").startswith("review-"):
+                continue
+            # Skip already-merged tasks
+            if self._has_merged_attempt(task):
                 continue
             if not self._get_attempt_branch(task):
                 continue
@@ -123,6 +309,11 @@ class Soldier:
             deps = task.get("depends_on") or []
             if not all(dep in merged_task_ids for dep in deps):
                 continue
+            # When review is required, gate on passing + fresh verdict
+            if self.require_review:
+                passed, _reason = self.check_review_verdict(task)
+                if not passed:
+                    continue
             eligible.append(task)
 
         # Sort: override tasks first (by override position), then by priority/FIFO
@@ -427,10 +618,18 @@ class Soldier:
     def create_review_task(self, task: dict) -> str | None:
         """Create a review task in the queue for a done task.
 
-        Returns the review task ID, or None if creation failed.
+        Idempotent: if review-{task_id} already exists, returns None without error.
+        Includes review pack in the spec when artifact is available.
+
+        Returns the review task ID, or None if creation failed or already exists.
         """
         task_id = task["id"]
         review_task_id = f"review-{task_id}"
+
+        # Idempotency: skip if review task already exists
+        existing = self.colony.get_task(review_task_id)
+        if existing is not None:
+            return None
 
         branch = self._get_attempt_branch(task) or ""
         pr = ""
@@ -439,15 +638,33 @@ class Soldier:
                 pr = a.get("pr", "")
                 break
 
+        # Build spec with review pack if artifact available
+        artifact_dict = self._get_attempt_artifact(task)
+        review_pack_text = ""
+        if artifact_dict:
+            from antfarm.core.models import TaskArtifact
+            from antfarm.core.review_pack import generate_review_pack
+
+            try:
+                artifact = TaskArtifact.from_dict(artifact_dict)
+                review_pack_text = generate_review_pack(artifact, task.get("title", ""))
+            except Exception:
+                pass
+
         spec = (
             f"Review task {task_id}: '{task.get('title', '')}'\n\n"
             f"Branch: {branch}\n"
             f"PR: {pr}\n\n"
+        )
+        if review_pack_text:
+            spec += f"{review_pack_text}\n\n"
+        spec += (
             "Instructions:\n"
             "1. Read the PR diff\n"
             "2. Check for bugs, security issues, and design problems\n"
             "3. Run tests to verify\n"
             "4. Produce a ReviewVerdict (pass/needs_changes/blocked)\n"
+            "5. Output verdict between [REVIEW_VERDICT] and [/REVIEW_VERDICT] tags\n"
         )
 
         try:
@@ -457,9 +674,43 @@ class Soldier:
                 spec=spec,
                 depends_on=[],
                 touches=task.get("touches", []),
-                priority=1,  # reviews are high priority
+                priority=1,
                 complexity="S",
+                capabilities_required=["review"],
             )
             return review_task_id
         except Exception:
             return None
+
+    @staticmethod
+    def _extract_verdict_from_review_task(review_task: dict) -> dict | None:
+        """Extract ReviewVerdict dict from a completed review task.
+
+        The reviewer stores the verdict in the review task's attempt artifact
+        under the "review_verdict" key, or as the artifact itself if it has
+        a "verdict" key.
+        """
+        current_attempt_id = review_task.get("current_attempt")
+        if not current_attempt_id:
+            return None
+        for attempt in review_task.get("attempts", []):
+            if attempt.get("attempt_id") == current_attempt_id:
+                # Check attempt artifact for verdict
+                artifact = attempt.get("artifact")
+                if artifact and "verdict" in artifact:
+                    return artifact
+                # Check attempt-level review_verdict
+                rv = attempt.get("review_verdict")
+                if rv:
+                    return rv
+        # Fall back to trail entries containing [REVIEW_VERDICT]
+        for entry in reversed(review_task.get("trail", [])):
+            msg = entry.get("message", "")
+            if msg.startswith("[REVIEW_VERDICT] "):
+                import json
+
+                try:
+                    return json.loads(msg[len("[REVIEW_VERDICT] "):])
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        return None

@@ -390,6 +390,30 @@ class FileBackend(TaskBackend):
             data["updated_at"] = _now_iso()
             self._write_json(active_path, data)
 
+    def store_review_verdict(
+        self, task_id: str, attempt_id: str, verdict: dict
+    ) -> None:
+        """Store a ReviewVerdict on the task's current attempt in done/."""
+        with self._lock:
+            done_path = self._done_path(task_id)
+            if not done_path.exists():
+                raise FileNotFoundError(f"Task '{task_id}' not found in done/")
+
+            data = self._read_json(done_path)
+            if data.get("current_attempt") != attempt_id:
+                raise ValueError(
+                    f"attempt_id '{attempt_id}' is not the current attempt "
+                    f"(got '{data.get('current_attempt')}')"
+                )
+
+            for a in data["attempts"]:
+                if a["attempt_id"] == attempt_id:
+                    a["review_verdict"] = verdict
+                    break
+
+            data["updated_at"] = _now_iso()
+            self._write_json(done_path, data)
+
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
         """Update attempt status to MERGED in done/ task file. Task stays DONE."""
         with self._lock:

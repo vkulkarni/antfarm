@@ -118,6 +118,23 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
+    def store_review_verdict(
+        self, task_id: str, attempt_id: str, verdict: dict
+    ) -> None:
+        """Store a ReviewVerdict on the task's current attempt.
+
+        Args:
+            task_id: ID of the task being reviewed.
+            attempt_id: ID of the attempt the verdict applies to.
+            verdict: ReviewVerdict.to_dict() output.
+
+        Raises:
+            ValueError: If attempt_id is not the current attempt.
+            FileNotFoundError: If the task is not found in done/.
+        """
+        ...
+
+    @abstractmethod
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
         """Mark attempt as MERGED. Task stays DONE in done/ folder.
 

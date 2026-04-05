@@ -111,9 +111,10 @@ class ColonyClient:
         touches: list[str] | None = None,
         priority: int = 10,
         complexity: str = "M",
+        capabilities_required: list[str] | None = None,
     ) -> dict:
         """Create a task in the colony."""
-        r = self._client.post("/tasks", json={
+        payload: dict = {
             "id": task_id,
             "title": title,
             "spec": spec,
@@ -121,7 +122,10 @@ class ColonyClient:
             "touches": touches or [],
             "priority": priority,
             "complexity": complexity,
-        })
+        }
+        if capabilities_required:
+            payload["capabilities_required"] = capabilities_required
+        r = self._client.post("/tasks", json=payload)
         r.raise_for_status()
         return r.json()
 
@@ -149,6 +153,15 @@ class ColonyClient:
 
     def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
         r = self._client.post(f"/tasks/{task_id}/harvest-pending", json={"attempt_id": attempt_id})
+        r.raise_for_status()
+
+    def store_review_verdict(
+        self, task_id: str, attempt_id: str, verdict: dict
+    ) -> None:
+        r = self._client.post(
+            f"/tasks/{task_id}/review-verdict",
+            json={"attempt_id": attempt_id, "verdict": verdict},
+        )
         r.raise_for_status()
 
     def mark_merged(self, task_id: str, attempt_id: str) -> None:

@@ -351,6 +351,7 @@ class Attempt:
     started_at: str
     completed_at: str | None
     artifact: dict | None = None
+    review_verdict: dict | None = None
 
     def to_dict(self) -> dict:
         d = {
@@ -364,6 +365,8 @@ class Attempt:
         }
         if self.artifact is not None:
             d["artifact"] = self.artifact
+        if self.review_verdict is not None:
+            d["review_verdict"] = self.review_verdict
         return d
 
     @classmethod
@@ -377,6 +380,7 @@ class Attempt:
             started_at=data["started_at"],
             completed_at=data.get("completed_at"),
             artifact=data.get("artifact"),
+            review_verdict=data.get("review_verdict"),
         )
 
 

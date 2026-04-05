@@ -21,7 +21,7 @@
 | `antfarm/mcp/__init__.py` | Create | Package marker |
 | `antfarm/mcp/config.py` | Create | Load `.antfarm/config.json` + env overrides |
 | `antfarm/mcp/server.py` | Create | MCP stdio server — tool registration, dispatch, error boundary |
-| `antfarm/mcp/tools.py` | Create | 10 tool definitions + handler functions |
+| `antfarm/mcp/tools.py` | Create | 14 tool definitions + handler functions |
 | `antfarm/core/colony_client.py` | Modify | Add `status_full()` method (existing client lacks `/status/full`) |
 | `antfarm/plugin/skills/antfarm-plan.md` | Create | `/antfarm-plan` skill |
 | `antfarm/plugin/skills/antfarm-status.md` | Create | `/antfarm-status` skill |
@@ -416,8 +416,10 @@ def register_tools(server: Server, config: AntfarmConfig) -> None:
             return [_error_response(f"Unexpected error: {e}")]
 
 
-def _error_response(message: str) -> TextContent:
-    return TextContent(type="text", text=json.dumps({"error": message}))
+def _error_response(message: str, code: str = "unknown", retryable: bool = False) -> TextContent:
+    return TextContent(type="text", text=json.dumps({
+        "error": {"code": code, "message": message, "retryable": retryable},
+    }))
 
 
 def _build_tool_defs() -> list[Tool]:
@@ -472,12 +474,14 @@ import pytest
 from antfarm.mcp.tools import (
     handle_blockers,
     handle_carry,
+    handle_deregister_worker,
     handle_forage,
     handle_harvest,
     handle_list_tasks,
     handle_memory,
     handle_merge_ready,
     handle_plan_spec,
+    handle_register_worker,
     handle_review_pack,
     handle_status,
     handle_trail,
@@ -598,7 +602,39 @@ def test_harvest_marks_done(mock_client):
     })
     assert result["status"] == "ok"
     mock_client.harvest.assert_called_once_with(
-        "task-001", "att-001", pr="https://github.com/org/repo/pull/42", branch="feat/auth"
+        "task-001", "att-001", pr="https://github.com/org/repo/pull/42",
+        branch="feat/auth", artifact=None,
+    )
+
+
+def test_harvest_with_artifact(mock_client):
+    """harvest passes structured artifact to client."""
+    mock_client.harvest.return_value = None
+
+    artifact = {
+        "task_id": "task-001",
+        "attempt_id": "att-001",
+        "worker_id": "node-1/claude-1",
+        "branch": "feat/auth",
+        "files_changed": ["api/auth.py", "tests/test_auth.py"],
+        "lines_added": 120,
+        "lines_removed": 5,
+        "tests_ran": True,
+        "tests_passed": True,
+        "lint_ran": True,
+        "lint_passed": True,
+        "merge_readiness": "ready",
+    }
+    result = handle_harvest(mock_client, {
+        "task_id": "task-001",
+        "attempt_id": "att-001",
+        "branch": "feat/auth",
+        "pr": "",
+        "artifact": artifact,
+    })
+    assert result["status"] == "ok"
+    mock_client.harvest.assert_called_once_with(
+        "task-001", "att-001", pr="", branch="feat/auth", artifact=artifact,
     )
 
 
@@ -699,6 +735,30 @@ def test_workers_returns_list(mock_client):
     assert result[0]["worker_id"] == "node-1/claude-1"
 
 
+def test_register_worker(mock_client):
+    """register_worker calls client.register_worker."""
+    mock_client.register_worker.return_value = {
+        "worker_id": "node-1/claude-1", "status": "idle",
+    }
+
+    result = handle_register_worker(mock_client, {
+        "worker_id": "node-1/claude-1",
+        "node_id": "node-1",
+        "agent_type": "claude-code",
+    })
+    assert result["worker_id"] == "node-1/claude-1"
+    mock_client.register_worker.assert_called_once()
+
+
+def test_deregister_worker(mock_client):
+    """deregister_worker calls client.deregister_worker."""
+    mock_client.deregister_worker.return_value = None
+
+    result = handle_deregister_worker(mock_client, {"worker_id": "node-1/claude-1"})
+    assert result["status"] == "ok"
+    mock_client.deregister_worker.assert_called_once_with("node-1/claude-1")
+
+
 def test_plan_spec_unavailable(mock_client):
     """plan_spec returns unavailable when v0.5 planner not shipped."""
     result = handle_plan_spec(mock_client, {"spec": "Build auth"})
@@ -780,6 +840,7 @@ def handle_harvest(client: ColonyClient, arguments: dict) -> dict:
         arguments["attempt_id"],
         pr=arguments.get("pr", ""),
         branch=arguments["branch"],
+        artifact=arguments.get("artifact"),
     )
     return {"status": "ok"}
 
@@ -843,6 +904,21 @@ def handle_workers(client: ColonyClient, arguments: dict) -> list[dict]:
     return client.list_workers()
 
 
+def handle_register_worker(client: ColonyClient, arguments: dict) -> dict:
+    return client.register_worker(
+        worker_id=arguments["worker_id"],
+        node_id=arguments["node_id"],
+        agent_type=arguments.get("agent_type", "claude-code"),
+        workspace_root=arguments.get("workspace_root", "."),
+        capabilities=arguments.get("capabilities"),
+    )
+
+
+def handle_deregister_worker(client: ColonyClient, arguments: dict) -> dict:
+    client.deregister_worker(arguments["worker_id"])
+    return {"status": "ok"}
+
+
 def handle_plan_spec(client: ColonyClient, arguments: dict) -> dict:
     """Decompose a spec into tasks. Delegates to v0.5 planner module.
 
@@ -898,6 +974,8 @@ HANDLERS: dict[str, callable] = {
     "antfarm_review_pack": handle_review_pack,
     "antfarm_merge_ready": handle_merge_ready,
     "antfarm_workers": handle_workers,
+    "antfarm_register_worker": handle_register_worker,
+    "antfarm_deregister_worker": handle_deregister_worker,
     "antfarm_plan_spec": handle_plan_spec,
     "antfarm_memory": handle_memory,
 }
@@ -980,7 +1058,7 @@ def _build_tool_defs() -> list[Tool]:
         ),
         Tool(
             name="antfarm_harvest",
-            description="Mark a task as complete with branch and PR info",
+            description="Mark a task as complete with branch, PR, and structured artifact",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -988,6 +1066,10 @@ def _build_tool_defs() -> list[Tool]:
                     "attempt_id": {"type": "string"},
                     "branch": {"type": "string", "description": "Git branch name"},
                     "pr": {"type": "string", "description": "PR URL (optional)", "default": ""},
+                    "artifact": {
+                        "type": "object",
+                        "description": "Structured TaskArtifact (v0.5): files_changed, test/lint results, merge readiness, risks",
+                    },
                 },
                 "required": ["task_id", "attempt_id", "branch"],
             },
@@ -1022,6 +1104,46 @@ def _build_tool_defs() -> list[Tool]:
             name="antfarm_workers",
             description="List all registered workers and their status",
             inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="antfarm_register_worker",
+            description="Register a worker with the colony (required before forage)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "worker_id": {
+                        "type": "string",
+                        "description": "Worker ID (e.g. node-1/claude-1)",
+                    },
+                    "node_id": {"type": "string", "description": "Node this worker runs on"},
+                    "agent_type": {
+                        "type": "string",
+                        "description": "Agent type (claude-code, codex, aider, generic)",
+                        "default": "claude-code",
+                    },
+                    "workspace_root": {
+                        "type": "string",
+                        "description": "Workspace root directory",
+                        "default": ".",
+                    },
+                    "capabilities": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": "Worker capabilities",
+                    },
+                },
+                "required": ["worker_id", "node_id"],
+            },
+        ),
+        Tool(
+            name="antfarm_deregister_worker",
+            description="Deregister a worker from the colony",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "worker_id": {"type": "string", "description": "Worker ID to deregister"},
+                },
+                "required": ["worker_id"],
+            },
         ),
         Tool(
             name="antfarm_plan_spec",
@@ -1102,8 +1224,10 @@ def register_tools(server: Server, config: AntfarmConfig) -> None:
                 return [_error_response(f"Unexpected error: {e}")]
 
 
-def _error_response(message: str) -> TextContent:
-    return TextContent(type="text", text=json.dumps({"error": message}))
+def _error_response(message: str, code: str = "unknown", retryable: bool = False) -> TextContent:
+    return TextContent(type="text", text=json.dumps({
+        "error": {"code": code, "message": message, "retryable": retryable},
+    }))
 ```
 
 - [ ] **Step 4: Run tool handler tests**
