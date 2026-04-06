@@ -22,6 +22,7 @@ import subprocess
 import time
 from enum import StrEnum
 
+from antfarm.core.backends.base import TaskBackend
 from antfarm.core.colony_client import ColonyClient
 from antfarm.core.models import ReviewVerdict
 
@@ -726,3 +727,83 @@ class Soldier:
                 except (json.JSONDecodeError, ValueError):
                     continue
         return None
+
+    # ------------------------------------------------------------------
+    # from_backend: in-process Soldier (no HTTP round-trips)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_backend(
+        cls,
+        backend: TaskBackend,
+        repo_path: str,
+        integration_branch: str = "dev",
+        test_command: list[str] | None = None,
+        poll_interval: float = 30.0,
+        require_review: bool = True,
+    ) -> Soldier:
+        """Create a Soldier that talks directly to a TaskBackend.
+
+        Instead of going through the Colony HTTP API, this wraps the backend
+        with a ColonyClient-compatible adapter so the Soldier can run
+        in-process (e.g., as a daemon thread inside the colony server).
+        Review is enabled by default — Soldier creates review tasks for done work.
+        """
+        instance = cls.__new__(cls)
+        instance.colony = _BackendAdapter(backend)
+        instance.repo_path = repo_path
+        instance.integration_branch = integration_branch
+        instance.test_command = test_command or ["pytest", "-x", "-q"]
+        instance.poll_interval = poll_interval
+        instance.require_review = require_review
+        instance.last_failure_reason = ""
+        return instance
+
+
+class _BackendAdapter:
+    """Wraps a TaskBackend with the subset of ColonyClient methods used by Soldier."""
+
+    def __init__(self, backend: TaskBackend) -> None:
+        self._backend = backend
+
+    def list_tasks(self, status: str | None = None) -> list[dict]:
+        return self._backend.list_tasks(status=status)
+
+    def get_task(self, task_id: str) -> dict | None:
+        return self._backend.get_task(task_id)
+
+    def carry(self, **kwargs) -> dict:
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        task = {
+            "id": kwargs.get("task_id", ""),
+            "title": kwargs.get("title", ""),
+            "spec": kwargs.get("spec", ""),
+            "complexity": kwargs.get("complexity", "M"),
+            "priority": kwargs.get("priority", 10),
+            "depends_on": kwargs.get("depends_on") or [],
+            "touches": kwargs.get("touches") or [],
+            "capabilities_required": kwargs.get("capabilities_required") or [],
+            "created_by": "soldier",
+            "status": "ready",
+            "current_attempt": None,
+            "attempts": [],
+            "trail": [],
+            "signals": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+        task_id = self._backend.carry(task)
+        return {"task_id": task_id}
+
+    def mark_merged(self, task_id: str, attempt_id: str) -> None:
+        self._backend.mark_merged(task_id, attempt_id)
+
+    def kickback(self, task_id: str, reason: str) -> None:
+        self._backend.kickback(task_id, reason)
+
+    def store_review_verdict(
+        self, task_id: str, attempt_id: str, verdict: dict
+    ) -> None:
+        self._backend.store_review_verdict(task_id, attempt_id, verdict)

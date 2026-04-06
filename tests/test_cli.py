@@ -462,3 +462,153 @@ def test_cli_signal_posts():
         assert result.exit_code == 0, result.output
         url = mock_post.call_args.args[0]
         assert "task-001/signal" in url
+
+
+# ---------------------------------------------------------------------------
+# worker start --type (#102)
+# ---------------------------------------------------------------------------
+
+
+def test_worker_start_reviewer_adds_review_capability():
+    """--type=reviewer auto-adds 'review' to capabilities."""
+    runner = CliRunner()
+    captured_kwargs = {}
+
+    def fake_worker_runtime(**kwargs):
+        captured_kwargs.update(kwargs)
+        return MagicMock()
+
+    with patch("antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime):
+        result = runner.invoke(
+            main,
+            [
+                "worker", "start",
+                "--agent", "claude-code",
+                "--type", "reviewer",
+                "--node", "n1",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "review" in captured_kwargs.get("capabilities", [])
+
+
+def test_worker_start_builder_no_review_capability():
+    """--type=builder (default) does not add 'review' capability."""
+    runner = CliRunner()
+    captured_kwargs = {}
+
+    def fake_worker_runtime(**kwargs):
+        captured_kwargs.update(kwargs)
+        m = MagicMock()
+        return m
+
+    with patch("antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime):
+        result = runner.invoke(
+            main,
+            [
+                "worker", "start",
+                "--agent", "claude-code",
+                "--node", "n1",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "review" not in captured_kwargs.get("capabilities", [])
+
+
+def test_worker_start_name_defaults_to_type():
+    """Worker name defaults to worker_type when --name is not specified."""
+    runner = CliRunner()
+    captured_kwargs = {}
+
+    def fake_worker_runtime(**kwargs):
+        captured_kwargs.update(kwargs)
+        m = MagicMock()
+        return m
+
+    with patch("antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime):
+        result = runner.invoke(
+            main,
+            [
+                "worker", "start",
+                "--agent", "claude-code",
+                "--type", "reviewer",
+                "--node", "n1",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured_kwargs["name"] == "reviewer"
+
+
+def test_worker_start_explicit_name_overrides():
+    """Explicit --name overrides the type-based default."""
+    runner = CliRunner()
+    captured_kwargs = {}
+
+    def fake_worker_runtime(**kwargs):
+        captured_kwargs.update(kwargs)
+        m = MagicMock()
+        return m
+
+    with patch("antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime):
+        result = runner.invoke(
+            main,
+            [
+                "worker", "start",
+                "--agent", "claude-code",
+                "--type", "reviewer",
+                "--name", "my-worker",
+                "--node", "n1",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured_kwargs["name"] == "my-worker"
+
+
+# ---------------------------------------------------------------------------
+# plan --carry dependency resolution (#93)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_carry_resolves_index_deps():
+    """plan --carry resolves 1-based index deps to generated task IDs."""
+    runner = CliRunner()
+
+    plan_json = json.dumps([
+        {"title": "Task A", "spec": "Do A"},
+        {"title": "Task B", "spec": "Do B", "depends_on": [1]},
+    ])
+
+    carried_payloads = []
+
+    def fake_post(url, json=None, headers=None):
+        if json:
+            carried_payloads.append(json)
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"task_id": json.get("id", "?")} if json else {}
+        return resp
+
+    with patch("antfarm.core.cli.httpx.post", side_effect=fake_post):
+        result = runner.invoke(
+            main,
+            [
+                "plan",
+                "--spec", plan_json,
+                "--carry",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert len(carried_payloads) == 2
+    # Task B's depends_on should reference Task A's actual ID
+    task_a_id = carried_payloads[0]["id"]
+    assert carried_payloads[1]["depends_on"] == [task_a_id]

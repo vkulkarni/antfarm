@@ -236,3 +236,34 @@ def test_check_overlap_warnings_multiple(store):
     ]
     warnings = store.check_overlap_warnings(["api", "db"], active)
     assert len(warnings) == 2
+
+
+# ---------------------------------------------------------------------------
+# Auto-recompute hotspots on record_outcome (#91)
+# ---------------------------------------------------------------------------
+
+
+def test_hotspots_recomputed_after_outcome(store):
+    """Hotspots are automatically recomputed after recording an outcome."""
+    # Record enough outcomes for a hotspot to emerge (needs >= 2 appearances)
+    store.record_outcome("t1", "a1", "w1", success=False, touches=["api"])
+    store.record_outcome("t2", "a2", "w1", success=False, touches=["api"])
+
+    # Hotspots should already be recomputed
+    hotspots = store.get_hotspots()
+    assert "api" in hotspots
+    assert hotspots["api"] == 1.0  # 2 failures / 2 total
+
+
+def test_recompute_failure_does_not_crash(store, monkeypatch):
+    """If recompute_hotspots raises, record_outcome still succeeds."""
+    def broken_recompute(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(store, "recompute_hotspots", broken_recompute)
+
+    # Should not raise
+    store.record_outcome("t1", "a1", "w1", success=True, touches=["api"])
+
+    outcomes = store.get_outcomes()
+    assert len(outcomes) == 1

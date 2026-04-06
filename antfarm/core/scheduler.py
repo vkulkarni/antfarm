@@ -48,10 +48,23 @@ def select_task(
 
     # Step 2: Filter by capability requirements (skip if worker_capabilities is None)
     if worker_capabilities is not None:
-        eligible = [
-            t for t in eligible
-            if set(t.capabilities_required).issubset(worker_capabilities)
-        ]
+        # Workers with specialized capabilities (e.g. "review") should ONLY
+        # forage tasks that require those capabilities. A reviewer should not
+        # pick up implementation tasks that have no capabilities_required.
+        specialized = worker_capabilities - {"builder"}  # "builder" is not restrictive
+        if specialized:
+            # Specialized worker: only forage tasks requiring at least one of
+            # the worker's specialized capabilities
+            eligible = [
+                t for t in eligible
+                if set(t.capabilities_required) & specialized
+            ]
+        else:
+            # General worker: forage tasks whose requirements it can satisfy
+            eligible = [
+                t for t in eligible
+                if set(t.capabilities_required).issubset(worker_capabilities)
+            ]
 
     # Step 3: Filter by pin — skip tasks pinned to a different worker
     if worker_id is not None:

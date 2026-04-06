@@ -550,3 +550,163 @@ def test_forage_skips_rate_limited_worker(client):
 
     r = client.post("/tasks/pull", json={"worker_id": "worker-rl"})
     assert r.status_code == 204
+
+
+# ---------------------------------------------------------------------------
+# Soldier auto-start (#99)
+# ---------------------------------------------------------------------------
+
+
+def test_soldier_disabled_flag(tmp_path):
+    """get_app(enable_soldier=False) leaves _soldier_status as 'not started'."""
+    from antfarm.core.backends.file import FileBackend
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    r = client.get("/status")
+    assert r.status_code == 200
+    assert r.json()["soldier"] == "not started"
+
+
+def test_soldier_singleton_guard(tmp_path):
+    """Calling _start_soldier_thread twice doesn't spawn a second thread."""
+    import antfarm.core.serve as serve_mod
+    from antfarm.core.backends.file import FileBackend
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+
+    # Reset module state
+    serve_mod._soldier_thread = None
+    serve_mod._soldier_status = "not started"
+
+    serve_mod._start_soldier_thread(backend, str(tmp_path / ".antfarm"))
+    first_thread = serve_mod._soldier_thread
+    assert first_thread is not None
+
+    serve_mod._start_soldier_thread(backend, str(tmp_path / ".antfarm"))
+    assert serve_mod._soldier_thread is first_thread  # same thread, not a new one
+
+    # Cleanup
+    serve_mod._soldier_thread = None
+    serve_mod._soldier_status = "not started"
+
+
+def test_status_full_includes_soldier(tmp_path):
+    """GET /status/full includes 'soldier' key."""
+    from antfarm.core.backends.file import FileBackend
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    r = client.get("/status/full")
+    assert r.status_code == 200
+    data = r.json()
+    assert "soldier" in data
+
+
+def test_from_backend_works(tmp_path):
+    """Soldier.from_backend creates a Soldier with a _BackendAdapter."""
+    from antfarm.core.backends.file import FileBackend
+    from antfarm.core.soldier import Soldier, _BackendAdapter
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+
+    assert isinstance(soldier.colony, _BackendAdapter)
+    assert soldier.repo_path == str(tmp_path)
+    # Backend adapter should work for listing tasks
+    assert soldier.colony.list_tasks() == []
+
+
+def test_from_backend_idempotent_review_creation(tmp_path):
+    """from_backend soldier's create_review_task is idempotent via _BackendAdapter.carry."""
+    from antfarm.core.backends.file import FileBackend
+    from antfarm.core.soldier import Soldier
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    soldier = Soldier.from_backend(
+        backend, repo_path=str(tmp_path), require_review=True
+    )
+
+    # Carry a task, forage, and harvest it manually
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    backend.carry({
+        "id": "task-001",
+        "title": "Test",
+        "spec": "spec",
+        "complexity": "M",
+        "priority": 10,
+        "depends_on": [],
+        "touches": [],
+        "capabilities_required": [],
+        "created_by": "test",
+        "status": "ready",
+        "current_attempt": None,
+        "attempts": [],
+        "trail": [],
+        "signals": [],
+        "created_at": now,
+        "updated_at": now,
+    })
+    task = backend.pull("worker-1")
+    assert task is not None
+    backend.mark_harvested(
+        "task-001", task["current_attempt"], "pr-url", "feat/branch"
+    )
+
+    # Create review task
+    done_task = backend.get_task("task-001")
+    review_id = soldier.create_review_task(done_task)
+    assert review_id == "review-task-001"
+
+    # Second call should return None (idempotent)
+    done_task = backend.get_task("task-001")
+    review_id2 = soldier.create_review_task(done_task)
+    assert review_id2 is None
+
+
+# ---------------------------------------------------------------------------
+# SSE events (#100)
+# ---------------------------------------------------------------------------
+
+
+def test_sse_events_on_harvest(tmp_path):
+    """Harvest emits an SSE event visible on GET /events."""
+    import json as json_mod
+
+    import antfarm.core.serve as serve_mod
+    from antfarm.core.backends.file import FileBackend
+
+    # Reset event state
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    _carry(client)
+    task = _forage(client).json()
+    attempt_id = task["current_attempt"]
+
+    client.post(
+        f"/tasks/{task['id']}/harvest",
+        json={"attempt_id": attempt_id, "pr": "pr-1", "branch": "feat/x"},
+    )
+
+    # Read SSE events
+    with client.stream("GET", "/events?after=0&timeout=2") as r:
+        assert r.status_code == 200
+        events = []
+        for line in r.iter_lines():
+            if line.startswith("data: "):
+                events.append(json_mod.loads(line[len("data: "):]))
+
+    assert len(events) >= 1
+    assert events[0]["type"] == "harvested"
+    assert events[0]["task_id"] == "task-001"

@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from antfarm.core.planner import PlannerEngine, PlanResult, ProposedTask
+from antfarm.core.planner import PlannerEngine, PlanResult, ProposedTask, resolve_dependencies
 
 
 @pytest.fixture
@@ -189,3 +189,50 @@ def test_plan_from_text_file(engine, tmp_path):
     f.write_text(json.dumps([{"title": "Z", "spec": "Do Z"}]))
     result = engine.plan_from_file(str(f))
     assert len(result.tasks) == 1
+
+
+# ---------------------------------------------------------------------------
+# resolve_dependencies (#93)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_deps_converts_indices():
+    """1-based index deps are converted to actual task IDs."""
+    tasks = [
+        ProposedTask(title="A", spec="a"),
+        ProposedTask(title="B", spec="b", depends_on=["1"]),
+    ]
+    ids = ["task-100", "task-101"]
+    resolved = resolve_dependencies(tasks, ids)
+    assert resolved[1].depends_on == ["task-100"]
+
+
+def test_resolve_deps_leaves_string_deps():
+    """Non-integer string deps are left as-is."""
+    tasks = [
+        ProposedTask(title="A", spec="a", depends_on=["ext-task-99"]),
+    ]
+    ids = ["task-100"]
+    resolved = resolve_dependencies(tasks, ids)
+    assert resolved[0].depends_on == ["ext-task-99"]
+
+
+def test_resolve_deps_mixed():
+    """Mixed index and string deps are resolved correctly."""
+    tasks = [
+        ProposedTask(title="A", spec="a"),
+        ProposedTask(title="B", spec="b", depends_on=["1", "ext-task"]),
+    ]
+    ids = ["task-100", "task-101"]
+    resolved = resolve_dependencies(tasks, ids)
+    assert resolved[1].depends_on == ["task-100", "ext-task"]
+
+
+def test_resolve_deps_out_of_range():
+    """Out-of-range index deps are left as-is."""
+    tasks = [
+        ProposedTask(title="A", spec="a", depends_on=["99"]),
+    ]
+    ids = ["task-100"]
+    resolved = resolve_dependencies(tasks, ids)
+    assert resolved[0].depends_on == ["99"]

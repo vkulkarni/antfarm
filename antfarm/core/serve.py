@@ -10,6 +10,7 @@ Mutation-critical paths (pull, guard, trail, signal) are protected by _lock.
 
 from __future__ import annotations
 
+import collections
 import json
 import threading
 import time
@@ -24,11 +25,52 @@ from antfarm.core.backends.base import TaskBackend
 # Module-level state — set by get_app()
 _lock = threading.Lock()
 _backend: TaskBackend | None = None
-_soldier_status: str = "unknown"
+_soldier_status: str = "not started"
+_soldier_thread: threading.Thread | None = None
+
+# SSE event bus
+_event_queue: collections.deque = collections.deque(maxlen=1000)
+_event_counter: int = 0
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _emit_event(event_type: str, task_id: str, detail: str = "") -> None:
+    """Append an event to the SSE event bus."""
+    global _event_counter
+    _event_counter += 1
+    _event_queue.append({
+        "id": _event_counter,
+        "type": event_type,
+        "task_id": task_id,
+        "detail": detail,
+        "ts": _now_iso(),
+    })
+
+
+def _start_soldier_thread(backend: TaskBackend, data_dir: str) -> None:
+    """Start the Soldier as a daemon thread (singleton guard)."""
+    global _soldier_thread, _soldier_status
+
+    if _soldier_thread is not None and _soldier_thread.is_alive():
+        return  # already running
+
+    from antfarm.core.soldier import Soldier
+
+    soldier = Soldier.from_backend(backend, repo_path=data_dir)
+
+    def _soldier_loop():
+        global _soldier_status
+        _soldier_status = "running"
+        try:
+            soldier.run()
+        except Exception as e:
+            _soldier_status = f"error: {e}"
+
+    _soldier_thread = threading.Thread(target=_soldier_loop, daemon=True, name="soldier")
+    _soldier_thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +176,7 @@ def get_app(
     backend: TaskBackend | None = None,
     data_dir: str = ".antfarm",
     auth_secret: str | None = None,
+    enable_soldier: bool = False,
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -143,6 +186,8 @@ def get_app(
         data_dir: Path to .antfarm directory (only used when backend is None).
         auth_secret: Optional shared secret for bearer token auth. When set,
                      all endpoints except GET /status require a valid token.
+        enable_soldier: If True (default), start the Soldier merge engine as a
+                        daemon thread.
 
     Returns:
         Configured FastAPI application.
@@ -162,6 +207,9 @@ def get_app(
         from antfarm.core.auth import create_auth_middleware
 
         app.middleware("http")(create_auth_middleware(auth_secret))
+
+    if enable_soldier:
+        _start_soldier_thread(_backend, data_dir)
 
     # ------------------------------------------------------------------
     # Nodes
@@ -261,8 +309,9 @@ def get_app(
             try:
                 from antfarm.core.memory import MemoryStore
 
+                resolved_dir = str(_backend._root) if hasattr(_backend, "_root") else data_dir
                 active = _backend.list_tasks(status="active")
-                memory = MemoryStore(data_dir)
+                memory = MemoryStore(resolved_dir)
                 warnings = memory.check_overlap_warnings(req.touches, active)
             except Exception:
                 pass
@@ -318,6 +367,7 @@ def get_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _emit_event("harvested", task_id, f"pr={req.pr} branch={req.branch}")
         return {"ok": True}
 
     @app.post("/tasks/{task_id}/harvest-pending", status_code=200)
@@ -338,6 +388,7 @@ def get_app(
             _backend.kickback(task_id, req.reason)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _emit_event("kickback", task_id, req.reason)
         return {"ok": True}
 
     @app.post("/tasks/{task_id}/review-verdict", status_code=200)
@@ -360,6 +411,7 @@ def get_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _emit_event("merged", task_id, f"attempt={req.attempt_id}")
         return {"ok": True}
 
     @app.post("/tasks/{task_id}/pause", status_code=200)
@@ -529,13 +581,44 @@ def get_app(
         return StreamingResponse(_generate(), media_type="text/event-stream")
 
     # ------------------------------------------------------------------
+    # SSE event stream
+    # ------------------------------------------------------------------
+
+    @app.get("/events")
+    def event_stream(
+        after: int = Query(default=0, description="Cursor: return events with id > after"),
+        timeout: float = Query(default=30.0, description="Max seconds to hold connection"),
+    ):
+        """Stream colony events (harvest, kickback, merge) as SSE."""
+
+        def _generate():
+            cursor = after
+            start = time.monotonic()
+            try:
+                while True:
+                    elapsed = time.monotonic() - start
+                    if elapsed >= timeout:
+                        break
+                    for event in list(_event_queue):
+                        if event["id"] > cursor:
+                            cursor = event["id"]
+                            yield f"data: {json.dumps(event)}\n\n"
+                    time.sleep(0.5)
+            except GeneratorExit:
+                pass
+
+        return StreamingResponse(_generate(), media_type="text/event-stream")
+
+    # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
 
     @app.get("/status", status_code=200)
     def colony_status():
         """Return colony status summary."""
-        return _backend.status()
+        result = _backend.status()
+        result["soldier"] = _soldier_status
+        return result
 
     @app.get("/status/full", status_code=200)
     def colony_status_full():

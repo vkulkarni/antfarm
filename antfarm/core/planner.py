@@ -19,6 +19,42 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 
+def resolve_dependencies(
+    tasks: list[ProposedTask],
+    task_ids: list[str],
+) -> list[ProposedTask]:
+    """Convert 1-based index deps to actual task IDs, leave string deps as-is.
+
+    Args:
+        tasks: List of proposed tasks (not mutated).
+        task_ids: Pre-generated task IDs, one per task (same order).
+
+    Returns:
+        New list of ProposedTask with resolved depends_on.
+    """
+    resolved: list[ProposedTask] = []
+    for task in tasks:
+        new_deps: list[str] = []
+        for dep in task.depends_on:
+            try:
+                idx = int(dep) - 1  # 1-based to 0-based
+                if 0 <= idx < len(task_ids):
+                    new_deps.append(task_ids[idx])
+                else:
+                    new_deps.append(dep)  # out of range, leave as-is
+            except ValueError:
+                new_deps.append(dep)  # string dep, leave as-is
+        resolved.append(ProposedTask(
+            title=task.title,
+            spec=task.spec,
+            touches=task.touches,
+            depends_on=new_deps,
+            priority=task.priority,
+            complexity=task.complexity,
+        ))
+    return resolved
+
+
 @dataclass
 class ProposedTask:
     """A task proposed by the planner, pending operator approval."""
