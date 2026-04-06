@@ -231,6 +231,7 @@ class WorkerRuntime:
         self.heartbeat_interval = heartbeat_interval
         self.capabilities = capabilities or []
         self._token = token
+        self._last_task_id: str | None = None
 
         self.colony = ColonyClient(colony_url, client=client, token=token)
         self.workspace_mgr = WorkspaceManager(workspace_root, repo_path, integration_branch)
@@ -268,6 +269,15 @@ class WorkerRuntime:
                     logger.info("queue empty, worker exiting worker_id=%s", self.worker_id)
                     break
         finally:
+            if self._last_task_id:
+                with contextlib.suppress(Exception):
+                    self.colony.trail(
+                        self._last_task_id,
+                        self.worker_id,
+                        "worker exiting — queue empty",
+                    )
+            with contextlib.suppress(Exception):
+                self.colony.heartbeat(self.worker_id, status={"status": "offline"})
             self.colony.deregister_worker(self.worker_id)
             logger.info("worker deregistered worker_id=%s", self.worker_id)
 
@@ -287,10 +297,21 @@ class WorkerRuntime:
 
         task_id = task["id"]
         attempt_id = task["current_attempt"]
+        self._last_task_id = task_id
         logger.info("task claimed task_id=%s attempt_id=%s", task_id, attempt_id)
+
+        with contextlib.suppress(Exception):
+            self.colony.trail(
+                task_id, self.worker_id, "task claimed, creating workspace"
+            )
 
         workspace = self.workspace_mgr.create(task_id, attempt_id)
         logger.info("workspace created path=%s", workspace)
+
+        with contextlib.suppress(Exception):
+            self.colony.trail(
+                task_id, self.worker_id, "workspace ready, launching agent"
+            )
 
         self._start_heartbeat_loop()
         try:
@@ -299,6 +320,12 @@ class WorkerRuntime:
             self._stop_heartbeat_loop()
 
         if result.returncode != 0:
+            with contextlib.suppress(Exception):
+                self.colony.trail(
+                    task_id,
+                    self.worker_id,
+                    f"agent failed (exit {result.returncode})",
+                )
             # Agent failed — classify, record, and trail the failure.
             failure = build_failure_record(
                 task_id=task_id,
@@ -329,14 +356,29 @@ class WorkerRuntime:
             )
             return True
 
+        with contextlib.suppress(Exception):
+            self.colony.trail(
+                task_id, self.worker_id, "agent completed, building artifact"
+            )
+
         # Set harvest_pending before writing result (best-effort)
         with contextlib.suppress(Exception):
             self.colony.mark_harvest_pending(task_id, attempt_id)
 
+        # Build artifact and create PR
+        artifact = self._build_artifact(task, attempt_id, workspace, result.branch)
+        pr_url = self._create_pr(task, result.branch, workspace)
+        if pr_url:
+            artifact["pr_url"] = pr_url
+
         # Successful agent — harvest the task.
         try:
-            self.colony.harvest(task_id, attempt_id, pr="", branch=result.branch)
+            self.colony.harvest(
+                task_id, attempt_id, pr=pr_url, branch=result.branch, artifact=artifact
+            )
             logger.info("task harvested task_id=%s branch=%s", task_id, result.branch)
+            with contextlib.suppress(Exception):
+                self.colony.trail(task_id, self.worker_id, "harvested successfully")
         except Exception as exc:
             # 409 = ownership loss (another worker claimed this attempt).
             # Log a warning and continue to next task — not fatal.
@@ -373,6 +415,91 @@ class WorkerRuntime:
                     )
 
         return True
+
+    # ------------------------------------------------------------------
+    # Artifact building & PR creation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _git(workspace: str, *args: str) -> str:
+        """Run a git command in the workspace directory and return stdout."""
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode, ["git", *args], proc.stdout, proc.stderr
+            )
+        return proc.stdout.strip()
+
+    def _build_artifact(
+        self, task: dict, attempt_id: str, workspace: str, branch: str
+    ) -> dict:
+        """Collect git diff stats and commit metadata for the harvest payload."""
+        artifact: dict = {}
+        try:
+            base_ref = f"origin/{self.workspace_mgr.integration_branch}...HEAD"
+            artifact["diff_stat"] = self._git(workspace, "diff", "--stat", base_ref)
+        except Exception:
+            artifact["diff_stat"] = ""
+        try:
+            base_ref = f"origin/{self.workspace_mgr.integration_branch}...HEAD"
+            numstat = self._git(workspace, "diff", "--numstat", base_ref)
+            added = 0
+            removed = 0
+            for line in numstat.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    with contextlib.suppress(ValueError):
+                        added += int(parts[0])
+                        removed += int(parts[1])
+            artifact["lines_added"] = added
+            artifact["lines_removed"] = removed
+        except Exception:
+            artifact["lines_added"] = 0
+            artifact["lines_removed"] = 0
+        try:
+            artifact["head_sha"] = self._git(workspace, "rev-parse", "HEAD")
+        except Exception:
+            artifact["head_sha"] = ""
+        try:
+            artifact["base_sha"] = self._git(
+                workspace, "merge-base", f"origin/{self.workspace_mgr.integration_branch}", "HEAD"
+            )
+        except Exception:
+            artifact["base_sha"] = ""
+        return artifact
+
+    def _create_pr(self, task: dict, branch: str, workspace: str) -> str:
+        """Create a GitHub PR using the gh CLI. Returns PR URL or empty string."""
+        title = task.get("title", task.get("id", "task"))
+        body = task.get("spec", "")[:500]
+        try:
+            proc = subprocess.run(
+                [
+                    "gh", "pr", "create",
+                    "--title", title,
+                    "--body", body,
+                    "--head", branch,
+                    "--fill",
+                ],
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode == 0:
+                url = proc.stdout.strip()
+                logger.info("PR created url=%s", url)
+                return url
+            logger.warning("gh pr create failed: %s", proc.stderr[:200])
+        except FileNotFoundError:
+            logger.warning("gh CLI not installed — skipping PR creation")
+        except Exception as exc:
+            logger.warning("PR creation failed: %s", exc)
+        return ""
 
     # ------------------------------------------------------------------
     # Agent launch
