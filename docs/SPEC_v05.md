@@ -670,64 +670,71 @@ Redesign the TUI to show the full review pipeline, not just ready/active/done.
 
 **Problem:** The v0.5.0 TUI collapses "done" into one bucket. The review pipeline (v0.5.3) is invisible — operators can't see tasks awaiting review, under review, or merge-ready. During dogfooding, 9 tasks completed silently with no visibility into the review stage gap.
 
-**Solution:** Split the TUI into 9 pipeline-stage panels:
+**Solution:** 7 panels in pipeline-flow order (top to bottom: waiting → building → review → merge → done). Colony summary and Workers stacked full-width at top. Every panel shows task count in title and time-in-queue per task. Overflow shows "+N more — run: antfarm inbox".
 
-- **Summary** — nodes with hostnames, workers by type, progress bar (merged/total), pipeline distribution bar (bklg/bld/rev/mrg/merged), Soldier status, review queue pressure
-- **Building** — active implementation tasks with worker name and trail + elapsed time
-- **Backlog** (renamed from Ready Queue) — tasks waiting for workers, blocked count
-- **Awaiting Review** — done tasks with no verdict and no review task yet
-- **Under Review** — review tasks actively being processed by reviewer workers
-- **Merge Ready** — tasks with passing verdict AND fresh SHA AND deps satisfied (truly ready to merge)
-- **Merge Blocked** — tasks with passing verdict BUT stale SHA or unsatisfied deps (needs rebase or upstream merge)
-- **Kicked Back** — tasks returned by reviewer with findings shown inline
-- **Recently Merged** — last N merged tasks with timestamp
-- **Workers** — all workers with node, status, type (builder/reviewer), rate limit
+- **Colony Summary** — nodes with hostnames, Soldier status, review queue pressure, progress bar (merged/total), pipeline distribution bar
+- **Workers** — full-width table: Worker, Node, Status, Type (builder/reviewer), Rate Limit
+- **Waiting: New | Rework** — side-by-side sub-panels. New = fresh tasks from carry. Rework = kicked-back tasks with review findings. Rework items are higher priority (already been through the pipeline).
+- **Building** — active implementation tasks with worker name, trail message, and elapsed time
+- **Awaiting Review | Under Review** — side-by-side. Awaiting = done tasks with no reviewer yet. Under Review = reviewer worker actively processing.
+- **Merge Ready | Merge Blocked** — side-by-side. Ready = passing verdict, fresh, deps satisfied. Blocked = passing verdict but stale or deps unsatisfied (Soldier-produced block reason).
+- **Recently Merged** — compact horizontal layout, last N merged tasks with time since merged
 
 TUI mockup:
 
 ```
-┌─────────────────────── Antfarm Colony ───────────────────────────┐
-│  Nodes (2): mini-1, mini-2    Workers (3): 2 builder, 1 reviewer│
-│  Soldier: active              Review queue: 2 waiting, 1 active │
-│                                                                  │
-│  Progress  [██████████░░░░░░░░░░]  5/10 merged                  │
-│  Pipeline  ████ ██ ░░ ██ ██                                      │
-│            bklg:4 bld:2 rev:2 mrg:2 merged:5                     │
-├─────────────────────── Building ────────────────────────────────┤
-│  ID              Title                  Worker       Trail       │
-│  task-auth       Add JWT auth midlw..   mini-1/bldr  routes • 3m│
-│  task-cache      Add Redis caching..    mini-2/bldr  tests • 1m │
-├──────── Backlog ──────────────┬─────── Awaiting Review ─────────┤
-│  task-login     [M] api      │  task-models  ⏳ no reviewer yet │
-│  task-tests     [S] tests    │  task-schema  ⏳ review created  │
-│  task-api       [M] api      │  task-db      ⏳ review created  │
-│  — 1 blocked (deps)         │                                   │
-├──────── Under Review ─────────┬─────── Merge Ready ─────────────┤
-│  review-task-api              │  task-config  ✅ pass (fresh)   │
-│    ← mini-2/reviewer • 2m   │  task-utils   ✅ pass (fresh)   │
-│  review-task-db               ├─────── Merge Blocked ───────────┤
-│    ← mini-2/reviewer (idle)  │  task-auth-v1 ⚠ stale (rebase) │
-│                               │  task-lib     ⛔ dep wait       │
-├──────── Kicked Back ──────────┬─────── Recently Merged ─────────┤
-│  task-auth-v2  needs_changes  │  task-init    ✅ merged 2m ago  │
-│    "fix SQL injection in..."  │  task-setup   ✅ merged 5m ago  │
-├───────────────────────────────┴─────────────────────────────────┤
-│                          Workers                                 │
-│  Worker           Node    Status   Type      Rate Limit          │
-│  mini-1/builder   mini-1  active   builder   ok                  │
-│  mini-2/builder   mini-2  active   builder   ok                  │
-│  mini-2/reviewer  mini-2  active   reviewer  ok                  │
-└─────────────────────────────────────────────────────────────────┘
+┌──────── Antfarm Colony ─────────────────────────────────────────────┐
+│  Nodes (2): mini-1, mini-2          Soldier: active                │
+│  Reviews: 2 waiting, 1 active                                      │
+│                                                                     │
+│  Progress  [██████████░░░░░░] 5/10 merged                          │
+│  Pipeline  ████ ██ ░░ ██ ██                                        │
+│            wt:3 bld:2 rev:2 mrg:2                                   │
+├──────── Workers (3) ────────────────────────────────────────────────┤
+│  Worker            Node     Status   Type       Rate Limit          │
+│  mini-1/builder    mini-1   active   builder    ok                  │
+│  mini-2/builder    mini-2   active   builder    ok                  │
+│  mini-2/reviewer   mini-2   active   reviewer   ok                  │
+├──── Waiting: New (3) ───────────────┬──── Waiting: Rework (2) ──────┤
+│  task-login     [M] api       2h   │  task-auth-v2  ❌ SQL inj 15m │
+│  task-tests     [S] tests     2h   │  task-cache-v2 ❌ no test 10m │
+│  task-api       [M] api       1h   │                                │
+├──────── Building (2) ───────────────┴───────────────────────────────┤
+│  ID              Title                  Worker       Trail     Time │
+│  task-auth       Add JWT auth midlw..   mini-1/bldr  routes    3m  │
+│  task-cache      Add Redis caching..    mini-2/bldr  tests     1m  │
+├──── Awaiting Review (9) ────────┬──── Under Review (1) ─────────────┤
+│  task-models  ⏳ waiting   45m  │  review-task-api                   │
+│  task-schema  ⏳ waiting   30m  │    ← mini-2/reviewer         2m   │
+│  task-db      ⏳ waiting   25m  │                                    │
+│  task-utils   ⏳ waiting   20m  │                                    │
+│  task-api     ⏳ waiting   15m  │                                    │
+│  +4 more — run: antfarm inbox   │                                    │
+├──── Merge Ready (2) ────────────┬──── Merge Blocked (1) ────────────┤
+│  task-config  ✅ pass       5m  │  task-lib     ⚠ stale        1h  │
+│  task-utils   ✅ pass       2m  │                                    │
+├──────── Recently Merged (3) ────────────────────────────────────────┤
+│  task-init   ✅ 2m ago    task-setup  ✅ 5m ago    task-db  ✅ 8m  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Panel sizing:** Awaiting Review gets the most vertical space (likely bottleneck — tasks wait here for reviewer capacity). Building gets second most (active work with trail info). Waiting, Merge, and Recently Merged are compact. Workers panel grows with worker count.
 
 **Review task identity:** Review tasks are attempt-scoped, not task-scoped. Naming convention: `review-{task_id}-{attempt_id}`. This prevents ambiguity after kickback and rework — each attempt gets its own review.
 
 **Derived views (no model changes needed for v0.5.75):**
-- Awaiting Review = `status=="done"` + no `review_verdict` + no `review-{task_id}-{attempt_id}` task
+- Waiting: New = `status=="ready"` + no superseded attempts
+- Waiting: Rework = `status=="ready"` + has superseded attempt + kickback trail
+- Building = `status=="active"` + not a review task
+- Awaiting Review = `status=="done"` + no `review_verdict` + not a review task
 - Under Review = `review-*` task exists + `status=="active"`
-- Merge Ready = `review_verdict` exists + `verdict=="pass"` + fresh SHA + deps satisfied
-- Merge Blocked = `review_verdict` exists + `verdict=="pass"` + stale SHA or deps unsatisfied
-- Kicked Back = `status=="ready"` + has superseded attempt + kickback trail
+- Merge Ready = `review_verdict` exists + `verdict=="pass"` + no Soldier block reason
+- Merge Blocked = `review_verdict` exists + `verdict=="pass"` + Soldier-produced `merge_block_reason`
+- Recently Merged = any task with a merged attempt (last N)
+
+**Time in queue:** Every panel shows how long each task has been in its current stage — not total lifetime, just time since entering the stage. Long wait times signal bottlenecks (e.g., `45m` in Awaiting Review = no reviewer capacity).
+
+**Overflow:** Panels show top N tasks by time-in-queue (longest first). If more exist, show `+N more — run: antfarm inbox`.
 
 **Note:** These heuristic views are sufficient for v0.5.75. If rework cycles reveal ambiguity, v0.5.78+ can add explicit `review_for_attempt_id` fields to the model.
 
