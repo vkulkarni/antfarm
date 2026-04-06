@@ -664,9 +664,166 @@ Add AI-assisted planning on top of a stable substrate.
 - Audit trail (#75)
 - Bug fixes from testing
 
-**Why this order:** Runtime truth first (v0.5.1), then evidence contracts (v0.5.2), then review execution (v0.5.3). Each slice builds on the previous. Review is the goal, not the starting point.
+### v0.5.75 — TUI Pipeline Redesign
 
-**Why this order:** First make the runtime deterministic, then make merges safe, then make parallelism smarter, then add AI-assisted planning on top of a stable substrate.
+Redesign the TUI to show the full review pipeline, not just ready/active/done.
+
+**Problem:** The v0.5.0 TUI collapses "done" into one bucket. The review pipeline (v0.5.3) is invisible — operators can't see tasks awaiting review, under review, or merge-ready. During dogfooding, 9 tasks completed silently with no visibility into the review stage gap.
+
+**Solution:** Split the TUI into 9 pipeline-stage panels:
+
+- **Summary** — nodes with hostnames, workers by type, progress bar (merged/total), pipeline distribution bar (bklg/bld/rev/mrg/merged), Soldier status, review queue pressure
+- **Building** — active implementation tasks with worker name and trail + elapsed time
+- **Backlog** (renamed from Ready Queue) — tasks waiting for workers, blocked count
+- **Awaiting Review** — done tasks with no verdict and no review task yet
+- **Under Review** — review tasks actively being processed by reviewer workers
+- **Merge Ready** — tasks with passing verdict AND fresh SHA AND deps satisfied (truly ready to merge)
+- **Merge Blocked** — tasks with passing verdict BUT stale SHA or unsatisfied deps (needs rebase or upstream merge)
+- **Kicked Back** — tasks returned by reviewer with findings shown inline
+- **Recently Merged** — last N merged tasks with timestamp
+- **Workers** — all workers with node, status, type (builder/reviewer), rate limit
+
+TUI mockup:
+
+```
+┌─────────────────────── Antfarm Colony ───────────────────────────┐
+│  Nodes (2): mini-1, mini-2    Workers (3): 2 builder, 1 reviewer│
+│  Soldier: active              Review queue: 2 waiting, 1 active │
+│                                                                  │
+│  Progress  [██████████░░░░░░░░░░]  5/10 merged                  │
+│  Pipeline  ████ ██ ░░ ██ ██                                      │
+│            bklg:4 bld:2 rev:2 mrg:2 merged:5                     │
+├─────────────────────── Building ────────────────────────────────┤
+│  ID              Title                  Worker       Trail       │
+│  task-auth       Add JWT auth midlw..   mini-1/bldr  routes • 3m│
+│  task-cache      Add Redis caching..    mini-2/bldr  tests • 1m │
+├──────── Backlog ──────────────┬─────── Awaiting Review ─────────┤
+│  task-login     [M] api      │  task-models  ⏳ no reviewer yet │
+│  task-tests     [S] tests    │  task-schema  ⏳ review created  │
+│  task-api       [M] api      │  task-db      ⏳ review created  │
+│  — 1 blocked (deps)         │                                   │
+├──────── Under Review ─────────┬─────── Merge Ready ─────────────┤
+│  review-task-api              │  task-config  ✅ pass (fresh)   │
+│    ← mini-2/reviewer • 2m   │  task-utils   ✅ pass (fresh)   │
+│  review-task-db               ├─────── Merge Blocked ───────────┤
+│    ← mini-2/reviewer (idle)  │  task-auth-v1 ⚠ stale (rebase) │
+│                               │  task-lib     ⛔ dep wait       │
+├──────── Kicked Back ──────────┬─────── Recently Merged ─────────┤
+│  task-auth-v2  needs_changes  │  task-init    ✅ merged 2m ago  │
+│    "fix SQL injection in..."  │  task-setup   ✅ merged 5m ago  │
+├───────────────────────────────┴─────────────────────────────────┤
+│                          Workers                                 │
+│  Worker           Node    Status   Type      Rate Limit          │
+│  mini-1/builder   mini-1  active   builder   ok                  │
+│  mini-2/builder   mini-2  active   builder   ok                  │
+│  mini-2/reviewer  mini-2  active   reviewer  ok                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Review task identity:** Review tasks are attempt-scoped, not task-scoped. Naming convention: `review-{task_id}-{attempt_id}`. This prevents ambiguity after kickback and rework — each attempt gets its own review.
+
+**Derived views (no model changes needed for v0.5.75):**
+- Awaiting Review = `status=="done"` + no `review_verdict` + no `review-{task_id}-{attempt_id}` task
+- Under Review = `review-*` task exists + `status=="active"`
+- Merge Ready = `review_verdict` exists + `verdict=="pass"` + fresh SHA + deps satisfied
+- Merge Blocked = `review_verdict` exists + `verdict=="pass"` + stale SHA or deps unsatisfied
+- Kicked Back = `status=="ready"` + has superseded attempt + kickback trail
+
+**Note:** These heuristic views are sufficient for v0.5.75. If rework cycles reveal ambiguity, v0.5.78+ can add explicit `review_for_attempt_id` fields to the model.
+
+**Files:** `antfarm/core/tui.py` (rewrite), `antfarm/core/serve.py` (add soldier status to /status/full)
+
+**Complexity:** M
+
+### v0.5.76 — Review Pipeline Operational
+
+Fix all bugs found during dogfooding that prevent the review pipeline from working end-to-end. The v0.5.3 review code exists but doesn't function in practice.
+
+**Bugs to fix (found during dogfooding):**
+
+| Issue | Bug | Why it breaks the pipeline |
+|-------|-----|--------------------------|
+| #99 | Soldier not auto-started with colony | Review tasks never created |
+| #100 | No notification on task completion | Operator unaware tasks finished |
+| #101 | Workers exit silently when queue empties | Can't tell if worker died or finished |
+| #102 | Review flow needs turnkey setup | Too many manual steps |
+| #103 | Workers never create GitHub PRs | Reviewer has nothing to review |
+| #104 | Workers never build TaskArtifact | Soldier can't gate on freshness/merge readiness |
+| #105 | Zero trail entries during execution | No progress visibility |
+| #91 | recompute_hotspots() never called automatically | Hotspot weighting is a no-op |
+| #92 | MemoryStore uses wrong data_dir when backend injected | Overlap warnings silently fail |
+| #93 | plan --carry does not resolve index dependencies | Carried tasks permanently blocked |
+
+**Changes:**
+
+1. **Colony auto-starts Soldier thread** (#99) — Soldier runs as a singleton daemon thread inside the colony process. Only one Soldier loop may be active per colony. Review-task creation is idempotent (check before create). Soldier health surfaced in `/status/full`. `--no-soldier` flag disables.
+
+2. **Worker builds TaskArtifact before harvest** (#104) — After agent completes, worker collects git diff stats, SHAs, files_changed, lines_added/removed, and builds a TaskArtifact dict. Passed to `harvest(artifact=...)`.
+
+3. **Worker produces a reviewable change handle** (#103) — On GitHub backend, worker creates a PR via `gh pr create`. On file/local backend, the branch + diff summary serves as the reviewable handle. PR URL (or branch ref) stored in harvest. Implementation starts GitHub-only but the interface is backend-agnostic.
+
+4. **Worker produces trail entries** (#105) — Worker trails at key lifecycle points: "task claimed", "workspace ready", "agent running", "agent completed (Ns)", "harvesting". Heartbeat thread optionally trails periodic status.
+
+5. **Worker announces exit** (#101) — On queue empty, worker explicitly transitions status to offline and deregisters. If a last task exists, trail "worker exiting, queue empty". If worker starts and finds nothing, still deregisters cleanly. TUI distinguishes intentional exit from crash (offline vs stale heartbeat).
+
+6. **Task completion notifications** (#100) — Colony emits SSE events on `/events` when task status changes. Notifications are informational only — they do not drive truth. System correctness must not depend on SSE delivery. TUI subscribes for live updates. Optional webhook URL in colony config.
+
+7. **Turnkey review setup** (#102) — `antfarm colony` auto-starts Soldier thread. `antfarm worker start --type reviewer` registers with `capabilities=["review"]`. Single command per role.
+
+8. **Review task identity is attempt-scoped** — Review tasks use naming convention `review-{task_id}-{attempt_id}`. Soldier creates one review task per attempt, not per task. Idempotent: checks for existing review task before creating.
+
+9. **Soldier writes merge block reason** — When Soldier evaluates a done task and finds it not mergeable (stale SHA, unsatisfied deps, missing artifact), it writes a `merge_block_reason` string on the attempt. The TUI displays this reason rather than guessing merge readiness.
+
+10. **Soldier.from_backend()** — Soldier gains a classmethod that operates directly on the backend, avoiding HTTP loopback. Used by the colony's auto-start thread.
+
+**Invariants:**
+- Only one Soldier loop active per colony process (singleton)
+- Review-task creation is idempotent (no duplicates on restart)
+- Soldier restart is safe — resumes from current state
+- Notifications are advisory, not authoritative
+- TUI does not guess merge readiness — it displays Soldier-produced state
+
+**Files:** `antfarm/core/worker.py`, `antfarm/core/soldier.py`, `antfarm/core/serve.py`, `antfarm/core/cli.py`
+
+**Complexity:** L
+
+### v0.5.77 — Dogfood Validation
+
+Zero new code. Run the system end-to-end and validate the full pipeline works.
+
+1. Restart colony with v0.5.76 code (Soldier auto-starts)
+2. Carry fresh tasks (re-run the TUI + bug fix tasks from earlier, or new work)
+3. Start builder workers on mini-1 + mini-2
+4. Start reviewer worker on mini-2
+5. Watch in the v0.5.75 TUI as tasks flow: Backlog → Building → Awaiting Review → Under Review → Merge Ready → Merged
+6. Verify: artifacts exist, PRs created, trail entries visible, review verdicts produced, Soldier merges automatically
+7. Any bugs found become v0.5.78
+
+**Success criteria:**
+- Tasks flow through the entire pipeline without manual intervention
+- The TUI shows every stage accurately
+- No silent failures — every state change is visible
+- No task remains in Awaiting Review longer than 60s without a visible reason (no reviewer, Soldier down, etc.)
+- No duplicate review tasks or duplicate merges during restart/recovery
+- Worker exit is distinguishable from worker crash in the TUI
+
+### v0.5.78 — Tester Worker (future)
+
+Add a **tester** worker type that independently verifies builder branches (#106). Acts as CI inside antfarm.
+
+- `antfarm worker start --type tester` — registers with `capabilities=["test"]`
+- Soldier creates test tasks: `test-{task_id}-{attempt_id}`
+- Tester checks out branch, runs tests/lint/build, populates artifact verification fields
+- Does NOT modify code — read-only execution
+- Pipeline becomes: builder → tester → reviewer → soldier merge
+
+This completes the artifact verification story — builders can't self-certify.
+
+**Why this order:**
+1. v0.5.75 (TUI) first — so we can see the pipeline when we test it
+2. v0.5.76 (pipeline fixes) second — makes the review flow actually work
+3. v0.5.77 (validation) third — proves it all works end-to-end with real tasks
+4. v0.5.78 (tester) later — independent verification, not needed for initial loop
 
 ---
 
@@ -703,6 +860,10 @@ Soldier merges only when:
 ### Scenario F: Review Orchestration
 
 Given a completed task with artifact, Soldier creates a review task, a reviewer worker (Claude Code or Codex) produces a fresh `ReviewVerdict`, and Soldier merges only if verdict is `pass` and `reviewed_commit_sha` matches current `head_commit_sha`. No human intervention required.
+
+### Scenario G: Operational Liveness
+
+Given completed implementation tasks and at least one active reviewer worker, the colony does not go silent. Within a bounded time, each completed task is either: assigned a review task, explicitly shown as waiting for reviewer capacity, kicked back with findings, or moved to merge-ready / merged. No task stalls invisibly.
 
 ### Scenario E: Useful Memory
 
@@ -771,11 +932,16 @@ ReviewVerdict is defined in v0.5 but implementation lands in v0.5.x or v0.6, dep
 
 ## Technical Debt to Address
 
-1. Untracked `redis.py` + `test_redis_backend.py` on local filesystem — clean up or gitignore
+1. ~~Untracked `redis.py` + `test_redis_backend.py`~~ — removed from tracking in v0.5.0
 2. Branch protection CI check `test` never runs — fix GitHub Actions or relax check
 3. Engineer self-merge prevention — add to CLAUDE.md guardrails
-4. Multiple scheduling brains — the #1 refactor target (addressed by #72)
-5. TUI rendering bug — `current_attempt` is string ID not dict, worker_id extraction broken in `tui.py:205-209`
+4. ~~Multiple scheduling brains~~ — resolved in v0.5.1 (canonical scheduler)
+5. ~~TUI rendering bug~~ — fixed in v0.5.6 (current_attempt lookup)
+6. Worker doesn't auto-register node (#98) — fixed in v0.5.0
+7. Review pipeline not operational (#99-#105) — 7 bugs found during dogfooding, planned for v0.5.76
+8. Soldier singleton / duplicate review protection — auto-start requires idempotent review-task creation and merge processing
+9. Review task attempt linkage — review must link to attempt, not only task (naming: `review-{task_id}-{attempt_id}`)
+10. Merge queue TUI semantics — separate merge-ready from merge-blocked/stale
 
 ---
 
@@ -785,11 +951,14 @@ Antfarm v0.5 should not become broader. It should become more trustworthy.
 
 The order of operations is:
 
-1. Make scheduling singular
-2. Make task completion explicit and reviewable
-3. Make merge gating deterministic and freshness-aware
-4. Make memory lightweight and useful
-5. Make conflict prevention stronger
-6. Add planning on top of a stable runtime
+1. Make scheduling singular (v0.5.1) ✅
+2. Make task completion explicit and reviewable (v0.5.2) ✅
+3. Make merge gating deterministic and freshness-aware (v0.5.3) ✅
+4. Make memory lightweight and useful (v0.5.4) ✅
+5. Add planning on top of a stable runtime (v0.5.5) ✅
+6. Polish and release (v0.5.6) ✅
+7. Make the pipeline visible to operators (v0.5.75)
+8. Make the review pipeline actually work in production (v0.5.76)
+9. Validate end-to-end with real dogfooding (v0.5.77)
 
-That keeps Antfarm lightweight while making it substantially more useful.
+v0.5.0 shipped the core architecture. v0.5.75-v0.5.77 make the review pipeline visible, operational, and dogfood-validated.
