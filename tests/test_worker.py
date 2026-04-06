@@ -270,14 +270,14 @@ def test_ownership_loss_continues_gracefully(tc, runtime, backend):
     harvest_calls = [0]
     original_harvest = runtime.colony.harvest
 
-    def patched_harvest(task_id, attempt_id, pr, branch):
+    def patched_harvest(task_id, attempt_id, pr, branch, artifact=None):
         harvest_calls[0] += 1
         if task_id == "task-001":
             # Simulate 409: raise httpx.HTTPStatusError
             req = httpx.Request("POST", f"http://test/tasks/{task_id}/harvest")
             resp = httpx.Response(409, request=req)
             raise httpx.HTTPStatusError("409 ownership loss", request=req, response=resp)
-        return original_harvest(task_id, attempt_id, pr, branch)
+        return original_harvest(task_id, attempt_id, pr, branch, artifact=artifact)
 
     runtime.colony.harvest = patched_harvest
     runtime._launch_agent = _good_agent
@@ -509,3 +509,225 @@ def test_merge_conflict_retry_policy():
     policy = get_retry_policy(FailureType.MERGE_CONFLICT)
     assert policy["retryable"] is True
     assert policy["max_retries"] == 1
+
+
+# ---------------------------------------------------------------------------
+# v0.5.76: Trail entries during processing (#105)
+# ---------------------------------------------------------------------------
+
+
+def test_trail_entries_during_processing(tc, runtime):
+    """Trail entries are appended at key lifecycle points during task processing."""
+    _carry(tc, task_id="task-trail-001")
+
+    runtime._launch_agent = _good_agent
+    # Patch _build_artifact and _create_pr to avoid real git/gh calls
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+    runtime.run()
+
+    r = tc.get("/tasks/task-trail-001")
+    task = r.json()
+    messages = [e["message"] for e in task["trail"]]
+    assert "task claimed, creating workspace" in messages
+    assert "workspace ready, launching agent" in messages
+    assert "agent completed, building artifact" in messages
+    assert "harvested successfully" in messages
+
+
+def test_trail_entries_on_failure(tc, runtime):
+    """Trail entries include failure message when agent exits non-zero."""
+    _carry(tc, task_id="task-fail-trail")
+
+    runtime._launch_agent = _bad_agent
+    runtime.run()
+
+    r = tc.get("/tasks/task-fail-trail")
+    task = r.json()
+    messages = [e["message"] for e in task["trail"]]
+    assert "task claimed, creating workspace" in messages
+    assert "workspace ready, launching agent" in messages
+    assert any("agent failed (exit 1)" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# v0.5.76: Exit announcement (#101)
+# ---------------------------------------------------------------------------
+
+
+def test_exit_announcement(tc, runtime):
+    """Worker posts exit trail and offline heartbeat on shutdown."""
+    _carry(tc, task_id="task-exit-001")
+
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+    runtime.run()
+
+    r = tc.get("/tasks/task-exit-001")
+    task = r.json()
+    messages = [e["message"] for e in task["trail"]]
+    assert "worker exiting — queue empty" in messages
+
+
+def test_exit_announcement_no_tasks(tc, runtime):
+    """Worker does not post exit trail when no tasks were ever processed."""
+    runtime._launch_agent = _good_agent
+    runtime.run()
+    # No assertion needed — just verify it doesn't crash.
+    # _last_task_id is None, so no trail is posted.
+    assert runtime._last_task_id is None
+
+
+# ---------------------------------------------------------------------------
+# v0.5.76: PR creation (#103)
+# ---------------------------------------------------------------------------
+
+
+def test_create_pr_success(tmp_path, http_client):
+    """_create_pr returns URL on successful gh pr create."""
+    import subprocess
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-pr",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        client=http_client,
+    )
+
+    task = {"id": "task-pr-001", "title": "Add feature", "spec": "do stuff"}
+
+    def fake_run(cmd, **kwargs):
+        return MagicMock(returncode=0, stdout="https://github.com/org/repo/pull/42\n", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        url = rt._create_pr(task, "feat/task-pr-001-att-001", str(tmp_path))
+
+    assert url == "https://github.com/org/repo/pull/42"
+
+
+def test_create_pr_failure(tmp_path, http_client):
+    """_create_pr returns empty string when gh pr create fails."""
+    import subprocess
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-pr-fail",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        client=http_client,
+    )
+
+    task = {"id": "task-pr-002", "title": "Add feature", "spec": "do stuff"}
+
+    def fake_run(cmd, **kwargs):
+        return MagicMock(returncode=1, stdout="", stderr="not a git repo")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        url = rt._create_pr(task, "feat/task-pr-002-att-001", str(tmp_path))
+
+    assert url == ""
+
+
+def test_create_pr_gh_not_found(tmp_path, http_client):
+    """_create_pr returns empty string when gh CLI is not installed."""
+    import subprocess
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-pr-nogh",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        client=http_client,
+    )
+
+    task = {"id": "task-pr-003", "title": "Add feature", "spec": "do stuff"}
+
+    with patch.object(subprocess, "run", side_effect=FileNotFoundError("gh")):
+        url = rt._create_pr(task, "feat/task-pr-003-att-001", str(tmp_path))
+
+    assert url == ""
+
+
+# ---------------------------------------------------------------------------
+# v0.5.76: Artifact building (#104)
+# ---------------------------------------------------------------------------
+
+
+def test_build_artifact_collects_stats(tmp_path, http_client):
+    """_build_artifact collects git diff stats and commit metadata."""
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-art",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        client=http_client,
+    )
+
+    git_responses = {
+        ("diff", "--stat"): " file.py | 10 +++++++---\n 1 file changed",
+        ("diff", "--numstat"): "7\t3\tfile.py",
+        ("rev-parse", "HEAD"): "abc123def",
+        ("merge-base",): "base456",
+    }
+
+    def fake_git(workspace, *args):
+        for key, val in git_responses.items():
+            if all(k in args for k in key):
+                return val
+        return ""
+
+    with patch.object(WorkerRuntime, "_git", side_effect=fake_git):
+        artifact = rt._build_artifact(
+            {"id": "t1"}, "att-001", str(tmp_path), "feat/t1-att-001"
+        )
+
+    assert artifact["lines_added"] == 7
+    assert artifact["lines_removed"] == 3
+    assert artifact["head_sha"] == "abc123def"
+    assert artifact["base_sha"] == "base456"
+    assert "file.py" in artifact["diff_stat"]
+
+
+def test_build_artifact_handles_git_failure(tmp_path, http_client):
+    """_build_artifact returns defaults when git commands fail."""
+    import subprocess
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-art-fail",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        client=http_client,
+    )
+
+    def failing_git(workspace, *args):
+        raise subprocess.CalledProcessError(1, ["git", *args])
+
+    with patch.object(WorkerRuntime, "_git", side_effect=failing_git):
+        artifact = rt._build_artifact(
+            {"id": "t1"}, "att-001", str(tmp_path), "feat/t1-att-001"
+        )
+
+    assert artifact["diff_stat"] == ""
+    assert artifact["lines_added"] == 0
+    assert artifact["lines_removed"] == 0
+    assert artifact["head_sha"] == ""
+    assert artifact["base_sha"] == ""

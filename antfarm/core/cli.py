@@ -286,7 +286,15 @@ def worker():
 
 @worker.command("start")
 @click.option("--agent", required=True, help="Agent type (e.g. claude-code, generic).")
-@click.option("--name", default=None, help="Worker name (defaults to agent type).")
+@click.option("--name", default=None, help="Worker name (defaults to worker type).")
+@click.option(
+    "--type",
+    "worker_type",
+    default="builder",
+    show_default=True,
+    type=click.Choice(["builder", "reviewer"]),
+    help="Worker type: builder (default) or reviewer.",
+)
 @click.option("--workspace-root", default=None, help="Root directory for worktrees.")
 @click.option("--node", required=True, help="Node ID this worker belongs to.")
 @click.option("--repo-path", default=".", show_default=True, help="Path to git repo.")
@@ -297,6 +305,7 @@ def worker():
 def worker_start(
     agent: str,
     name: str | None,
+    worker_type: str,
     workspace_root: str | None,
     node: str,
     repo_path: str,
@@ -308,9 +317,11 @@ def worker_start(
     """Start a worker and enter the forage loop."""
     from antfarm.core.worker import WorkerRuntime
 
-    worker_name = name or agent
+    worker_name = name or worker_type
     ws_root = workspace_root or f".antfarm/workspaces/{worker_name}"
     caps = [c.strip() for c in capabilities.split(",")] if capabilities else []
+    if worker_type == "reviewer" and "review" not in caps:
+        caps.append("review")
 
     runtime = WorkerRuntime(
         colony_url=colony_url,
@@ -928,7 +939,7 @@ def plan(
     token: str | None,
 ):
     """Decompose a spec into tasks with dependencies and scope hints."""
-    from antfarm.core.planner import PlannerEngine
+    from antfarm.core.planner import PlannerEngine, resolve_dependencies
 
     if not spec and not file_path:
         raise click.UsageError("Either --spec or --file is required.")
@@ -970,11 +981,13 @@ def plan(
         click.echo("\nUse --carry to submit these tasks to the colony.")
         return
 
-    # Carry tasks
+    # Carry tasks — pre-generate IDs and resolve index-based deps
     click.echo("\nCarrying tasks...")
-    for i, task in enumerate(result.tasks, 1):
-        task_id = f"task-{int(time.time() * 1000)}-{i}"
-        payload = task.to_carry_dict(task_id)
+    base_ts = int(time.time() * 1000)
+    task_ids = [f"task-{base_ts}-{i}" for i in range(1, len(result.tasks) + 1)]
+    resolved_tasks = resolve_dependencies(result.tasks, task_ids)
+    for i, (task, tid) in enumerate(zip(resolved_tasks, task_ids, strict=True), 1):
+        payload = task.to_carry_dict(tid)
         try:
             r = _post(colony_url, "/tasks", payload, token=token)
             click.echo(f"  Created: {r}")
