@@ -105,6 +105,12 @@ def main():
     help="Seconds between periodic backups (requires --backup-dest).",
 )
 @click.option(
+    "--no-soldier",
+    is_flag=True,
+    default=False,
+    help="Disable the built-in Soldier merge engine.",
+)
+@click.option(
     "--backend",
     default="file",
     show_default=True,
@@ -130,6 +136,7 @@ def colony(
     auth_token: str | None,
     backup_dest: str | None,
     backup_interval: int,
+    no_soldier: bool,
     backend: str,
     github_repo: str | None,
     github_token: str | None,
@@ -148,7 +155,12 @@ def colony(
     else:
         task_backend = get_backend("file", root=data_dir)
 
-    app = get_app(task_backend, auth_secret=auth_token)
+    app = get_app(
+        task_backend,
+        data_dir=data_dir,
+        auth_secret=auth_token,
+        enable_soldier=not no_soldier,
+    )
     if auth_token:
         from antfarm.core.auth import generate_token
 
