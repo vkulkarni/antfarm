@@ -47,6 +47,7 @@ def _task(
     touches: list | None = None,
     complexity: str = "M",
     spec: str = "",
+    created_at: str = "2026-04-05T00:00:00+00:00",
 ) -> dict:
     return {
         "id": task_id,
@@ -58,6 +59,7 @@ def _task(
         "touches": touches or [],
         "complexity": complexity,
         "spec": spec,
+        "created_at": created_at,
     }
 
 
@@ -75,11 +77,11 @@ def test_classify_building():
     assert len(snap.under_review) == 0
 
 
-def test_classify_backlog():
+def test_classify_waiting_new():
     tui = _make_tui()
     tasks = [_task(status="ready")]
     snap = tui._classify_tasks(tasks)
-    assert len(snap.backlog) == 1
+    assert len(snap.waiting_new) == 1
 
 
 def test_classify_awaiting_review():
@@ -116,13 +118,14 @@ def test_classify_merge_blocked():
     assert len(snap.merge_blocked) == 1
 
 
-def test_classify_kicked_back():
+def test_classify_waiting_rework():
     tui = _make_tui()
-    att = _attempt(attempt_id="att-001", status="superseded")
+    att = _attempt(attempt_id="att-001", status="superseded",
+                   completed_at="2026-04-05T01:00:00+00:00")
     tasks = [_task(status="ready", attempts=[att])]
     snap = tui._classify_tasks(tasks)
-    assert len(snap.kicked_back) == 1
-    assert len(snap.backlog) == 0
+    assert len(snap.waiting_rework) == 1
+    assert len(snap.waiting_new) == 0
 
 
 def test_classify_recently_merged():
@@ -215,15 +218,60 @@ def test_get_merge_block_reason_none():
 
 
 # ---------------------------------------------------------------------------
+# Time-in-queue helpers
+# ---------------------------------------------------------------------------
+
+
+def test_get_time_since_created():
+    tui = _make_tui()
+    t = _task(created_at="2026-04-05T00:00:00+00:00")
+    result = tui._get_time_since_created(t)
+    # Just verify it returns a non-empty string (time-dependent)
+    assert isinstance(result, str)
+
+
+def test_get_time_since_kickback():
+    tui = _make_tui()
+    att = _attempt(status="superseded", completed_at="2026-04-05T01:00:00+00:00")
+    t = _task(attempts=[att])
+    result = tui._get_time_since_kickback(t)
+    assert isinstance(result, str)
+
+
+def test_get_time_since_kickback_no_superseded():
+    tui = _make_tui()
+    t = _task(attempts=[_attempt(status="done")])
+    result = tui._get_time_since_kickback(t)
+    assert result == ""
+
+
+def test_get_time_since_harvested():
+    tui = _make_tui()
+    att = _attempt(status="done", completed_at="2026-04-05T01:00:00+00:00")
+    t = _task(current_attempt="att-001", attempts=[att])
+    result = tui._get_time_since_harvested(t)
+    assert isinstance(result, str)
+    assert len(result) > 0
+
+
+def test_get_time_since_harvested_no_completed():
+    tui = _make_tui()
+    att = _attempt(status="done", completed_at=None)
+    t = _task(current_attempt="att-001", attempts=[att])
+    result = tui._get_time_since_harvested(t)
+    assert result == ""
+
+
+# ---------------------------------------------------------------------------
 # Pipeline bar
 # ---------------------------------------------------------------------------
 
 
 def test_pipeline_bar_renders():
     tui = _make_tui()
-    counts = {"building": 3, "backlog": 2, "merged": 5,
+    counts = {"building": 3, "waiting": 2, "merged": 5,
               "awaiting_review": 0, "under_review": 0,
-              "merge_ready": 1, "merge_blocked": 0, "kicked_back": 0}
+              "merge_ready": 1, "merge_blocked": 0}
     result = tui._render_pipeline_bar(counts)
     assert isinstance(result, Text)
     assert len(str(result)) > 0
@@ -231,11 +279,22 @@ def test_pipeline_bar_renders():
 
 def test_pipeline_bar_empty():
     tui = _make_tui()
-    counts = {"building": 0, "backlog": 0, "merged": 0,
+    counts = {"building": 0, "waiting": 0, "merged": 0,
               "awaiting_review": 0, "under_review": 0,
-              "merge_ready": 0, "merge_blocked": 0, "kicked_back": 0}
+              "merge_ready": 0, "merge_blocked": 0}
     result = tui._render_pipeline_bar(counts)
     assert "no tasks" in str(result)
+
+
+def test_pipeline_bar_uses_wt_abbreviation():
+    tui = _make_tui()
+    counts = {"building": 1, "waiting": 3, "merged": 0,
+              "awaiting_review": 0, "under_review": 0,
+              "merge_ready": 0, "merge_blocked": 0}
+    result = tui._render_pipeline_bar(counts)
+    text_str = str(result)
+    assert "wt:3" in text_str
+    assert "bld:1" in text_str
 
 
 # ---------------------------------------------------------------------------
@@ -243,32 +302,18 @@ def test_pipeline_bar_empty():
 # ---------------------------------------------------------------------------
 
 
-def test_summary_node_names():
+def test_summary_renders():
     tui = _make_tui()
-    workers = [
-        {"worker_id": "mini/w1", "node_id": "mini", "agent_type": "claude-code"},
-        {"worker_id": "mac/w2", "node_id": "mac", "agent_type": "claude-code"},
-    ]
     snap = PipelineSnapshot()
-    result = tui._render_summary({}, [], workers, snap, "unknown")
+    result = tui._render_summary({}, [], snap, "unknown")
     assert isinstance(result, Table)
 
 
-def test_summary_worker_types():
-    tui = _make_tui()
-    workers = [
-        {"worker_id": "n1/b1", "node_id": "n1", "agent_type": "claude-code"},
-        {"worker_id": "n1/r1", "node_id": "n1", "agent_type": "claude-code-review"},
-    ]
-    snap = PipelineSnapshot()
-    result = tui._render_summary({}, [], workers, snap, "running")
-    assert isinstance(result, Table)
-
-
-def test_summary_soldier_status():
+def test_summary_soldier_not_started():
+    """Soldier status 'unknown' should display as 'not started'."""
     tui = _make_tui()
     snap = PipelineSnapshot()
-    result = tui._render_summary({"nodes": 1}, [], [], snap, "running")
+    result = tui._render_summary({"nodes": 1}, [], snap, "unknown")
     assert isinstance(result, Table)
 
 
@@ -277,12 +322,12 @@ def test_summary_review_pressure():
     snap = PipelineSnapshot(
         awaiting_review=[_task(), _task(task_id="t2"), _task(task_id="t3"), _task(task_id="t4")]
     )
-    result = tui._render_summary({}, [], [], snap, "idle")
+    result = tui._render_summary({}, [], snap, "idle")
     assert isinstance(result, Table)
 
 
 # ---------------------------------------------------------------------------
-# Render methods — empty + populated
+# Render methods -- empty + populated
 # ---------------------------------------------------------------------------
 
 
@@ -303,16 +348,43 @@ def test_render_building_populated():
     assert result.row_count == 1
 
 
-def test_render_backlog_empty():
+def test_render_waiting_new_empty():
     tui = _make_tui()
-    result = tui._render_backlog([])
+    result = tui._render_waiting_new([])
     assert isinstance(result, Table)
     assert result.row_count == 1
 
 
-def test_render_backlog_populated():
+def test_render_waiting_new_populated():
     tui = _make_tui()
-    result = tui._render_backlog([_task(touches=["api", "db"])])
+    result = tui._render_waiting_new([_task(touches=["api", "db"])])
+    assert isinstance(result, Table)
+    assert result.row_count == 1
+
+
+def test_render_waiting_rework_empty():
+    tui = _make_tui()
+    result = tui._render_waiting_rework([])
+    assert isinstance(result, Table)
+    assert result.row_count == 1
+
+
+def test_render_waiting_rework_populated():
+    tui = _make_tui()
+    t = _task(trail=[{"ts": "t", "worker_id": "w", "message": "tests failed"}])
+    result = tui._render_waiting_rework([t])
+    assert isinstance(result, Table)
+    assert result.row_count == 1
+
+
+def test_render_waiting_rework_shows_reason():
+    """Rework tasks should show kickback reason with cross mark prefix."""
+    tui = _make_tui()
+    t = _task(
+        trail=[{"ts": "t", "worker_id": "w", "message": "merge conflict"}],
+        attempts=[_attempt(status="superseded", completed_at="2026-04-05T01:00:00+00:00")],
+    )
+    result = tui._render_waiting_rework([t])
     assert isinstance(result, Table)
     assert result.row_count == 1
 
@@ -326,7 +398,9 @@ def test_render_awaiting_review_empty():
 
 def test_render_awaiting_review_populated():
     tui = _make_tui()
-    result = tui._render_awaiting_review([_task()])
+    att = _attempt(status="done", completed_at="2026-04-05T01:00:00+00:00")
+    t = _task(current_attempt="att-001", attempts=[att])
+    result = tui._render_awaiting_review([t])
     assert isinstance(result, Table)
     assert result.row_count == 1
 
@@ -355,7 +429,8 @@ def test_render_merge_ready_empty():
 
 def test_render_merge_ready_populated():
     tui = _make_tui()
-    att = _attempt(review_verdict={"result": "pass", "freshness": "fresh"})
+    att = _attempt(review_verdict={"result": "pass", "freshness": "fresh"},
+                   status="done", completed_at="2026-04-05T01:00:00+00:00")
     t = _task(status="done", current_attempt="att-001", attempts=[att])
     result = tui._render_merge_ready([t])
     assert isinstance(result, Table)
@@ -371,24 +446,10 @@ def test_render_merge_blocked_empty():
 
 def test_render_merge_blocked_populated():
     tui = _make_tui()
-    att = _attempt(merge_block_reason="conflict")
+    att = _attempt(merge_block_reason="conflict",
+                   status="done", completed_at="2026-04-05T01:00:00+00:00")
     t = _task(status="done", current_attempt="att-001", attempts=[att])
     result = tui._render_merge_blocked([t])
-    assert isinstance(result, Table)
-    assert result.row_count == 1
-
-
-def test_render_kicked_back_empty():
-    tui = _make_tui()
-    result = tui._render_kicked_back([])
-    assert isinstance(result, Table)
-    assert result.row_count == 1
-
-
-def test_render_kicked_back_populated():
-    tui = _make_tui()
-    t = _task(trail=[{"ts": "t", "worker_id": "w", "message": "tests failed"}])
-    result = tui._render_kicked_back([t])
     assert isinstance(result, Table)
     assert result.row_count == 1
 
@@ -419,8 +480,51 @@ def test_render_recently_merged_limits_to_5():
                            current_attempt=f"att-{i}", attempts=[att]))
     result = tui._render_recently_merged(tasks)
     assert isinstance(result, Table)
-    # 5 shown + 1 "... +3 more" row
+    # 5 shown + 1 overflow hint row
     assert result.row_count == 6
+
+
+# ---------------------------------------------------------------------------
+# Overflow hint
+# ---------------------------------------------------------------------------
+
+
+def test_overflow_hint_building():
+    """Building panel should show overflow hint when more than max_shown tasks."""
+    tui = _make_tui()
+    tasks = [
+        _task(task_id=f"task-{i}", status="active", current_attempt=f"att-{i}",
+              attempts=[_attempt(attempt_id=f"att-{i}")])
+        for i in range(7)
+    ]
+    result = tui._render_building(tasks, max_shown=5)
+    assert isinstance(result, Table)
+    # 5 shown + 1 overflow hint
+    assert result.row_count == 6
+
+
+def test_overflow_hint_awaiting_review():
+    """Awaiting review uses max_shown=8 by default."""
+    tui = _make_tui()
+    tasks = [
+        _task(task_id=f"task-{i}", current_attempt=f"att-{i}",
+              attempts=[_attempt(attempt_id=f"att-{i}", status="done",
+                                 completed_at="2026-04-05T01:00:00+00:00")])
+        for i in range(10)
+    ]
+    result = tui._render_awaiting_review(tasks)
+    assert isinstance(result, Table)
+    # 8 shown + 1 overflow hint
+    assert result.row_count == 9
+
+
+def test_no_overflow_hint_when_within_limit():
+    """No overflow hint when tasks fit within max_shown."""
+    tui = _make_tui()
+    tasks = [_task(task_id=f"task-{i}", touches=["api"]) for i in range(3)]
+    result = tui._render_waiting_new(tasks)
+    assert isinstance(result, Table)
+    assert result.row_count == 3
 
 
 # ---------------------------------------------------------------------------
