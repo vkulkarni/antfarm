@@ -305,7 +305,7 @@ def test_pipeline_bar_uses_wt_abbreviation():
 def test_summary_renders():
     tui = _make_tui()
     snap = PipelineSnapshot()
-    result = tui._render_summary({}, [], snap, "unknown")
+    result = tui._render_summary({}, [], [], snap, "unknown")
     assert isinstance(result, Table)
 
 
@@ -313,7 +313,19 @@ def test_summary_soldier_not_started():
     """Soldier status 'unknown' should display as 'not started'."""
     tui = _make_tui()
     snap = PipelineSnapshot()
-    result = tui._render_summary({"nodes": 1}, [], snap, "unknown")
+    result = tui._render_summary({"nodes": 1}, [], [], snap, "unknown")
+    assert isinstance(result, Table)
+
+
+def test_summary_shows_node_names():
+    """When workers are present, show node names instead of count."""
+    tui = _make_tui()
+    snap = PipelineSnapshot()
+    workers = [
+        {"worker_id": "mini-1/b1", "node_id": "mini-1"},
+        {"worker_id": "mini-2/b2", "node_id": "mini-2"},
+    ]
+    result = tui._render_summary({}, [], workers, snap, "unknown")
     assert isinstance(result, Table)
 
 
@@ -322,7 +334,7 @@ def test_summary_review_pressure():
     snap = PipelineSnapshot(
         awaiting_review=[_task(), _task(task_id="t2"), _task(task_id="t3"), _task(task_id="t4")]
     )
-    result = tui._render_summary({}, [], snap, "idle")
+    result = tui._render_summary({}, [], [], snap, "idle")
     assert isinstance(result, Table)
 
 

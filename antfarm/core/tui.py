@@ -83,17 +83,17 @@ class AntfarmTUI:
         layout = Layout()
         layout.split_column(
             Layout(name="summary", size=8),
-            Layout(name="workers", size=5),
+            Layout(name="workers", size=max(5, len(workers) + 4)),
             Layout(name="waiting", size=7),
             Layout(name="building", size=6),
-            Layout(name="review", size=10),
+            Layout(name="review", size=12),
             Layout(name="merge", size=6),
             Layout(name="merged", size=4),
         )
 
         layout["summary"].update(
             Panel(
-                self._render_summary(status, tasks, snap, soldier_status),
+                self._render_summary(status, tasks, workers, snap, soldier_status),
                 title="[bold blue]Antfarm Colony[/bold blue]",
             )
         )
@@ -353,6 +353,7 @@ class AntfarmTUI:
         self,
         status: dict,
         tasks: list[dict],
+        workers: list[dict],
         snap: PipelineSnapshot,
         soldier_status: str,
     ) -> Table:
@@ -361,9 +362,16 @@ class AntfarmTUI:
         table.add_column("Metric", style="bold")
         table.add_column("Value")
 
-        # Nodes
+        # Nodes — show names from workers, fall back to count
         node_count = status.get("nodes", 0)
-        table.add_row("Nodes", Text(str(node_count)))
+        node_ids = sorted(set(w.get("node_id", "") for w in workers if w.get("node_id")))
+        if node_ids:
+            table.add_row(
+                f"Nodes ({len(node_ids)})",
+                Text(", ".join(node_ids)),
+            )
+        else:
+            table.add_row("Nodes", Text(str(node_count)))
 
         # Soldier status
         if soldier_status == "running":
