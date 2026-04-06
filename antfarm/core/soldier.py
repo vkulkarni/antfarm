@@ -740,13 +740,14 @@ class Soldier:
         integration_branch: str = "dev",
         test_command: list[str] | None = None,
         poll_interval: float = 30.0,
-        require_review: bool = False,
+        require_review: bool = True,
     ) -> Soldier:
         """Create a Soldier that talks directly to a TaskBackend.
 
         Instead of going through the Colony HTTP API, this wraps the backend
         with a ColonyClient-compatible adapter so the Soldier can run
         in-process (e.g., as a daemon thread inside the colony server).
+        Review is enabled by default — Soldier creates review tasks for done work.
         """
         instance = cls.__new__(cls)
         instance.colony = _BackendAdapter(backend)
