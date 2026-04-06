@@ -245,9 +245,13 @@ class WorkerRuntime:
     def run(self) -> None:
         """Main lifecycle loop.
 
-        Registers the worker, iterates _process_one_task until the queue is
-        empty, then deregisters unconditionally in the finally block.
+        Registers the node and worker, iterates _process_one_task until the
+        queue is empty, then deregisters unconditionally in the finally block.
         """
+        # Auto-register node before worker (#98)
+        with contextlib.suppress(Exception):
+            self.colony.register_node(self.node_id)
+
         self.colony.register_worker(
             self.worker_id,
             self.node_id,
