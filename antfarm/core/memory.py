@@ -14,6 +14,7 @@ Trust model:
 
 from __future__ import annotations
 
+import contextlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -120,6 +121,9 @@ class MemoryStore:
         }
         with open(self._outcomes_path(), "a") as f:
             f.write(json.dumps(entry) + "\n")
+
+        with contextlib.suppress(Exception):
+            self.recompute_hotspots()
 
     def get_outcomes(self, limit: int = 100) -> list[dict]:
         """Return recent task outcomes (newest first)."""
