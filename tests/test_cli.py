@@ -11,6 +11,23 @@ from click.testing import CliRunner
 from antfarm.core.cli import main
 
 # ---------------------------------------------------------------------------
+# version
+# ---------------------------------------------------------------------------
+
+
+def test_version_command():
+    """Version command prints 'antfarm v<version>'."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["version"])
+    assert result.exit_code == 0, result.output
+    assert result.output.startswith("antfarm v")
+    # Verify it contains the actual version string
+    from antfarm.core import __version__
+
+    assert f"antfarm v{__version__}" in result.output
+
+
+# ---------------------------------------------------------------------------
 # colony
 # ---------------------------------------------------------------------------
 
