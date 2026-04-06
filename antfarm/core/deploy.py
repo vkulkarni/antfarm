@@ -98,7 +98,7 @@ def _build_ssh_command(
 def deploy(
     config_path: str,
     colony_url: str = "http://localhost:7433",
-    integration_branch: str = "dev",
+    integration_branch: str = "main",
 ) -> list[DeployResult]:
     """Deploy workers to remote nodes according to fleet config.
 

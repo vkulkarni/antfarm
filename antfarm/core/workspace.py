@@ -18,7 +18,7 @@ class WorkspaceManager:
         integration_branch: Remote branch new worktrees branch off of.
     """
 
-    def __init__(self, workspace_root: str, repo_path: str, integration_branch: str = "dev"):
+    def __init__(self, workspace_root: str, repo_path: str, integration_branch: str = "main"):
         self.workspace_root = workspace_root
         self.repo_path = repo_path
         self.integration_branch = integration_branch

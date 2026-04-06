@@ -298,7 +298,7 @@ def worker():
 @click.option("--workspace-root", default=None, help="Root directory for worktrees.")
 @click.option("--node", required=True, help="Node ID this worker belongs to.")
 @click.option("--repo-path", default=".", show_default=True, help="Path to git repo.")
-@click.option("--integration-branch", default="dev", show_default=True, help="Integration branch.")
+@click.option("--integration-branch", default="main", show_default=True, help="Integration branch.")
 @click.option("--capabilities", default=None, help="Comma-separated worker capabilities (e.g. gpu,docker).")  # noqa: E501
 @COLONY_URL_OPTION
 @TOKEN_OPTION

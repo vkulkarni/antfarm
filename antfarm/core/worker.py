@@ -218,7 +218,7 @@ class WorkerRuntime:
         agent_type: str,
         workspace_root: str,
         repo_path: str,
-        integration_branch: str = "dev",
+        integration_branch: str = "main",
         heartbeat_interval: float = 30.0,
         capabilities: list[str] | None = None,
         client: httpx.Client | None = None,
