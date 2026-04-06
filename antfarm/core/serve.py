@@ -453,6 +453,11 @@ def get_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"ok": True}
 
+    @app.get("/tasks/count", status_code=200)
+    def task_count():
+        """Return task counts by status without full task data."""
+        return _backend.status()["tasks"]
+
     @app.get("/tasks", status_code=200)
     def list_tasks(status: str | None = Query(default=None)):
         """List tasks with optional ?status= filter."""
