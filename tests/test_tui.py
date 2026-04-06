@@ -94,8 +94,7 @@ def test_classify_under_review():
     tui = _make_tui()
     tasks = [_task(task_id="review-001", status="active",
                    current_attempt="att-001",
-                   attempts=[_attempt()],
-                   touches=["review"])]
+                   attempts=[_attempt()])]
     snap = tui._classify_tasks(tasks)
     assert len(snap.under_review) == 1
     assert len(snap.building) == 0
@@ -140,8 +139,7 @@ def test_classify_review_task_not_in_building():
     tasks = [
         _task(task_id="review-task", status="active",
               current_attempt="att-r",
-              attempts=[_attempt(attempt_id="att-r")],
-              touches=["review"]),
+              attempts=[_attempt(attempt_id="att-r")]),
         _task(task_id="build-task", status="active",
               current_attempt="att-b",
               attempts=[_attempt(attempt_id="att-b")]),

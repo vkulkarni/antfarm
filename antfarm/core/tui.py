@@ -187,22 +187,13 @@ class AntfarmTUI:
         """Classify all tasks into pipeline stages."""
         snap = PipelineSnapshot()
 
-        # Build a set of review task IDs to exclude from building
-        review_task_ids: set[str] = set()
-        for task in tasks:
-            spec = task.get("spec", "")
-            if isinstance(spec, str) and "review_target" in spec:
-                review_task_ids.add(task.get("id", ""))
-            touches = task.get("touches", [])
-            if "review" in touches:
-                review_task_ids.add(task.get("id", ""))
-
         for task in tasks:
             task_id = task.get("id", "")
             status = task.get("status", "")
+            is_review = task_id.startswith("review-")
 
             if status == "active":
-                if task_id in review_task_ids:
+                if is_review:
                     snap.under_review.append(task)
                     # Map review task to its target
                     snap.review_tasks[task_id] = task
@@ -212,7 +203,7 @@ class AntfarmTUI:
             elif status == "ready":
                 if self._is_kicked_back(task):
                     snap.kicked_back.append(task)
-                elif task_id in review_task_ids:
+                elif is_review:
                     snap.review_tasks[task_id] = task
                 else:
                     snap.backlog.append(task)
