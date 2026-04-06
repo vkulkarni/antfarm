@@ -534,6 +534,19 @@ def test_workers_list_returns_registered(client):
     assert ids == {"worker-a", "worker-b"}
 
 
+def test_task_count_endpoint(client):
+    """GET /tasks/count returns task counts by status."""
+    _carry(client, task_id="task-001")
+    _carry(client, task_id="task-002")
+
+    r = client.get("/tasks/count")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ready"] == 2
+    assert data["active"] == 0
+    assert data["done"] == 0
+
+
 def test_forage_skips_rate_limited_worker(client):
     """POST /tasks/pull returns 204 when worker is in cooldown."""
     from datetime import UTC, datetime, timedelta
