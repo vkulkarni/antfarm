@@ -57,9 +57,16 @@ def _start_soldier_thread(backend: TaskBackend, data_dir: str) -> None:
     if _soldier_thread is not None and _soldier_thread.is_alive():
         return  # already running
 
+    from pathlib import Path
+
     from antfarm.core.soldier import Soldier
 
-    soldier = Soldier.from_backend(backend, repo_path=data_dir)
+    # Soldier needs the git repo root, not the .antfarm data dir.
+    # Resolve: if data_dir is inside a git repo, use its parent.
+    data_path = Path(data_dir).resolve()
+    repo_path = str(data_path.parent) if data_path.name == ".antfarm" else str(data_path)
+
+    soldier = Soldier.from_backend(backend, repo_path=repo_path)
 
     def _soldier_loop():
         global _soldier_status
