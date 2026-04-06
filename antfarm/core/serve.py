@@ -24,6 +24,7 @@ from antfarm.core.backends.base import TaskBackend
 # Module-level state — set by get_app()
 _lock = threading.Lock()
 _backend: TaskBackend | None = None
+_soldier_status: str = "unknown"
 
 
 def _now_iso() -> str:
@@ -549,6 +550,7 @@ def get_app(
             "status": _backend.status(),
             "tasks": _backend.list_tasks(),
             "workers": _backend.list_workers(),
+            "soldier": _soldier_status,
         }
 
     # ------------------------------------------------------------------
