@@ -174,6 +174,17 @@ def test_status_returns_summary(client):
     assert data["tasks"]["done"] == 0
 
 
+def test_task_count_endpoint(client):
+    _carry(client, task_id="task-001")
+    _carry(client, task_id="task-002")
+    r = client.get("/tasks/count")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ready"] == 2
+    assert data["active"] == 0
+    assert data["done"] == 0
+
+
 def test_guard_acquire_and_release(client):
     r = client.post("/guards/repo/main", json={"owner": "node-1/worker-1"})
     assert r.status_code == 200
