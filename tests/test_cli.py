@@ -8,7 +8,21 @@ from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
+from antfarm.core import __version__
 from antfarm.core.cli import main
+
+# ---------------------------------------------------------------------------
+# version
+# ---------------------------------------------------------------------------
+
+
+def test_version_command():
+    """Version command prints the current antfarm version."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["version"])
+    assert result.exit_code == 0
+    assert f"antfarm v{__version__}" in result.output
+
 
 # ---------------------------------------------------------------------------
 # colony

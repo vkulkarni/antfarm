@@ -15,6 +15,8 @@ import time
 import click
 import httpx
 
+from antfarm.core import __version__
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -76,6 +78,17 @@ def _delete(
 @click.group()
 def main():
     """Antfarm — lightweight orchestration for AI coding agents."""
+
+
+# ---------------------------------------------------------------------------
+# version
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+def version():
+    """Print the antfarm version."""
+    click.echo(f"antfarm v{__version__}")
 
 
 # ---------------------------------------------------------------------------
