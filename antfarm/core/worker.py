@@ -369,6 +369,39 @@ class WorkerRuntime:
             )
             return True
 
+        # Plan task processing — carry children instead of building artifact
+        caps_req = set(task.get("capabilities_required", []))
+        if "plan" in caps_req:
+            plan_result = self._process_plan_output(
+                task, attempt_id, result.stdout + result.stderr
+            )
+            if plan_result:
+                artifact = {
+                    "plan_task_id": task_id,
+                    "created_task_ids": plan_result["created_ids"],
+                    "task_count": len(plan_result["created_ids"]),
+                    "warnings": plan_result["warnings"],
+                    "dependency_summary": plan_result["dep_summary"],
+                }
+                with contextlib.suppress(Exception):
+                    self.colony.harvest(
+                        task_id, attempt_id, pr="", branch="",
+                        artifact=artifact,
+                    )
+                with contextlib.suppress(Exception):
+                    self.colony.trail(
+                        task_id, self.worker_id,
+                        f"plan complete: created {len(plan_result['created_ids'])} tasks",
+                    )
+                return True
+            # Plan parsing failed
+            with contextlib.suppress(Exception):
+                self.colony.trail(
+                    task_id, self.worker_id,
+                    "plan failed: could not parse agent output into tasks",
+                )
+            return True
+
         with contextlib.suppress(Exception):
             self.colony.trail(
                 task_id, self.worker_id, "agent completed, building artifact"
@@ -532,12 +565,41 @@ class WorkerRuntime:
         """
         spec = task.get("spec", "")
         title = task.get("title", "")
+        caps_req = set(task.get("capabilities_required", []))
+        is_plan = "plan" in caps_req
         is_review = task["id"].startswith("review-")
         branch = _extract_branch_from_spec(spec) if is_review else None
         if not branch:
             branch = f"feat/{task['id']}-{task['current_attempt']}"
 
-        if is_review:
+        if is_plan:
+            prompt = (
+                f"Task: {title}\n\n"
+                f"You are a PLANNER. Decompose this spec into implementation tasks.\n\n"
+                f"Spec:\n{spec}\n\n"
+                f"You are working in: {workspace}\n"
+                f"Read the codebase to understand the project structure.\n\n"
+                "Output a JSON array of tasks between [PLAN_RESULT] tags.\n"
+                "Each task object must have:\n"
+                '  - "title": short imperative title\n'
+                '  - "spec": detailed implementation instructions (2-5 sentences)\n'
+                '  - "touches": list of scope tags (e.g. ["api", "auth"])\n'
+                '  - "depends_on": list of task indices (1-based) or []\n'
+                '  - "priority": integer 1-20 (lower = higher priority)\n'
+                '  - "complexity": "S", "M", or "L"\n\n'
+                "Rules:\n"
+                "- Maximum 10 tasks\n"
+                "- Make tasks as parallel as possible\n"
+                "- Use depends_on only when strictly necessary\n"
+                "- Each task should be independently implementable\n\n"
+                "Example output:\n"
+                "[PLAN_RESULT]\n"
+                '[{"title": "Add auth middleware", "spec": "...", '
+                '"touches": ["api"], "depends_on": [], '
+                '"priority": 5, "complexity": "M"}]\n'
+                "[/PLAN_RESULT]\n"
+            )
+        elif is_review:
             prompt = (
                 f"Task: {title}\n\n"
                 f"Spec: {spec}\n\n"
@@ -603,6 +665,133 @@ class WorkerRuntime:
             stderr=proc.stderr,
             branch=branch,
         )
+
+    # ------------------------------------------------------------------
+    # Plan task processing
+    # ------------------------------------------------------------------
+
+    def _process_plan_output(
+        self, task: dict, attempt_id: str, output: str,
+    ) -> dict | None:
+        """Parse plan output, validate, and carry child tasks.
+
+        Returns dict with created_ids, warnings, dep_summary on success.
+        Returns None if parsing or validation fails.
+        """
+        import re
+
+        # Extract JSON from [PLAN_RESULT]...[/PLAN_RESULT] tags
+        match = re.search(
+            r"\[PLAN_RESULT\]\s*(.*?)\s*\[/PLAN_RESULT\]",
+            output, re.DOTALL,
+        )
+        if not match:
+            logger.warning("no [PLAN_RESULT] tags in planner output")
+            return None
+
+        # Parse using shared PlannerEngine logic
+        from antfarm.core.planner import PlannerEngine, resolve_dependencies
+
+        engine = PlannerEngine()
+        plan_result = engine.parse_structured_plan(match.group(1))
+
+        if not plan_result.tasks:
+            logger.warning("plan parse returned no tasks")
+            return None
+
+        # Validate
+        errors = engine.validate_plan(plan_result)
+        if errors:
+            for err in errors:
+                logger.warning("plan validation error: %s", err)
+                with contextlib.suppress(Exception):
+                    self.colony.trail(
+                        task["id"], self.worker_id,
+                        f"plan validation error: {err}",
+                    )
+            return None
+
+        tasks = plan_result.tasks
+
+        # Guardrail: max 10 children
+        if len(tasks) > 10:
+            logger.warning("plan has %d tasks, max 10", len(tasks))
+            with contextlib.suppress(Exception):
+                self.colony.trail(
+                    task["id"], self.worker_id,
+                    f"plan rejected: {len(tasks)} tasks exceeds max 10",
+                )
+            return None
+
+        # Generate deterministic child IDs
+        parent_id = task["id"]
+        slug = parent_id.removeprefix("plan-")
+        child_ids = [f"task-{slug}-{i:02d}" for i in range(1, len(tasks) + 1)]
+
+        # Resolve index-based deps to child IDs
+        resolved_tasks = resolve_dependencies(tasks, child_ids)
+
+        # Generate warnings
+        warnings = engine.generate_warnings(plan_result)
+        warn_strs = [str(w) for w in warnings] if isinstance(warnings, list) else []
+
+        # Carry each child task
+        created_ids: list[str] = []
+        failed_ids: list[str] = []
+        for i, proposed_task in enumerate(resolved_tasks):
+            child_id = child_ids[i]
+            try:
+                self.colony.carry(
+                    task_id=child_id,
+                    title=proposed_task.title,
+                    spec=proposed_task.spec,
+                    depends_on=proposed_task.depends_on,
+                    touches=proposed_task.touches,
+                    priority=proposed_task.priority,
+                    complexity=proposed_task.complexity,
+                    capabilities_required=[],  # no recursive plans
+                    spawned_by={
+                        "task_id": parent_id,
+                        "attempt_id": attempt_id,
+                    },
+                )
+                created_ids.append(child_id)
+                logger.info("carried child task %s", child_id)
+            except Exception as exc:
+                # 409 = already exists (idempotent retry)
+                if "409" in str(exc) or "already exists" in str(exc):
+                    created_ids.append(child_id)
+                    logger.info("child task %s already exists (idempotent)", child_id)
+                else:
+                    logger.warning("failed to carry child %s: %s", child_id, exc)
+                    failed_ids.append(child_id)
+
+        # Partial failure: abort harvest
+        if failed_ids:
+            logger.warning(
+                "plan partial failure: %d/%d tasks failed",
+                len(failed_ids), len(tasks),
+            )
+            with contextlib.suppress(Exception):
+                self.colony.trail(
+                    task["id"], self.worker_id,
+                    f"plan partial failure: {len(created_ids)} created, "
+                    f"{len(failed_ids)} failed: {', '.join(failed_ids)}",
+                )
+            return None
+
+        # Build dependency summary
+        dep_pairs: list[str] = []
+        for i, t in enumerate(resolved_tasks):
+            for dep in t.depends_on:
+                dep_pairs.append(f"{dep} -> {child_ids[i]}")
+        dep_summary = ", ".join(dep_pairs) if dep_pairs else "all parallel"
+
+        return {
+            "created_ids": created_ids,
+            "warnings": warn_strs,
+            "dep_summary": dep_summary,
+        }
 
     # ------------------------------------------------------------------
     # Heartbeat thread

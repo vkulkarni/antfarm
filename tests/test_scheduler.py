@@ -225,3 +225,32 @@ def test_pin_filter_skipped_when_worker_id_none():
         worker_id=None,
     )
     assert result is t
+
+
+# ---------------------------------------------------------------------------
+# v0.5.8: Planner worker routing
+# ---------------------------------------------------------------------------
+
+
+def test_planner_worker_only_forages_plan_tasks():
+    """Worker with capabilities=["plan"] does NOT forage regular tasks."""
+    regular = make_task("t1", capabilities_required=[])
+    result = select_task(
+        [regular],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_capabilities={"plan"},
+    )
+    assert result is None
+
+
+def test_planner_worker_forages_plan_task():
+    """Worker with capabilities=["plan"] forages plan tasks."""
+    plan_task = make_task("plan-auth", capabilities_required=["plan"])
+    result = select_task(
+        [plan_task],
+        done_task_ids=set(),
+        active_tasks=[],
+        worker_capabilities={"plan"},
+    )
+    assert result is plan_task

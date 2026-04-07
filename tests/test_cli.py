@@ -592,6 +592,89 @@ def test_worker_start_explicit_name_overrides():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# v0.5.8: carry --type plan and worker start --type planner
+# ---------------------------------------------------------------------------
+
+
+def test_carry_type_plan_adds_prefix():
+    """carry --type plan --id auth -> task ID is 'plan-auth'."""
+    runner = CliRunner()
+
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"task_id": "plan-auth"}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "carry",
+                "--title", "Plan auth",
+                "--spec", "Build auth",
+                "--type", "plan",
+                "--id", "auth",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]
+    assert payload["id"] == "plan-auth"
+
+
+def test_carry_type_plan_adds_capability():
+    """carry --type plan -> capabilities_required includes 'plan'."""
+    runner = CliRunner()
+
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"task_id": "plan-xxx"}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "carry",
+                "--title", "Plan something",
+                "--spec", "Do planning",
+                "--type", "plan",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]
+    assert "plan" in payload.get("capabilities_required", [])
+
+
+def test_worker_start_type_planner_adds_capability():
+    """worker start --type planner -> capabilities includes 'plan'."""
+    runner = CliRunner()
+    captured_kwargs = {}
+
+    def fake_worker_runtime(**kwargs):
+        captured_kwargs.update(kwargs)
+        return MagicMock()
+
+    with patch("antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime):
+        result = runner.invoke(
+            main,
+            [
+                "worker", "start",
+                "--agent", "claude-code",
+                "--type", "planner",
+                "--node", "n1",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "plan" in captured_kwargs.get("capabilities", [])
+
+
 def test_plan_carry_resolves_index_deps():
     """plan --carry resolves 1-based index deps to generated task IDs."""
     runner = CliRunner()

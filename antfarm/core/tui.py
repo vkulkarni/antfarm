@@ -25,6 +25,7 @@ from rich.text import Text
 
 @dataclass
 class PipelineSnapshot:
+    planning: list[dict] = field(default_factory=list)
     building: list[dict] = field(default_factory=list)
     waiting_new: list[dict] = field(default_factory=list)
     waiting_rework: list[dict] = field(default_factory=list)
@@ -219,8 +220,13 @@ class AntfarmTUI:
             status = task.get("status", "")
             is_review = task_id.startswith("review-")
 
+            caps_req = set(task.get("capabilities_required", []))
+            is_plan = "plan" in caps_req
+
             if status == "active":
-                if is_review:
+                if is_plan:
+                    snap.planning.append(task)
+                elif is_review:
                     snap.under_review.append(task)
                     snap.review_tasks[task_id] = task
                 else:

@@ -136,6 +136,20 @@ def test_classify_recently_merged():
     assert len(snap.recently_merged) == 1
 
 
+def test_classify_tasks_planning():
+    """Plan task in active -> planning list, not building."""
+    tui = _make_tui()
+    tasks = [_task(task_id="plan-auth", status="active",
+                   current_attempt="att-001",
+                   attempts=[_attempt()])]
+    # Add capabilities_required to the task dict
+    tasks[0]["capabilities_required"] = ["plan"]
+    snap = tui._classify_tasks(tasks)
+    assert len(snap.planning) == 1
+    assert snap.planning[0]["id"] == "plan-auth"
+    assert len(snap.building) == 0
+
+
 def test_classify_review_task_not_in_building():
     """A review task that is active should be in under_review, not building."""
     tui = _make_tui()

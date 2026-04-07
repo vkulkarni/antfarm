@@ -95,6 +95,7 @@ class CarryRequest(BaseModel):
     touches: list[str] = []
     capabilities_required: list[str] = []
     created_by: str = "api"
+    spawned_by: dict | None = None
 
 
 class NodeRequest(BaseModel):
@@ -305,6 +306,8 @@ def get_app(
             "created_at": now,
             "updated_at": now,
         }
+        if req.spawned_by:
+            task["spawned_by"] = req.spawned_by
         try:
             task_id = _backend.carry(task)
         except ValueError as exc:
