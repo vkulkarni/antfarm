@@ -127,6 +127,10 @@ class Soldier:
             task_id = task.get("id", "")
             if task_id.startswith("review-"):
                 continue
+            # Skip plan tasks — they produce tasks, not code
+            caps_req = set(task.get("capabilities_required", []))
+            if "plan" in caps_req:
+                continue
             if self._has_merged_attempt(task):
                 continue
             # Skip if already has a verdict
