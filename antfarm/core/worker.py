@@ -374,6 +374,43 @@ class WorkerRuntime:
                 task_id, self.worker_id, "agent completed, building artifact"
             )
 
+        # Plan task: parse output, validate, carry children, harvest with plan artifact
+        caps_req = set(task.get("capabilities_required", []))
+        is_plan = "plan" in caps_req
+        if is_plan:
+            plan_result = self._process_plan_output(
+                task, attempt_id, result.stdout + result.stderr
+            )
+            if plan_result:
+                artifact = {
+                    "plan_task_id": task_id,
+                    "created_task_ids": plan_result["created_ids"],
+                    "task_count": len(plan_result["created_ids"]),
+                    "warnings": plan_result["warnings"],
+                    "dependency_summary": plan_result["dep_summary"],
+                }
+                with contextlib.suppress(Exception):
+                    self.colony.mark_harvest_pending(task_id, attempt_id)
+                with contextlib.suppress(Exception):
+                    self.colony.harvest(
+                        task_id, attempt_id, pr="", branch="",
+                        artifact=artifact,
+                    )
+                with contextlib.suppress(Exception):
+                    self.colony.trail(
+                        task_id, self.worker_id,
+                        f"plan complete: created {len(plan_result['created_ids'])} tasks",
+                    )
+                return True
+
+            # Plan parsing failed — trail the error
+            with contextlib.suppress(Exception):
+                self.colony.trail(
+                    task_id, self.worker_id,
+                    "plan failed: could not parse agent output into tasks",
+                )
+            return True
+
         # Set harvest_pending before writing result (best-effort)
         with contextlib.suppress(Exception):
             self.colony.mark_harvest_pending(task_id, attempt_id)
@@ -532,12 +569,41 @@ class WorkerRuntime:
         """
         spec = task.get("spec", "")
         title = task.get("title", "")
-        is_review = task["id"].startswith("review-")
+        caps_req = set(task.get("capabilities_required", []))
+        is_plan = "plan" in caps_req
+        is_review = "review" in caps_req
         branch = _extract_branch_from_spec(spec) if is_review else None
         if not branch:
             branch = f"feat/{task['id']}-{task['current_attempt']}"
 
-        if is_review:
+        if is_plan:
+            prompt = (
+                f"Task: {title}\n\n"
+                "You are a PLANNER. Decompose this spec into implementation tasks.\n\n"
+                f"Spec:\n{spec}\n\n"
+                f"You are working in: {workspace}\n"
+                "Read the codebase to understand the project structure.\n\n"
+                "Output a JSON array of tasks between [PLAN_RESULT] tags.\n"
+                "Each task object must have:\n"
+                '  - "title": short imperative title\n'
+                '  - "spec": detailed implementation instructions (2-5 sentences)\n'
+                '  - "touches": list of scope tags (e.g. ["api", "auth"])\n'
+                '  - "depends_on": list of task indices (1-based) or []\n'
+                '  - "priority": integer 1-20 (lower = higher priority)\n'
+                '  - "complexity": "S", "M", or "L"\n\n'
+                "Rules:\n"
+                "- Maximum 10 tasks\n"
+                "- Make tasks as parallel as possible\n"
+                "- Use depends_on only when strictly necessary\n"
+                "- Each task should be independently implementable\n\n"
+                "Example output:\n"
+                "[PLAN_RESULT]\n"
+                '[{"title": "Add auth middleware", "spec": "...", '
+                '"touches": ["api"], "depends_on": [], '
+                '"priority": 5, "complexity": "M"}]\n'
+                "[/PLAN_RESULT]\n"
+            )
+        elif is_review:
             prompt = (
                 f"Task: {title}\n\n"
                 f"Spec: {spec}\n\n"
@@ -565,7 +631,7 @@ class WorkerRuntime:
                 "4. Push the branch: git push -u origin {branch}\n"
             )
 
-        agent_role = "reviewer" if is_review else "worker"
+        agent_role = "planner" if is_plan else ("reviewer" if is_review else "worker")
         if self.agent_type == "claude-code":
             cmd = [
                 "claude", "-p",
@@ -603,6 +669,146 @@ class WorkerRuntime:
             stderr=proc.stderr,
             branch=branch,
         )
+
+    # ------------------------------------------------------------------
+    # Plan output processing
+    # ------------------------------------------------------------------
+
+    def _process_plan_output(
+        self, task: dict, attempt_id: str, output: str,
+    ) -> dict | None:
+        """Parse plan output, validate, and carry child tasks.
+
+        Returns dict with created_ids, warnings, dep_summary on success.
+        Returns None if parsing or validation fails.
+        """
+        import re
+
+        # Extract JSON from [PLAN_RESULT]...[/PLAN_RESULT] tags
+        match = re.search(
+            r"\[PLAN_RESULT\]\s*(.*?)\s*\[/PLAN_RESULT\]",
+            output, re.DOTALL,
+        )
+        if not match:
+            logger.warning("no [PLAN_RESULT] tags in planner output")
+            return None
+
+        # Parse and validate using shared PlannerEngine logic
+        from antfarm.core.planner import PlannerEngine, resolve_dependencies
+
+        engine = PlannerEngine()
+        plan_result = engine.parse_structured_plan(match.group(1))
+
+        if not plan_result.tasks:
+            logger.warning("plan produced no tasks")
+            with contextlib.suppress(Exception):
+                self.colony.trail(
+                    task["id"], self.worker_id,
+                    "plan produced no tasks"
+                    + (f": {plan_result.warnings[0]}" if plan_result.warnings else ""),
+                )
+            return None
+
+        errors = engine.validate_plan(plan_result)
+        if errors:
+            for err in errors:
+                logger.warning("plan validation error: %s", err)
+                with contextlib.suppress(Exception):
+                    self.colony.trail(
+                        task["id"], self.worker_id,
+                        f"plan validation error: {err}",
+                    )
+            return None
+
+        tasks = plan_result.tasks
+
+        # Guardrail: max 10 children
+        if len(tasks) > 10:
+            logger.warning("plan has %d tasks, max 10", len(tasks))
+            with contextlib.suppress(Exception):
+                self.colony.trail(
+                    task["id"], self.worker_id,
+                    f"plan rejected: {len(tasks)} tasks exceeds max 10",
+                )
+            return None
+
+        # Generate deterministic child IDs (NOT plan-prefixed — these are impl tasks)
+        parent_id = task["id"]
+        slug = parent_id.removeprefix("plan-")
+        child_ids = [f"task-{slug}-{i:02d}" for i in range(1, len(tasks) + 1)]
+
+        # Resolve index-based deps to child IDs
+        resolved_tasks = resolve_dependencies(tasks, child_ids)
+
+        # Generate warnings
+        warnings = engine.generate_warnings(plan_result)
+        warn_strs = [str(w) for w in warnings] if isinstance(warnings, list) else []
+
+        # Carry each child task
+        created_ids: list[str] = []
+        failed_ids: list[str] = []
+        for i, proposed_task in enumerate(resolved_tasks):
+            child_id = child_ids[i]
+            payload = proposed_task.to_carry_dict(child_id)
+
+            # Guardrail: no recursive plans
+            payload["capabilities_required"] = []
+
+            # Lineage metadata
+            spawned_by = {
+                "task_id": parent_id,
+                "attempt_id": attempt_id,
+            }
+
+            try:
+                self.colony.carry(
+                    task_id=child_id,
+                    title=payload["title"],
+                    spec=payload["spec"],
+                    depends_on=payload.get("depends_on", []),
+                    touches=payload.get("touches", []),
+                    priority=payload.get("priority", 10),
+                    complexity=payload.get("complexity", "M"),
+                    capabilities_required=[],
+                    spawned_by=spawned_by,
+                )
+                created_ids.append(child_id)
+                logger.info("carried child task %s", child_id)
+            except Exception as exc:
+                # 409 = already exists (idempotent retry)
+                if "409" in str(exc) or "already exists" in str(exc):
+                    created_ids.append(child_id)
+                    logger.info("child task %s already exists (idempotent)", child_id)
+                else:
+                    logger.warning("failed to carry child %s: %s", child_id, exc)
+                    failed_ids.append(child_id)
+
+        # Partial failure: if any non-idempotent carry failed, do NOT harvest
+        if failed_ids:
+            logger.warning(
+                "plan partial failure: %d/%d tasks failed",
+                len(failed_ids), len(resolved_tasks),
+            )
+            with contextlib.suppress(Exception):
+                self.colony.trail(
+                    task["id"], self.worker_id,
+                    f"plan partial failure: {len(created_ids)} created, "
+                    f"{len(failed_ids)} failed: {', '.join(failed_ids)}",
+                )
+            return None
+
+        # Build dependency summary
+        dep_pairs: list[str] = []
+        for i, t in enumerate(resolved_tasks):
+            for dep in t.depends_on:
+                dep_pairs.append(f"{dep} → {child_ids[i]}")
+        dep_summary = ", ".join(dep_pairs) if dep_pairs else "all parallel"
+
+        return {
+            "created_ids": created_ids,
+            "warnings": warn_strs,
+            "dep_summary": dep_summary,
+        }
 
     # ------------------------------------------------------------------
     # Heartbeat thread

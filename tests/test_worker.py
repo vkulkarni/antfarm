@@ -7,6 +7,7 @@ WorkspaceManager.create() is monkeypatched to skip real git operations.
 
 from __future__ import annotations
 
+import json as _json
 from unittest.mock import MagicMock
 
 import httpx
@@ -731,3 +732,327 @@ def test_build_artifact_handles_git_failure(tmp_path, http_client):
     assert artifact["lines_removed"] == 0
     assert artifact["head_sha"] == ""
     assert artifact["base_sha"] == ""
+
+
+# ---------------------------------------------------------------------------
+# v0.5.8: Planner mode (#129)
+# ---------------------------------------------------------------------------
+
+
+def _carry_plan(tc, task_id="plan-test", title="Plan Test", spec="decompose this"):
+    """Carry a plan task with capabilities_required=["plan"]."""
+    r = tc.post("/tasks", json={
+        "id": task_id,
+        "title": title,
+        "spec": spec,
+        "capabilities_required": ["plan"],
+    })
+    assert r.status_code == 201
+    return r.json()
+
+
+def _plan_agent_output(tasks_json: str) -> str:
+    """Build agent stdout containing [PLAN_RESULT] tags."""
+    return f"Analyzing codebase...\n[PLAN_RESULT]\n{tasks_json}\n[/PLAN_RESULT]\nDone."
+
+
+def _make_planner_runtime(tmp_path, http_client):
+    """Create a WorkerRuntime with planner capabilities."""
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="planner-1",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        capabilities=["plan"],
+        client=http_client,
+    )
+    rt.workspace_mgr.create = MagicMock(return_value=str(tmp_path / "ws"))
+    return rt
+
+
+def test_planner_mode_detects_plan_task(tc, tmp_path, http_client):
+    """Plan task is detected via capabilities_required, not prefix."""
+    _carry_plan(tc)
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    plan_json = _json.dumps([
+        {"title": "Task A", "spec": "do A", "touches": ["api"],
+         "depends_on": [], "priority": 5, "complexity": "S"},
+    ])
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(
+            returncode=0,
+            stdout=_plan_agent_output(plan_json),
+            stderr="",
+            branch="",
+        )
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    # Plan task should be harvested (done)
+    r = tc.get("/tasks/plan-test")
+    assert r.json()["status"] == "done"
+
+    # Child task should have been created
+    r = tc.get("/tasks/task-test-01")
+    assert r.status_code == 200
+    child = r.json()
+    assert child["title"] == "Task A"
+    assert child["status"] == "ready"
+
+
+def test_planner_creates_deterministic_child_ids(tc, tmp_path, http_client):
+    """Child IDs follow pattern task-{slug}-01, task-{slug}-02."""
+    _carry_plan(tc, task_id="plan-auth-system")
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    plan_json = _json.dumps([
+        {"title": "Add middleware", "spec": "do middleware", "touches": ["api"],
+         "depends_on": [], "priority": 5, "complexity": "M"},
+        {"title": "Add routes", "spec": "do routes", "touches": ["api"],
+         "depends_on": [1], "priority": 10, "complexity": "M"},
+    ])
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
+                           stderr="", branch="")
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    # Check child IDs
+    r1 = tc.get("/tasks/task-auth-system-01")
+    assert r1.status_code == 200
+    assert r1.json()["title"] == "Add middleware"
+
+    r2 = tc.get("/tasks/task-auth-system-02")
+    assert r2.status_code == 200
+    assert r2.json()["title"] == "Add routes"
+    # Dep should be resolved to child ID
+    assert "task-auth-system-01" in r2.json()["depends_on"]
+
+
+def test_planner_rejects_more_than_10_tasks(tc, tmp_path, http_client):
+    """Plan with >10 tasks is rejected (guardrail)."""
+    _carry_plan(tc)
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    tasks = [
+        {"title": f"Task {i}", "spec": f"do {i}", "touches": [],
+         "depends_on": [], "priority": 10, "complexity": "S"}
+        for i in range(11)
+    ]
+    plan_json = _json.dumps(tasks)
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
+                           stderr="", branch="")
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    # Plan task should NOT be harvested (stays active due to failure)
+    r = tc.get("/tasks/plan-test")
+    task = r.json()
+    assert task["status"] == "active"
+
+    # Trail should mention rejection
+    messages = [e["message"] for e in task["trail"]]
+    assert any("exceeds max 10" in m for m in messages)
+
+
+def test_planner_no_plan_result_tags(tc, tmp_path, http_client):
+    """Agent output without [PLAN_RESULT] tags fails gracefully."""
+    _carry_plan(tc)
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(returncode=0, stdout="no tags here", stderr="", branch="")
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    r = tc.get("/tasks/plan-test")
+    task = r.json()
+    assert task["status"] == "active"
+
+    messages = [e["message"] for e in task["trail"]]
+    assert any("could not parse" in m for m in messages)
+
+
+def test_planner_children_no_recursive_plans(tc, tmp_path, http_client):
+    """Child tasks have capabilities_required=[] to prevent recursive plans."""
+    _carry_plan(tc)
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    plan_json = _json.dumps([
+        {"title": "Sub task", "spec": "do sub", "touches": [],
+         "depends_on": [], "priority": 5, "complexity": "S"},
+    ])
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
+                           stderr="", branch="")
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    r = tc.get("/tasks/task-test-01")
+    child = r.json()
+    assert child.get("capabilities_required", []) == []
+
+
+def test_planner_harvest_artifact(tc, tmp_path, http_client):
+    """Plan task harvest artifact contains created_task_ids and dep summary."""
+    _carry_plan(tc, task_id="plan-feat")
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    plan_json = _json.dumps([
+        {"title": "A", "spec": "do A", "touches": [], "depends_on": [],
+         "priority": 5, "complexity": "S"},
+        {"title": "B", "spec": "do B", "touches": [], "depends_on": [1],
+         "priority": 10, "complexity": "M"},
+    ])
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
+                           stderr="", branch="")
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    r = tc.get("/tasks/plan-feat")
+    task = r.json()
+    assert task["status"] == "done"
+
+    # Check the attempt has artifact data
+    attempt = task["attempts"][0]
+    assert attempt["status"] == "done"
+
+
+def test_planner_spawned_by_lineage(tc, tmp_path, http_client):
+    """Child tasks carry spawned_by metadata linking to parent plan task."""
+    _carry_plan(tc, task_id="plan-lineage")
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    plan_json = _json.dumps([
+        {"title": "Child", "spec": "do child", "touches": [],
+         "depends_on": [], "priority": 5, "complexity": "S"},
+    ])
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
+                           stderr="", branch="")
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    r = tc.get("/tasks/task-lineage-01")
+    child = r.json()
+    assert child.get("spawned_by") is not None
+    assert child["spawned_by"]["task_id"] == "plan-lineage"
+
+
+def test_planner_agent_failure_no_harvest(tc, tmp_path, http_client):
+    """Plan agent that exits non-zero does not attempt plan processing."""
+    _carry_plan(tc)
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    def bad_plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(returncode=1, stdout="", stderr="crash", branch="")
+
+    rt._launch_agent = bad_plan_agent
+    rt.run()
+
+    r = tc.get("/tasks/plan-test")
+    task = r.json()
+    # Task stays active (agent failed, no harvest)
+    assert task["status"] == "active"
+
+
+def test_planner_409_idempotent(tc, tmp_path, http_client):
+    """409 on child carry (already exists) is treated as idempotent success."""
+    # Pre-create a child task that will collide
+    tc.post("/tasks", json={
+        "id": "task-idem-01",
+        "title": "Pre-existing",
+        "spec": "already here",
+    })
+
+    _carry_plan(tc, task_id="plan-idem")
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    plan_json = _json.dumps([
+        {"title": "Child", "spec": "do child", "touches": [],
+         "depends_on": [], "priority": 5, "complexity": "S"},
+    ])
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
+                           stderr="", branch="")
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    # Plan task should still be harvested successfully (409 is idempotent)
+    r = tc.get("/tasks/plan-idem")
+    assert r.json()["status"] == "done"
+
+
+def test_planner_invalid_json_in_tags(tc, tmp_path, http_client):
+    """Invalid JSON inside [PLAN_RESULT] tags fails gracefully."""
+    _carry_plan(tc)
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(
+            returncode=0,
+            stdout="[PLAN_RESULT]\nnot valid json\n[/PLAN_RESULT]",
+            stderr="",
+            branch="",
+        )
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    r = tc.get("/tasks/plan-test")
+    task = r.json()
+    # Should stay active — parsing failed
+    assert task["status"] == "active"
+
+
+def test_planner_prompt_includes_plan_instructions(tmp_path, http_client):
+    """Plan task prompt includes PLANNER instructions and [PLAN_RESULT] example."""
+    import subprocess
+    from unittest.mock import patch
+
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    task = {
+        "id": "plan-check",
+        "title": "Plan Check",
+        "spec": "decompose this feature",
+        "current_attempt": "att-001",
+        "capabilities_required": ["plan"],
+    }
+
+    captured_cmd = []
+
+    def fake_run(cmd, **kwargs):
+        captured_cmd.extend(cmd)
+        return MagicMock(returncode=0, stdout="done", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        rt._launch_agent(task, str(tmp_path / "ws"))
+
+    # The prompt (last arg) should contain planner-specific content
+    prompt = captured_cmd[-1]
+    assert "PLANNER" in prompt
+    assert "[PLAN_RESULT]" in prompt
+    assert "Maximum 10 tasks" in prompt
