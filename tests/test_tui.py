@@ -104,7 +104,7 @@ def test_classify_under_review():
 
 def test_classify_merge_ready():
     tui = _make_tui()
-    att = _attempt(status="done", review_verdict={"result": "pass", "freshness": "fresh"})
+    att = _attempt(status="done", review_verdict={"verdict": "pass", "freshness": "fresh"})
     tasks = [_task(status="done", current_attempt="att-001", attempts=[att])]
     snap = tui._classify_tasks(tasks)
     assert len(snap.merge_ready) == 1

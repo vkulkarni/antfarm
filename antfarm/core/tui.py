@@ -215,13 +215,17 @@ class AntfarmTUI:
 
             elif status == "done":
                 if self._has_merged_attempt(task):
-                    snap.recently_merged.append(task)
+                    if not is_review:  # only show impl tasks in merged
+                        snap.recently_merged.append(task)
+                elif is_review:
+                    # Done review tasks are just containers — hide them
+                    snap.review_tasks[task_id] = task
                 else:
                     verdict = self._get_verdict(task)
                     block_reason = self._get_merge_block_reason(task)
                     if block_reason:
                         snap.merge_blocked.append(task)
-                    elif verdict and verdict.get("result") == "pass":
+                    elif verdict and verdict.get("verdict") == "pass":
                         snap.merge_ready.append(task)
                     else:
                         snap.awaiting_review.append(task)
@@ -395,8 +399,9 @@ class AntfarmTUI:
         else:
             table.add_row("Reviews", Text(review_text, style="dim"))
 
-        # Progress bar
-        total = len(tasks)
+        # Progress bar — only count implementation tasks, not review tasks
+        impl_tasks = [t for t in tasks if not t.get("id", "").startswith("review-")]
+        total = len(impl_tasks)
         merged = len(snap.recently_merged)
         if total > 0:
             pct = int(merged / total * 100)
