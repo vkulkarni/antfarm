@@ -110,12 +110,15 @@ def test_classify_merge_ready():
     assert len(snap.merge_ready) == 1
 
 
-def test_classify_merge_blocked():
+def test_classify_planning():
     tui = _make_tui()
-    att = _attempt(status="done", merge_block_reason="conflict with task-002")
-    tasks = [_task(status="done", current_attempt="att-001", attempts=[att])]
+    t = _task(status="active", current_attempt="att-001",
+              attempts=[_attempt()])
+    t["capabilities_required"] = ["plan"]
+    tasks = [t]
     snap = tui._classify_tasks(tasks)
-    assert len(snap.merge_blocked) == 1
+    assert len(snap.planning) == 1
+    assert len(snap.building) == 0
 
 
 def test_classify_waiting_rework():
@@ -203,18 +206,15 @@ def test_has_merged_attempt_no():
     assert tui._has_merged_attempt(t) is False
 
 
-def test_get_merge_block_reason_found():
+def test_classify_active_without_plan_capability():
+    """Active task without plan capability goes to building."""
     tui = _make_tui()
-    att = _attempt(merge_block_reason="deps not merged")
-    t = _task(current_attempt="att-001", attempts=[att])
-    assert tui._get_merge_block_reason(t) == "deps not merged"
-
-
-def test_get_merge_block_reason_none():
-    tui = _make_tui()
-    att = _attempt()
-    t = _task(current_attempt="att-001", attempts=[att])
-    assert tui._get_merge_block_reason(t) is None
+    t = _task(status="active", current_attempt="att-001", attempts=[_attempt()])
+    t["capabilities_required"] = ["code"]
+    tasks = [t]
+    snap = tui._classify_tasks(tasks)
+    assert len(snap.building) == 1
+    assert len(snap.planning) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -269,9 +269,9 @@ def test_get_time_since_harvested_no_completed():
 
 def test_pipeline_bar_renders():
     tui = _make_tui()
-    counts = {"building": 3, "waiting": 2, "merged": 5,
+    counts = {"plan": 0, "building": 3, "waiting": 2, "merged": 5,
               "awaiting_review": 0, "under_review": 0,
-              "merge_ready": 1, "merge_blocked": 0}
+              "merge_ready": 1}
     result = tui._render_pipeline_bar(counts)
     assert isinstance(result, Text)
     assert len(str(result)) > 0
@@ -279,18 +279,18 @@ def test_pipeline_bar_renders():
 
 def test_pipeline_bar_empty():
     tui = _make_tui()
-    counts = {"building": 0, "waiting": 0, "merged": 0,
+    counts = {"plan": 0, "building": 0, "waiting": 0, "merged": 0,
               "awaiting_review": 0, "under_review": 0,
-              "merge_ready": 0, "merge_blocked": 0}
+              "merge_ready": 0}
     result = tui._render_pipeline_bar(counts)
     assert "no tasks" in str(result)
 
 
 def test_pipeline_bar_uses_wt_abbreviation():
     tui = _make_tui()
-    counts = {"building": 1, "waiting": 3, "merged": 0,
+    counts = {"plan": 0, "building": 1, "waiting": 3, "merged": 0,
               "awaiting_review": 0, "under_review": 0,
-              "merge_ready": 0, "merge_blocked": 0}
+              "merge_ready": 0}
     result = tui._render_pipeline_bar(counts)
     text_str = str(result)
     assert "wt:3" in text_str
@@ -449,19 +449,20 @@ def test_render_merge_ready_populated():
     assert result.row_count == 1
 
 
-def test_render_merge_blocked_empty():
+def test_render_planning_empty():
     tui = _make_tui()
-    result = tui._render_merge_blocked([])
+    result = tui._render_planning([])
     assert isinstance(result, Table)
     assert result.row_count == 1
 
 
-def test_render_merge_blocked_populated():
+def test_render_planning_populated():
     tui = _make_tui()
-    att = _attempt(merge_block_reason="conflict",
-                   status="done", completed_at="2026-04-05T01:00:00+00:00")
-    t = _task(status="done", current_attempt="att-001", attempts=[att])
-    result = tui._render_merge_blocked([t])
+    t = _task(status="active", current_attempt="att-001",
+              attempts=[_attempt()],
+              trail=[{"ts": "2026-01-01T00:00:00", "worker_id": "w1", "message": "planning"}])
+    t["capabilities_required"] = ["plan"]
+    result = tui._render_planning([t])
     assert isinstance(result, Table)
     assert result.row_count == 1
 
