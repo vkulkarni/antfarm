@@ -814,7 +814,85 @@ Zero new code. Run the system end-to-end and validate the full pipeline works.
 - No duplicate review tasks or duplicate merges during restart/recovery
 - Worker exit is distinguishable from worker crash in the TUI
 
-### v0.5.78 — Tester Worker (future)
+### v0.5.8 — Planner Worker
+
+Complete the autonomous pipeline by adding a planner worker that decomposes specs into tasks. Removes the human from the front of the pipeline.
+
+**Problem:** Currently, a human must manually decompose work and run `antfarm carry` for each task. The `antfarm plan` CLI exists but requires human interaction (run, review, confirm). The pipeline starts at "tasks exist" — someone has to create them.
+
+**Solution:** A planner worker that forages "plan tasks" (high-level specs), decomposes them into sub-tasks using the AI agent, and auto-carries them into the colony.
+
+**Pipeline becomes fully autonomous:**
+```
+Current:   [Human carries tasks] → Builder → Reviewer → Soldier merge
+With v0.5.8:
+    Spec → Planner → Tasks → Builder → Reviewer → Soldier merge
+```
+
+**How it works:**
+
+1. Operator creates a plan task:
+```bash
+antfarm carry --type plan --title "Auth system" \
+  --spec "Build JWT auth with login, logout, profile endpoints"
+```
+Creates task with `id="plan-{id}"`, `capabilities_required=["plan"]`.
+
+2. Planner worker forages the plan task (`antfarm worker start --type planner`).
+
+3. The worker's claude-code agent receives the spec as prompt with instructions to output a JSON array of tasks (same schema as PlannerEngine). The agent has full repo context from the worktree.
+
+4. Worker parses the agent's JSON output, validates (deps, touches, complexity), resolves index-based dependencies to actual task IDs.
+
+5. Worker auto-carries each sub-task via the colony API (`self.colony.carry()`).
+
+6. Worker harvests the plan task with an artifact listing the created task IDs.
+
+7. Builder workers forage the sub-tasks → normal build → review → merge flow.
+
+**Task naming:** Plan tasks use `plan-{id}` prefix convention (same pattern as `review-{id}`). No model changes needed.
+
+**Planner worker details:**
+- `antfarm worker start --type planner` — registers with `capabilities=["plan"]`
+- Scheduler restricts planner workers to only forage plan tasks (same pattern as reviewer)
+- Agent prompt includes repo context from memory (repo_facts, hotspots, touch_observations)
+- Output is parsed from `[PLAN_RESULT]...[/PLAN_RESULT]` tags in agent stdout (same pattern as `[REVIEW_VERDICT]`)
+- Validation: no circular deps, required fields, touches non-empty
+- Conflict warnings included in trail
+
+**Input sources for plan tasks:**
+```bash
+# Inline spec
+antfarm carry --type plan --title "Auth" --spec "Build JWT auth..."
+
+# From file
+antfarm carry --type plan --title "Auth" --spec "$(cat auth-spec.md)"
+
+# From GitHub issue (operator copies issue body into spec)
+antfarm carry --type plan --title "Auth" --spec "..." --issue 42
+```
+
+**TUI visibility:**
+- Plan tasks show in Waiting: New / Building with worker type "planner"
+- Sub-tasks created by planner appear in Waiting: New immediately
+- No separate "Planning" panel — planner is just another worker type
+
+**What the planner worker does NOT do:**
+- Does not approve its own plan — it IS the approval (operator approved by carrying the plan task)
+- Does not modify code — it only creates tasks
+- Does not use nested `PlannerEngine._call_agent()` subprocess — the worker's own agent does the planning
+- Does not create review or test tasks — those are Soldier's responsibility after builders complete
+
+**Files to change:**
+- `antfarm/core/worker.py` — planner mode in `_launch_agent()` and `_process_one_task()`
+- `antfarm/core/cli.py` — `--type plan` in carry, `planner` worker type
+- `antfarm/core/scheduler.py` — planner workers only forage plan tasks
+- `antfarm/core/tui.py` — plan task badge
+- `tests/` — planner worker flow tests
+
+**Complexity:** M
+
+### v0.5.9 — Tester Worker (future)
 
 Add a **tester** worker type that independently verifies builder branches (#106). Acts as CI inside antfarm.
 
@@ -822,15 +900,16 @@ Add a **tester** worker type that independently verifies builder branches (#106)
 - Soldier creates test tasks: `test-{task_id}-{attempt_id}`
 - Tester checks out branch, runs tests/lint/build, populates artifact verification fields
 - Does NOT modify code — read-only execution
-- Pipeline becomes: builder → tester → reviewer → soldier merge
+- Pipeline becomes: planner → builder → tester → reviewer → soldier merge
 
 This completes the artifact verification story — builders can't self-certify.
 
 **Why this order:**
-1. v0.5.75 (TUI) first — so we can see the pipeline when we test it
-2. v0.5.76 (pipeline fixes) second — makes the review flow actually work
-3. v0.5.77 (validation) third — proves it all works end-to-end with real tasks
-4. v0.5.78 (tester) later — independent verification, not needed for initial loop
+1. v0.5.75 (TUI) first — see the pipeline ✅
+2. v0.5.76 (pipeline fixes) — make review flow work ✅
+3. v0.5.77 (validation) — prove end-to-end ✅
+4. v0.5.8 (planner worker) — remove human from front of pipeline
+5. v0.5.9 (tester worker) — add independent verification
 
 ---
 
@@ -871,6 +950,10 @@ Given a completed task with artifact, Soldier creates a review task, a reviewer 
 ### Scenario G: Operational Liveness
 
 Given completed implementation tasks and at least one active reviewer worker, the colony does not go silent. Within a bounded time, each completed task is either: assigned a review task, explicitly shown as waiting for reviewer capacity, kicked back with findings, or moved to merge-ready / merged. No task stalls invisibly.
+
+### Scenario H: Autonomous Planning
+
+Given a high-level spec carried as a plan task, the planner worker decomposes it into parallelizable sub-tasks with correct dependencies and touches, auto-carries them, and builder workers begin foraging immediately. The operator's only action is `antfarm carry --type plan`. No manual task decomposition, no manual carry of sub-tasks.
 
 ### Scenario E: Useful Memory
 
@@ -964,8 +1047,10 @@ The order of operations is:
 4. Make memory lightweight and useful (v0.5.4) ✅
 5. Add planning on top of a stable runtime (v0.5.5) ✅
 6. Polish and release (v0.5.6) ✅
-7. Make the pipeline visible to operators (v0.5.75)
-8. Make the review pipeline actually work in production (v0.5.76)
-9. Validate end-to-end with real dogfooding (v0.5.77)
+7. Make the pipeline visible to operators (v0.5.75) ✅
+8. Make the review pipeline actually work in production (v0.5.76) ✅
+9. Validate end-to-end with real dogfooding (v0.5.77) ✅
+10. Remove the human from the front of the pipeline (v0.5.8)
+11. Add independent test verification (v0.5.9)
 
-v0.5.0 shipped the core architecture. v0.5.75-v0.5.77 make the review pipeline visible, operational, and dogfood-validated.
+v0.5.0 shipped the core architecture. v0.5.75-v0.5.77 made the review pipeline visible, operational, and dogfood-validated. v0.5.8 completes the autonomous loop — spec in, merged code out.
