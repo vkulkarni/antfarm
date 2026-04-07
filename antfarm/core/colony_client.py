@@ -112,6 +112,7 @@ class ColonyClient:
         priority: int = 10,
         complexity: str = "M",
         capabilities_required: list[str] | None = None,
+        spawned_by: dict | None = None,
     ) -> dict:
         """Create a task in the colony."""
         payload: dict = {
@@ -125,6 +126,8 @@ class ColonyClient:
         }
         if capabilities_required:
             payload["capabilities_required"] = capabilities_required
+        if spawned_by:
+            payload["spawned_by"] = spawned_by
         r = self._client.post("/tasks", json=payload)
         r.raise_for_status()
         return r.json()
