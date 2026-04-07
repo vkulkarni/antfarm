@@ -107,6 +107,8 @@ class AntfarmTUI:
         banner.append(" ··🐜\n", style="dim")
         banner.append("      ", style="dim")
         banner.append(line2, style="bold dark_orange")
+        from antfarm.core import __version__
+        banner.append(f"\n             v{__version__}", style="dim")
         layout["header"]["banner"].update(Panel(banner))
 
         layout["header"]["summary"].update(
