@@ -440,8 +440,12 @@ class WorkerRuntime:
             )
 
         # For review tasks: parse verdict from output and store on original task
-        if task_id.startswith("review-") and result.returncode == 0:
-            original_task_id = task_id[len("review-"):]
+        is_review_task = (
+            "review" in set(task.get("capabilities_required", []))
+            or task_id.startswith("review-")
+        )
+        if is_review_task and result.returncode == 0:
+            original_task_id = task_id.removeprefix("review-")
             verdict = _parse_review_verdict(result.stdout + result.stderr)
             if verdict:
                 try:
@@ -462,6 +466,17 @@ class WorkerRuntime:
                         "failed to store review verdict for %s: %s",
                         original_task_id,
                         exc,
+                    )
+            else:
+                # Agent didn't produce parseable [REVIEW_VERDICT] tags
+                logger.warning(
+                    "reviewer produced no verdict for %s", original_task_id
+                )
+                with contextlib.suppress(Exception):
+                    self.colony.trail(
+                        task_id,
+                        self.worker_id,
+                        f"WARNING: no [REVIEW_VERDICT] tags in output for {original_task_id}",
                     )
 
         return True
