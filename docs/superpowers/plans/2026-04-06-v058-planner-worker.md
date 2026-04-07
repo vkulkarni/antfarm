@@ -1,6 +1,6 @@
 # v0.5.8 — Planner Worker Implementation Plan
 
-**Status:** DRAFT — pending approval
+**Status:** DRAFT v2 — revised per ChatGPT principal-engineer review
 **Derived from:** SPEC_v05.md v0.5.8 section
 **Goal:** Remove the human from the front of the pipeline. Operator carries a plan task, planner worker decomposes it into sub-tasks, builders build, reviewers review, Soldier merges. Spec in, merged code out.
 
@@ -11,7 +11,7 @@
 - Planner worker type (`--type planner`, `capabilities=["plan"]`)
 - Plan task creation (`antfarm carry --type plan`)
 - Planner mode in worker runtime (forage plan task → agent decomposes → validate → carry children)
-- Deterministic child IDs (`plan-{parent}-01`, `plan-{parent}-02`)
+- Deterministic child IDs (`task-{slug}-01`, `task-{slug}-02` — NOT plan-prefixed)
 - Lineage metadata (`spawned_by` on child tasks)
 - Guardrails (max children, no recursive plans, acyclic deps)
 - Shared PlannerEngine validation (reuse, not duplicate)
@@ -117,13 +117,16 @@ Verify with a test that planner workers don't forage implementation tasks.
 
 #### 3a. Detect plan task in `_process_one_task()`
 
-After forage, check if task is a plan task:
+After forage, detect task type from `capabilities_required`, NOT string prefix:
 
 ```python
 task_id = task["id"]
-is_plan = task_id.startswith("plan-")
-is_review = task_id.startswith("review-")
+caps_req = set(task.get("capabilities_required", []))
+is_plan = "plan" in caps_req
+is_review = "review" in caps_req
 ```
+
+**Why not prefix?** Child tasks use `task-{slug}-01` IDs which would collide with `plan-` prefix detection. Capabilities are the authoritative source of task type.
 
 #### 3b. Planner prompt in `_launch_agent()`
 
@@ -266,9 +269,11 @@ def _process_plan_output(
             )
         return None
 
-    # Generate deterministic child IDs
+    # Generate deterministic child IDs (NOT plan-prefixed — these are impl tasks)
+    # Strip "plan-" prefix from parent to get the slug
     parent_id = task["id"]
-    child_ids = [f"{parent_id}-{i:02d}" for i in range(1, len(tasks) + 1)]
+    slug = parent_id.removeprefix("plan-")
+    child_ids = [f"task-{slug}-{i:02d}" for i in range(1, len(tasks) + 1)]
 
     # Resolve index-based deps to child IDs
     from antfarm.core.planner import resolve_dependencies
@@ -283,6 +288,7 @@ def _process_plan_output(
 
     # Carry each child task
     created_ids = []
+    failed_ids = []
     for i, proposed_task in enumerate(tasks):
         child_id = child_ids[i]
         payload = proposed_task.to_carry_dict(child_id)
@@ -305,6 +311,7 @@ def _process_plan_output(
                 touches=payload.get("touches", []),
                 priority=payload.get("priority", 10),
                 complexity=payload.get("complexity", "M"),
+                spawned_by=payload["spawned_by"],  # lineage persisted
             )
             created_ids.append(child_id)
             logger.info("carried child task %s", child_id)
@@ -315,6 +322,20 @@ def _process_plan_output(
                 logger.info("child task %s already exists (idempotent)", child_id)
             else:
                 logger.warning("failed to carry child %s: %s", child_id, exc)
+                failed_ids.append(child_id)
+
+    # Partial failure check: if any non-idempotent carry failed, do NOT harvest.
+    # Trail the failures and return None — task stays active for operator/doctor.
+    if failed_ids:
+        logger.warning("plan partial failure: %d/%d tasks failed",
+                        len(failed_ids), len(tasks))
+        with contextlib.suppress(Exception):
+            self.colony.trail(
+                task["id"], self.worker_id,
+                f"plan partial failure: {len(created_ids)} created, "
+                f"{len(failed_ids)} failed: {', '.join(failed_ids)}",
+            )
+        return None
 
     # Build dependency summary
     dep_pairs = []
@@ -365,26 +386,44 @@ If `generate_warnings` needs a `PlanResult` object, make it accept a list of tas
 
 ## 5. Lineage Metadata
 
-### Approach: `spawned_by` in task spec payload
+### Approach: explicit `spawned_by` field
 
-The simplest approach without model changes: include `spawned_by` as an extra field in the task dict. The carry endpoint accepts arbitrary fields (they're passed through to the JSON file). No backend or model changes needed.
+Add `spawned_by` as a first-class field to ensure it persists through carry.
+
+#### File: `antfarm/core/serve.py` — update CarryRequest
 
 ```python
-payload["spawned_by"] = {
-    "task_id": "plan-auth",
-    "attempt_id": "att-001",
-}
+class CarryRequest(BaseModel):
+    id: str
+    title: str
+    spec: str
+    complexity: str = "M"
+    priority: int = 10
+    depends_on: list[str] = []
+    touches: list[str] = []
+    capabilities_required: list[str] = []
+    created_by: str = "api"
+    spawned_by: dict | None = None  # NEW: lineage to parent plan task
 ```
 
-The TUI can read this field to show lineage. The `carry()` endpoint stores whatever fields are in the payload.
+In `carry_task()` endpoint, pass spawned_by through to the task dict:
+```python
+if req.spawned_by:
+    task["spawned_by"] = req.spawned_by
+```
 
-### CarryRequest in serve.py
+#### File: `antfarm/core/colony_client.py` — update carry()
 
-Check if `CarryRequest` model strips extra fields. If it does, we need to either:
-- Add `spawned_by: dict | None = None` to CarryRequest
-- Or pass it through as part of the task dict
+Add `spawned_by` parameter:
+```python
+def carry(self, ..., spawned_by: dict | None = None) -> dict:
+    payload = {...}
+    if spawned_by:
+        payload["spawned_by"] = spawned_by
+    ...
+```
 
-Read serve.py to verify.
+This ensures lineage data survives the full carry → API → backend → JSON file chain.
 
 ---
 
@@ -394,28 +433,37 @@ Read serve.py to verify.
 
 #### Show `[plan]` badge in Waiting: New and Building
 
-In `_render_waiting_new()` and `_render_building()`, check if task ID starts with `plan-`:
+Detect plan tasks from capabilities, not prefix:
 
 ```python
-badge = " [plan]" if task.get("id", "").startswith("plan-") else ""
+is_plan = "plan" in task.get("capabilities_required", [])
+badge = " [plan]" if is_plan else ""
 ```
 
-Append to task title display.
+#### Show "spawned N tasks" for done plan tasks
 
-#### Show "spawned N tasks" in Recently Merged for plan tasks
-
-In `_render_recently_merged()`, for plan tasks:
+In `_render_recently_merged()` or a dedicated done-plans section:
 
 ```python
-if task.get("id", "").startswith("plan-"):
-    # Get created count from artifact
-    for a in task.get("attempts", []):
-        if a.get("status") == "merged":
-            artifact = a.get("artifact", {})
-            count = artifact.get("task_count", 0)
-            if count:
-                merged_text = f"spawned {count} tasks"
+is_plan = "plan" in task.get("capabilities_required", [])
+if is_plan:
+    artifact = ...  # get from current attempt
+    count = artifact.get("task_count", 0)
+    if count:
+        merged_text = f"spawned {count} tasks"
 ```
+
+#### Soldier skips plan tasks for review
+
+Plan tasks produce tasks, not code. Soldier should NOT create review tasks for them. In `process_done_tasks()`:
+
+```python
+# Skip plan tasks — they don't need review or merge
+if "plan" in task.get("capabilities_required", []):
+    continue
+```
+
+Plan tasks stay in `done/` as a record of what was planned. They are not merged (no git integration happened).
 
 ---
 
@@ -440,7 +488,10 @@ test_process_plan_output_max_children
     — 15 tasks → rejected (max 10), trail entry logged
 
 test_process_plan_output_deterministic_ids
-    — parent "plan-auth" → children "plan-auth-01", "plan-auth-02", etc.
+    — parent "plan-auth" → children "task-auth-01", "task-auth-02", etc. (NOT plan-prefixed)
+
+test_process_plan_output_partial_failure_aborts
+    — 3 tasks, 1 carry fails (non-409) → returns None, trails failure, task stays active
 
 test_process_plan_output_idempotent_retry
     — carry 3 tasks, simulate crash, retry → no duplicates (409 handled)
@@ -500,7 +551,9 @@ test_e2e_plan_to_build_flow
 | `antfarm/core/worker.py` | Planner mode: prompt, `_process_plan_output()`, plan tag parsing |
 | `antfarm/core/planner.py` | Verify/minor refactor for reusable validation |
 | `antfarm/core/tui.py` | `[plan]` badge, spawned count in merged |
-| `antfarm/core/serve.py` | Maybe: add `spawned_by` to CarryRequest |
+| `antfarm/core/serve.py` | Add `spawned_by` to CarryRequest, pass through to task dict |
+| `antfarm/core/colony_client.py` | Add `spawned_by` param to carry() |
+| `antfarm/core/soldier.py` | Skip plan tasks in process_done_tasks() |
 | `tests/test_worker.py` | ~11 new tests for planner flow |
 | `tests/test_scheduler.py` | 2 new tests for plan task routing |
 | `tests/test_cli.py` | 3 new tests for carry --type plan |
@@ -512,16 +565,20 @@ test_e2e_plan_to_build_flow
 
 1. **Inline agent, shared validation.** The worker's claude-code agent does the AI planning. PlannerEngine provides deterministic validation only. No nested subprocess.
 
-2. **Deterministic child IDs.** `plan-{parent}-01` format. If the planner crashes and retries, carry() returns 409 for already-created tasks. No duplicates.
+2. **Deterministic child IDs.** `task-{slug}-01` format (NOT `plan-` prefixed). If the planner crashes and retries, carry() returns 409 for already-created tasks. No duplicates.
 
-3. **Lineage via `spawned_by` field.** Extra dict on the task JSON. No model changes. TUI reads it for "spawned N tasks" display.
+3. **Plan detection via capabilities, not prefix.** `"plan" in task.capabilities_required` is the authoritative check. String prefix is only used for parent plan task IDs (created by CLI). Child tasks are never plan-prefixed.
 
-4. **Max 10 children.** Hard guardrail. Prevents colony flooding from bad AI output. Configurable later.
+4. **Lineage via explicit `spawned_by` field.** Added to CarryRequest model and ColonyClient.carry(). Persisted on the task JSON. TUI reads it for lineage display.
 
-5. **No recursive plans.** Child tasks have `capabilities_required=[]`. A plan task cannot spawn another plan task. Prevents infinite decomposition loops.
+5. **Partial failure aborts harvest.** If any non-idempotent child carry fails, the plan task is NOT harvested. It stays active for doctor/operator recovery. Trail records what succeeded and what failed.
 
-6. **Scheduler reuse.** The existing specialized-worker logic already handles plan workers. `capabilities=["plan"]` is not `"builder"`, so the worker only forages plan tasks. Zero scheduler changes needed.
+6. **Max 10 children.** Hard guardrail. Prevents colony flooding from bad AI output. Configurable later.
 
-7. **PlannerEngine reuse.** Parsing, validation, cycle detection, and dep resolution are already built. The planner worker calls them — doesn't reimplement.
+7. **No recursive plans.** Child tasks have `capabilities_required=[]`. A plan task cannot spawn another plan task. Prevents infinite decomposition loops.
 
-8. **Plan task harvests like any task.** The plan task goes through the normal harvest flow. Its artifact contains the list of created task IDs instead of code changes. Soldier will see it as "done" and (if review is required) create a review task for it — but review of a plan task is optional since it didn't produce code.
+8. **Scheduler reuse.** The existing specialized-worker logic already handles plan workers. `capabilities=["plan"]` is not `"builder"`, so the worker only forages plan tasks. Zero scheduler changes needed.
+
+9. **PlannerEngine reuse.** Parsing, validation, cycle detection, and dep resolution are already built. The planner worker calls them — doesn't reimplement.
+
+10. **Plan tasks skip review and merge.** Plan tasks produce tasks, not code. Soldier skips them in `process_done_tasks()` — no review task created. Plan tasks stay in `done/` as a planning record. They are never "merged" because no git integration happened.
