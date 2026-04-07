@@ -102,9 +102,9 @@ class AntfarmTUI:
         line2 = "█▀█ █░▀█ ░█░ █▀░ █▀█ █▀▄ █░▀░█"
         banner = Text()
         banner.append("\n")
-        banner.append(" 🐜·· ", style="dim")
+        banner.append(" 🐜·· ", style="rgb(139,69,19)")
         banner.append(line1, style="bold dark_orange")
-        banner.append(" ··🐜\n", style="dim")
+        banner.append(" ··🐜\n", style="rgb(139,69,19)")
         banner.append("      ", style="dim")
         banner.append(line2, style="bold dark_orange")
         from antfarm.core import __version__
