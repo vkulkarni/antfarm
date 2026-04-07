@@ -1,8 +1,42 @@
 # v0.5.8 — Planner Worker Implementation Plan
 
-**Status:** DRAFT v2 — revised per ChatGPT principal-engineer review
+**Status:** APPROVED — ready for implementation
 **Derived from:** SPEC_v05.md v0.5.8 section
 **Goal:** Remove the human from the front of the pipeline. Operator carries a plan task, planner worker decomposes it into sub-tasks, builders build, reviewers review, Soldier merges. Spec in, merged code out.
+
+---
+
+## Build Execution Plan
+
+**Method:** Dogfooding — use antfarm itself to build v0.5.8.
+
+### Steps
+
+1. **Create GitHub issues** for v0.5.8 work
+2. **Restart colony** with latest code (v0.5.77), Soldier auto-starts
+3. **Carry 6 implementation tasks** into antfarm with detailed specs from this plan:
+   - task-cli-plan-type → cli.py (--type plan on carry, planner worker type)
+   - task-worker-planner-mode → worker.py (planner prompt, _process_plan_output)
+   - task-spawned-by → serve.py + colony_client.py (spawned_by field)
+   - task-soldier-skip-plans → soldier.py (skip plan tasks in process_done_tasks)
+   - task-tui-planning-panel → tui.py (Planning panel, plan badge, drop Merge Blocked)
+   - task-planner-tests → tests/ (18 new tests, depends on all above)
+4. **Start workers:**
+   - mini-1/builder — forages implementation tasks
+   - mini-2/builder — forages implementation tasks
+   - mini-2/reviewer — forages review tasks (polls 5min before exit)
+5. **Antfarm pipeline runs autonomously:**
+   - Builders build tasks 1-5 in parallel (no file conflicts)
+   - Task 6 (tests) blocked until 1-5 complete
+   - Soldier creates review tasks for each done task
+   - Reviewer reviews each task
+   - Soldier merges on passing verdict
+6. **Watch in TUI** — monitor pipeline flow: Waiting → Building → Reviewing → Merged
+7. **Fix any antfarm bugs** found during dogfood — file issues, fix on main
+8. **Verify all tests pass** on main after all tasks merged
+9. **Tag v0.5.8**, push
+10. **Dogfood test the planner worker** — carry a real plan task, start planner worker, watch decomposition flow through the pipeline
+11. **Update memory + docs**
 
 ---
 
@@ -431,18 +465,106 @@ This ensures lineage data survives the full carry → API → backend → JSON f
 
 ### File: `antfarm/core/tui.py`
 
-#### Show `[plan]` badge in Waiting: New and Building
+#### Add Planning panel
 
-Detect plan tasks from capabilities, not prefix:
+Add `planning` list to PipelineSnapshot:
 
 ```python
-is_plan = "plan" in task.get("capabilities_required", [])
-badge = " [plan]" if is_plan else ""
+@dataclass
+class PipelineSnapshot:
+    planning: list[dict] = field(default_factory=list)      # NEW
+    building: list[dict] = field(default_factory=list)
+    waiting_new: list[dict] = field(default_factory=list)
+    waiting_rework: list[dict] = field(default_factory=list)
+    awaiting_review: list[dict] = field(default_factory=list)
+    under_review: list[dict] = field(default_factory=list)
+    merge_ready: list[dict] = field(default_factory=list)
+    recently_merged: list[dict] = field(default_factory=list)
+    review_tasks: dict = field(default_factory=dict)
+```
+
+In `_classify_tasks()`, split active tasks by capabilities:
+
+```python
+if status == "active":
+    caps_req = set(task.get("capabilities_required", []))
+    if "plan" in caps_req:
+        snap.planning.append(task)
+    elif "review" in caps_req:
+        snap.under_review.append(task)
+        snap.review_tasks[task_id] = task
+    else:
+        snap.building.append(task)
+```
+
+#### Add Planning panel to layout
+
+Between Waiting and Building:
+
+```python
+Layout(name="planning", size=5),
+```
+
+Render:
+```python
+layout["planning"].update(
+    Panel(
+        self._render_planning(snap.planning),
+        title=f"[bold magenta]Planning ({len(snap.planning)})[/bold magenta]",
+    )
+)
+```
+
+#### Add `_render_planning()` method
+
+```python
+def _render_planning(self, tasks: list[dict], max_shown: int = 5) -> Table:
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
+    table.add_column("ID", max_width=20, no_wrap=True)
+    table.add_column("Title", max_width=30, no_wrap=True)
+    table.add_column("Worker", max_width=20, no_wrap=True)
+    table.add_column("Trail", max_width=25, no_wrap=True)
+    table.add_column("Time", max_width=6, no_wrap=True)
+
+    if not tasks:
+        table.add_row("[dim]--[/dim]", "[dim]no active plans[/dim]", "", "", "")
+        return table
+
+    shown = tasks[:max_shown]
+    for t in shown:
+        trail = t.get("trail", [])
+        last = trail[-1].get("message", "")[:23] if trail else ""
+        table.add_row(
+            Text(t.get("id", "")[:18], style="magenta"),
+            Text(t.get("title", "")[:28], style="magenta"),
+            Text(self._get_worker_for_task(t)[:18], style="dim"),
+            Text(last, style="dim"),
+            Text(self._get_elapsed(t), style="dim"),
+        )
+    self._add_overflow_hint(table, len(tasks), max_shown)
+    return table
+```
+
+#### Drop Merge Blocked panel
+
+Remove `merge_blocked` from PipelineSnapshot and layout. Tasks that can't merge yet simply don't appear in Merge Ready (Soldier's `get_merge_queue()` already filters them).
+
+#### Update pipeline bar
+
+Add `plan` stage to pipeline distribution:
+
+```python
+counts = {
+    "plan": len(snap.planning),
+    "waiting": len(snap.waiting_new) + len(snap.waiting_rework),
+    "building": len(snap.building),
+    ...
+}
 ```
 
 #### Show "spawned N tasks" for done plan tasks
 
-In `_render_recently_merged()` or a dedicated done-plans section:
+In `_render_recently_merged()`:
 
 ```python
 is_plan = "plan" in task.get("capabilities_required", [])
@@ -453,9 +575,24 @@ if is_plan:
         merged_text = f"spawned {count} tasks"
 ```
 
+#### Full TUI layout (7 panels, top to bottom):
+
+```
+Logo | Colony Summary
+Workers
+Waiting: New | Waiting: Rework
+Planning                          ← NEW
+Building
+Awaiting Review | Under Review
+Merge Ready
+Recently Merged
+```
+
+Pipeline reads as a flow: Waiting → Planning → Building → Reviewing → Merging → Done
+
 #### Soldier skips plan tasks for review
 
-Plan tasks produce tasks, not code. Soldier should NOT create review tasks for them. In `process_done_tasks()`:
+In `soldier.py` `process_done_tasks()`:
 
 ```python
 # Skip plan tasks — they don't need review or merge
@@ -463,7 +600,7 @@ if "plan" in task.get("capabilities_required", []):
     continue
 ```
 
-Plan tasks stay in `done/` as a record of what was planned. They are not merged (no git integration happened).
+Plan tasks stay in `done/` as a record. Not merged (no git integration).
 
 ---
 

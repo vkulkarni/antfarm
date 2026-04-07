@@ -677,7 +677,8 @@ Redesign the TUI to show the full review pipeline, not just ready/active/done.
 - **Waiting: New | Rework** — side-by-side sub-panels. New = fresh tasks from carry. Rework = kicked-back tasks with review findings. Rework items are higher priority (already been through the pipeline).
 - **Building** — active implementation tasks with worker name, trail message, and elapsed time
 - **Awaiting Review | Under Review** — side-by-side. Awaiting = done tasks with no reviewer yet. Under Review = reviewer worker actively processing.
-- **Merge Ready | Merge Blocked** — side-by-side. Ready = passing verdict, fresh, deps satisfied. Blocked = passing verdict but stale or deps unsatisfied (Soldier-produced block reason).
+- **Planning** — plan tasks being actively decomposed by planner workers
+- **Merge Ready** — tasks with passing verdict, fresh SHA, deps satisfied
 - **Recently Merged** — compact horizontal layout, last N merged tasks with time since merged
 
 TUI mockup:
@@ -699,6 +700,9 @@ TUI mockup:
 │  task-login     [M] api       2h   │  task-auth-v2  ❌ SQL inj 15m │
 │  task-tests     [S] tests     2h   │  task-cache-v2 ❌ no test 10m │
 │  task-api       [M] api       1h   │                                │
+├──────── Planning (1) ────────────────────────────────────────────────┤
+│  ID              Title                  Worker       Trail     Time │
+│  plan-v058       Plan v0.5.8 planner..  mini-2/plnr  decomp.. 2m   │
 ├──────── Building (2) ───────────────┴───────────────────────────────┤
 │  ID              Title                  Worker       Trail     Time │
 │  task-auth       Add JWT auth midlw..   mini-1/bldr  routes    3m  │
@@ -710,9 +714,8 @@ TUI mockup:
 │  task-utils   ⏳ waiting   20m  │                                    │
 │  task-api     ⏳ waiting   15m  │                                    │
 │  +4 more — run: antfarm inbox   │                                    │
-├──── Merge Ready (2) ────────────┬──── Merge Blocked (1) ────────────┤
-│  task-config  ✅ pass       5m  │  task-lib     ⚠ stale        1h  │
-│  task-utils   ✅ pass       2m  │                                    │
+├──── Merge Ready (2) ─────────────────────────────────────────────────┤
+│  task-config  ✅ pass       5m     task-utils   ✅ pass       2m    │
 ├──────── Recently Merged (3) ────────────────────────────────────────┤
 │  task-init   ✅ 2m ago    task-setup  ✅ 5m ago    task-db  ✅ 8m  │
 └─────────────────────────────────────────────────────────────────────┘
@@ -725,11 +728,11 @@ TUI mockup:
 **Derived views (no model changes needed for v0.5.75):**
 - Waiting: New = `status=="ready"` + no superseded attempts
 - Waiting: Rework = `status=="ready"` + has superseded attempt + kickback trail
-- Building = `status=="active"` + not a review task
+- Planning = `status=="active"` + `"plan" in capabilities_required`
+- Building = `status=="active"` + not a review or plan task
 - Awaiting Review = `status=="done"` + no `review_verdict` + not a review task
 - Under Review = `review-*` task exists + `status=="active"`
-- Merge Ready = `review_verdict` exists + `verdict=="pass"` + no Soldier block reason
-- Merge Blocked = `review_verdict` exists + `verdict=="pass"` + Soldier-produced `merge_block_reason`
+- Merge Ready = `review_verdict` exists + `verdict=="pass"` (tasks not yet merge-eligible simply don't appear)
 - Recently Merged = any task with a merged attempt (last N)
 
 **Time in queue:** Every panel shows how long each task has been in its current stage — not total lifetime, just time since entering the stage. Long wait times signal bottlenecks (e.g., `45m` in Awaiting Review = no reviewer capacity).
