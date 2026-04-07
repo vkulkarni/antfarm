@@ -1,13 +1,5 @@
-<div align="center">
-
-```
-🐜·· ▄▀█ █▄░█ ▀█▀ █▀▀ █▀█ █▀█ █▀▄▀█ ··🐜
-     █▀█ █░▀█ ░█░ █▀░ █▀█ █▀▄ █░▀░█
-```
-
-**Lightweight orchestration for AI coding agents across machines.**
-
-</div>
+<h1 align="center">🐜 ANTFARM</h1>
+<p align="center"><b>Lightweight orchestration for AI coding agents across machines.</b></p>
 
 Antfarm is a thin, self-hosted coordination layer that lets you distribute coding work across multiple machines running any AI coding agent — Claude Code, Codex, Aider, Cursor, or anything that can run a shell command.
 
