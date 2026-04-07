@@ -850,15 +850,43 @@ Creates task with `id="plan-{id}"`, `capabilities_required=["plan"]`.
 
 7. Builder workers forage the sub-tasks → normal build → review → merge flow.
 
-**Task naming:** Plan tasks use `plan-{id}` prefix convention (same pattern as `review-{id}`). No model changes needed.
+**Lineage metadata:** Child tasks carry `spawned_by` field linking back to the plan task:
+- `spawned_by: {"task_id": "plan-auth", "attempt_id": "att-001"}`
+- TUI can show "this plan created 6 tasks"
+- Retries and rework traceable to the originating plan
+
+**Deterministic child IDs:** Child task IDs are derived from the parent plan task ID:
+- `{plan_task_id}-01`, `{plan_task_id}-02`, etc.
+- Example: `plan-auth-01`, `plan-auth-02`, `plan-auth-03`
+- Idempotent: if planner crashes after carrying 4 of 6 tasks and retries, duplicate IDs are rejected by `carry()` (409), remaining tasks are carried. No duplicates.
 
 **Planner worker details:**
 - `antfarm worker start --type planner` — registers with `capabilities=["plan"]`
 - Scheduler restricts planner workers to only forage plan tasks (same pattern as reviewer)
 - Agent prompt includes repo context from memory (repo_facts, hotspots, touch_observations)
 - Output is parsed from `[PLAN_RESULT]...[/PLAN_RESULT]` tags in agent stdout (same pattern as `[REVIEW_VERDICT]`)
-- Validation: no circular deps, required fields, touches non-empty
-- Conflict warnings included in trail
+- Raw agent output is validated and dependency-resolved by shared `PlannerEngine` logic (validation, cycle detection, conflict warnings) — not duplicated in worker
+- Planner worker reuses: `PlannerEngine._parse_tasks()`, `_validate_tasks()`, `_detect_cycles()`, `_generate_warnings()`, `resolve_dependencies()`
+
+**Guardrails (deterministic, not AI-gated):**
+- Max 10 child tasks per plan (configurable, prevents colony flooding)
+- No recursive plan spawning — child tasks cannot have `capabilities_required=["plan"]`
+- Dependency graph must be acyclic (validated by `_detect_cycles()`)
+- Every child task must have non-empty title and spec
+- Duplicate task IDs rejected (carry returns 409)
+- Child tasks default to implementation — never review/test/plan unless explicitly configured
+- Operator approval is the act of creating the plan task. Planner autonomy is bounded by these deterministic rules.
+
+**Plan task harvest artifact:**
+```python
+{
+    "plan_task_id": "plan-auth",
+    "created_task_ids": ["plan-auth-01", "plan-auth-02", ...],
+    "task_count": 6,
+    "warnings": ["Tasks 2,3 overlap on 'api' scope"],
+    "dependency_summary": "plan-auth-01 → plan-auth-02, plan-auth-03",
+}
+```
 
 **Input sources for plan tasks:**
 ```bash
@@ -875,20 +903,23 @@ antfarm carry --type plan --title "Auth" --spec "..." --issue 42
 **TUI visibility:**
 - Plan tasks show in Waiting: New / Building with worker type "planner"
 - Sub-tasks created by planner appear in Waiting: New immediately
+- Plan task in Recently Merged shows "spawned N tasks" badge
 - No separate "Planning" panel — planner is just another worker type
 
 **What the planner worker does NOT do:**
-- Does not approve its own plan — it IS the approval (operator approved by carrying the plan task)
+- Does not approve its own plan — operator approved by carrying the plan task
 - Does not modify code — it only creates tasks
-- Does not use nested `PlannerEngine._call_agent()` subprocess — the worker's own agent does the planning
+- Does not use nested `PlannerEngine._call_agent()` subprocess — the worker's own agent does the planning, but output is validated by shared PlannerEngine logic
 - Does not create review or test tasks — those are Soldier's responsibility after builders complete
+- Does not spawn recursive plan tasks — child tasks are always implementation tasks
 
 **Files to change:**
 - `antfarm/core/worker.py` — planner mode in `_launch_agent()` and `_process_one_task()`
+- `antfarm/core/planner.py` — refactor validation into reusable functions (already mostly there)
 - `antfarm/core/cli.py` — `--type plan` in carry, `planner` worker type
 - `antfarm/core/scheduler.py` — planner workers only forage plan tasks
-- `antfarm/core/tui.py` — plan task badge
-- `tests/` — planner worker flow tests
+- `antfarm/core/tui.py` — plan task badge, spawned count
+- `tests/` — planner worker flow tests, idempotent retry test, guardrail tests
 
 **Complexity:** M
 
