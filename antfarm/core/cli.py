@@ -305,8 +305,8 @@ def worker():
     "worker_type",
     default="builder",
     show_default=True,
-    type=click.Choice(["builder", "reviewer"]),
-    help="Worker type: builder (default) or reviewer.",
+    type=click.Choice(["builder", "reviewer", "planner"]),
+    help="Worker type: builder (default), reviewer, or planner.",
 )
 @click.option("--workspace-root", default=None, help="Root directory for worktrees.")
 @click.option("--node", required=True, help="Node ID this worker belongs to.")
@@ -335,6 +335,8 @@ def worker_start(
     caps = [c.strip() for c in capabilities.split(",")] if capabilities else []
     if worker_type == "reviewer" and "review" not in caps:
         caps.append("review")
+    if worker_type == "planner" and "plan" not in caps:
+        caps.append("plan")
 
     runtime = WorkerRuntime(
         colony_url=colony_url,
@@ -371,6 +373,8 @@ def worker_start(
 )
 @click.option("--file", "file_path", default=None, help="JSON file with task payload.")
 @click.option("--id", "task_id", default=None, help="Task ID (auto-generated if omitted).")
+@click.option("--type", "task_type", default=None, type=click.Choice(["plan"]),
+              help="Task type: 'plan' for planner decomposition.")
 @click.option("--issue", "issue_number", default=None, type=int,
               help="GitHub issue number to link.")
 @COLONY_URL_OPTION
@@ -385,6 +389,7 @@ def carry(
     complexity: str,
     file_path: str | None,
     task_id: str | None,
+    task_type: str | None,
     issue_number: int | None,
     colony_url: str,
     token: str | None,
@@ -408,6 +413,14 @@ def carry(
 
     if not task_id:
         task_id = f"task-{int(time.time() * 1000)}"
+
+    if task_type == "plan":
+        if not task_id.startswith("plan-"):
+            task_id = f"plan-{task_id}"
+        payload.setdefault("capabilities_required", [])
+        if "plan" not in payload["capabilities_required"]:
+            payload["capabilities_required"].append("plan")
+
     payload["id"] = task_id
 
     # Append issue reference to spec so workers include it in commits
