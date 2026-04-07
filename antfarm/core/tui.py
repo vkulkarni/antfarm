@@ -1,8 +1,8 @@
 """Rich TUI dashboard for Antfarm colony monitoring.
 
 Provides a live-updating terminal dashboard showing pipeline stages:
-Waiting (New + Rework), Building, Awaiting Review, Under Review,
-Merge Ready, Merge Blocked, Recently Merged, and Workers.
+Waiting (New + Rework), Planning, Building, Awaiting Review, Under Review,
+Merge Ready, Recently Merged, and Workers.
 
 Usage:
     tui = AntfarmTUI(colony_url="http://localhost:7433", token=None)
@@ -25,13 +25,13 @@ from rich.text import Text
 
 @dataclass
 class PipelineSnapshot:
+    planning: list[dict] = field(default_factory=list)
     building: list[dict] = field(default_factory=list)
     waiting_new: list[dict] = field(default_factory=list)
     waiting_rework: list[dict] = field(default_factory=list)
     awaiting_review: list[dict] = field(default_factory=list)
     under_review: list[dict] = field(default_factory=list)
     merge_ready: list[dict] = field(default_factory=list)
-    merge_blocked: list[dict] = field(default_factory=list)
     recently_merged: list[dict] = field(default_factory=list)
     review_tasks: dict = field(default_factory=dict)
 
@@ -85,6 +85,7 @@ class AntfarmTUI:
             Layout(name="header", size=10),
             Layout(name="workers", size=max(5, len(workers) + 5)),
             Layout(name="waiting", size=7),
+            Layout(name="planning", size=5),
             Layout(name="building", size=6),
             Layout(name="review", size=12),
             Layout(name="merge", size=6),
@@ -143,6 +144,13 @@ class AntfarmTUI:
             )
         )
 
+        layout["planning"].update(
+            Panel(
+                self._render_planning(snap.planning),
+                title=f"[bold magenta]Planning ({len(snap.planning)})[/bold magenta]",
+            )
+        )
+
         layout["building"].update(
             Panel(
                 self._render_building(snap.building),
@@ -170,20 +178,10 @@ class AntfarmTUI:
             )
         )
 
-        layout["merge"].split_row(
-            Layout(name="merge_ready"),
-            Layout(name="merge_blocked"),
-        )
-        layout["merge"]["merge_ready"].update(
+        layout["merge"].update(
             Panel(
                 self._render_merge_ready(snap.merge_ready),
                 title=f"[bold green]Merge Ready ({len(snap.merge_ready)})[/bold green]",
-            )
-        )
-        layout["merge"]["merge_blocked"].update(
-            Panel(
-                self._render_merge_blocked(snap.merge_blocked),
-                title=f"[bold red]Merge Blocked ({len(snap.merge_blocked)})[/bold red]",
             )
         )
 
@@ -220,9 +218,12 @@ class AntfarmTUI:
             is_review = task_id.startswith("review-")
 
             if status == "active":
-                if is_review:
+                caps_req = set(task.get("capabilities_required", []))
+                if is_review or "review" in caps_req:
                     snap.under_review.append(task)
                     snap.review_tasks[task_id] = task
+                elif "plan" in caps_req:
+                    snap.planning.append(task)
                 else:
                     snap.building.append(task)
 
@@ -243,10 +244,7 @@ class AntfarmTUI:
                     snap.review_tasks[task_id] = task
                 else:
                     verdict = self._get_verdict(task)
-                    block_reason = self._get_merge_block_reason(task)
-                    if block_reason:
-                        snap.merge_blocked.append(task)
-                    elif verdict and verdict.get("verdict") == "pass":
+                    if verdict and verdict.get("verdict") == "pass":
                         snap.merge_ready.append(task)
                     else:
                         snap.awaiting_review.append(task)
@@ -435,12 +433,12 @@ class AntfarmTUI:
 
         # Pipeline distribution bar
         counts = {
+            "plan": len(snap.planning),
             "building": len(snap.building),
             "waiting": len(snap.waiting_new) + len(snap.waiting_rework),
             "awaiting_review": len(snap.awaiting_review),
             "under_review": len(snap.under_review),
             "merge_ready": len(snap.merge_ready),
-            "merge_blocked": len(snap.merge_blocked),
             "merged": len(snap.recently_merged),
         }
         table.add_row("Pipeline", self._render_pipeline_bar(counts))
@@ -454,22 +452,22 @@ class AntfarmTUI:
             return Text("no tasks", style="dim")
 
         color_map = {
+            "plan": "magenta",
             "building": "yellow",
             "waiting": "blue",
             "awaiting_review": "magenta",
             "under_review": "cyan",
             "merge_ready": "green",
-            "merge_blocked": "red",
             "merged": "bright_green",
         }
 
         abbrev_map = {
+            "plan": "plan",
             "building": "bld",
             "waiting": "wt",
             "awaiting_review": "await",
             "under_review": "review",
             "merge_ready": "ready",
-            "merge_blocked": "blocked",
             "merged": "merged",
         }
 
@@ -490,6 +488,38 @@ class AntfarmTUI:
         text.append(" ".join(legend_parts), style="dim")
 
         return text
+
+    def _render_planning(self, tasks: list[dict], max_shown: int = 5) -> Table:
+        """Render planning (active tasks with plan capability) tasks."""
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
+        table.add_column("ID", max_width=20, no_wrap=True)
+        table.add_column("Title", max_width=30, no_wrap=True)
+        table.add_column("Worker", max_width=20, no_wrap=True)
+        table.add_column("Trail", max_width=35, no_wrap=True)
+        table.add_column("Time", max_width=8, no_wrap=True)
+
+        if not tasks:
+            table.add_row("[dim]--[/dim]", "[dim]no active plans[/dim]", "", "", "")
+            return table
+
+        shown = tasks[:max_shown]
+        for task in shown:
+            worker = self._get_worker_for_task(task)
+            trail = task.get("trail", [])
+            last_trail = trail[-1].get("message", "") if trail else ""
+            if len(last_trail) > 33:
+                last_trail = last_trail[:30] + "..."
+            elapsed = self._get_elapsed(task)
+            table.add_row(
+                Text(task.get("id", "")[:18], style="magenta"),
+                Text(task.get("title", "")[:28], style="magenta"),
+                Text(worker[:18] if worker else "\u2014", style="dim"),
+                Text(last_trail, style="dim"),
+                Text(elapsed, style="dim"),
+            )
+
+        self._add_overflow_hint(table, len(tasks), max_shown)
+        return table
 
     def _render_building(self, tasks: list[dict], max_shown: int = 5) -> Table:
         """Render building (active non-review) tasks."""
