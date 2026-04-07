@@ -371,6 +371,8 @@ def worker_start(
 )
 @click.option("--file", "file_path", default=None, help="JSON file with task payload.")
 @click.option("--id", "task_id", default=None, help="Task ID (auto-generated if omitted).")
+@click.option("--issue", "issue_number", default=None, type=int,
+              help="GitHub issue number to link.")
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def carry(
@@ -383,6 +385,7 @@ def carry(
     complexity: str,
     file_path: str | None,
     task_id: str | None,
+    issue_number: int | None,
     colony_url: str,
     token: str | None,
 ):
@@ -406,6 +409,11 @@ def carry(
     if not task_id:
         task_id = f"task-{int(time.time() * 1000)}"
     payload["id"] = task_id
+
+    # Append issue reference to spec so workers include it in commits
+    if issue_number:
+        payload.setdefault("spec", "")
+        payload["spec"] += f"\n\nGitHub Issue: #{issue_number}"
 
     result = _post(colony_url, "/tasks", payload, token=token)
     click.echo(f"Task created: {result}")

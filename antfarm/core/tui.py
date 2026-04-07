@@ -82,9 +82,8 @@ class AntfarmTUI:
 
         layout = Layout()
         layout.split_column(
-            Layout(name="banner", size=4),
-            Layout(name="summary", size=8),
-            Layout(name="workers", size=max(5, len(workers) + 4)),
+            Layout(name="header", size=10),
+            Layout(name="workers", size=max(5, len(workers) + 5)),
             Layout(name="waiting", size=7),
             Layout(name="building", size=6),
             Layout(name="review", size=12),
@@ -92,29 +91,36 @@ class AntfarmTUI:
             Layout(name="merged", size=6),
         )
 
+        # Header: banner (left) + colony summary (right) side by side
+        layout["header"].split_row(
+            Layout(name="banner", ratio=1),
+            Layout(name="summary", ratio=2),
+        )
+
         # Banner — ANTFARM in half-height block letters with ant icons
         line1 = "▄▀█ █▄░█ ▀█▀ █▀▀ █▀█ █▀█ █▀▄▀█"
         line2 = "█▀█ █░▀█ ░█░ █▀░ █▀█ █▀▄ █░▀░█"
         banner = Text()
         banner.append("\n")
-        banner.append("  🐜·· ", style="dim")
+        banner.append(" 🐜·· ", style="dim")
         banner.append(line1, style="bold dark_orange")
         banner.append(" ··🐜\n", style="dim")
-        banner.append("       ", style="dim")
+        banner.append("      ", style="dim")
         banner.append(line2, style="bold dark_orange")
-        layout["banner"].update(Panel(banner, style="green"))
+        layout["header"]["banner"].update(Panel(banner))
 
-        layout["summary"].update(
+        layout["header"]["summary"].update(
             Panel(
                 self._render_summary(status, tasks, workers, snap, soldier_status),
                 title="[bold blue]Antfarm Colony[/bold blue]",
             )
         )
 
+        worker_count = len(workers) + (1 if soldier_status != "disabled" else 0)
         layout["workers"].update(
             Panel(
-                self._render_workers(workers),
-                title=f"[bold cyan]Workers ({len(workers)})[/bold cyan]",
+                self._render_workers(workers, soldier_status),
+                title=f"[bold cyan]Workers ({worker_count})[/bold cyan]",
             )
         )
 
@@ -707,8 +713,8 @@ class AntfarmTUI:
             return "reviewer"
         return "builder"
 
-    def _render_workers(self, workers: list) -> Table:
-        """Render worker list with type column."""
+    def _render_workers(self, workers: list, soldier_status: str = "unknown") -> Table:
+        """Render worker list with type column, including Soldier."""
         table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
         table.add_column("Worker", max_width=22, no_wrap=True)
         table.add_column("Node", max_width=15, no_wrap=True)
@@ -716,7 +722,18 @@ class AntfarmTUI:
         table.add_column("Type", max_width=10, no_wrap=True)
         table.add_column("Rate Limit", max_width=20, no_wrap=True)
 
-        if not workers:
+        # Soldier row (virtual — it's a thread, not a registered worker)
+        if soldier_status != "disabled":
+            s_style = "green" if soldier_status == "running" else "yellow"
+            table.add_row(
+                Text("soldier", style="bold"),
+                Text("colony", style="dim"),
+                Text(soldier_status, style=s_style),
+                Text("soldier", style="bold"),
+                Text("—", style="dim"),
+            )
+
+        if not workers and soldier_status == "disabled":
             table.add_row("[dim]\u2014[/dim]", "[dim]no workers[/dim]", "", "", "")
             return table
 

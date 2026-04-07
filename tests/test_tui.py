@@ -555,7 +555,7 @@ def test_render_workers_type_column_builder():
     tui = _make_tui()
     workers = [{"worker_id": "n1/w1", "status": "idle", "node_id": "n1",
                 "agent_type": "claude-code", "rate_limited": False}]
-    result = tui._render_workers(workers)
+    result = tui._render_workers(workers, soldier_status="disabled")
     assert isinstance(result, Table)
     assert result.row_count == 1
 
@@ -564,9 +564,16 @@ def test_render_workers_type_column_reviewer():
     tui = _make_tui()
     workers = [{"worker_id": "n1/r1", "status": "busy", "node_id": "n1",
                 "agent_type": "claude-code-review", "rate_limited": False}]
-    result = tui._render_workers(workers)
+    result = tui._render_workers(workers, soldier_status="disabled")
     assert isinstance(result, Table)
     assert result.row_count == 1
+
+
+def test_render_workers_includes_soldier():
+    tui = _make_tui()
+    result = tui._render_workers([], soldier_status="running")
+    assert isinstance(result, Table)
+    assert result.row_count == 1  # soldier row only
 
 
 def test_get_worker_type_builder():

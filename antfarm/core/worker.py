@@ -16,6 +16,7 @@ import json as _json
 import logging
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -232,6 +233,9 @@ class WorkerRuntime:
         self.capabilities = capabilities or []
         self._token = token
         self._last_task_id: str | None = None
+        # Reviewer workers poll longer before exiting (wait for review tasks)
+        is_reviewer = "review" in (capabilities or [])
+        self._max_idle_polls = 10 if is_reviewer else 0  # 10 * 30s = 5min
 
         self.colony = ColonyClient(colony_url, client=client, token=token)
         self.workspace_mgr = WorkspaceManager(workspace_root, repo_path, integration_branch)
@@ -263,11 +267,20 @@ class WorkerRuntime:
         logger.info("worker registered worker_id=%s", self.worker_id)
 
         try:
+            idle_polls = 0
+            max_idle_polls = self._max_idle_polls  # 0 = exit immediately, >0 = poll
             while True:
                 had_task = self._process_one_task()
                 if not had_task:
-                    logger.info("queue empty, worker exiting worker_id=%s", self.worker_id)
-                    break
+                    if idle_polls >= max_idle_polls:
+                        logger.info("queue empty, worker exiting worker_id=%s", self.worker_id)
+                        break
+                    idle_polls += 1
+                    logger.debug("queue empty, polling (%d/%d) worker_id=%s",
+                                 idle_polls, max_idle_polls, self.worker_id)
+                    time.sleep(30)
+                else:
+                    idle_polls = 0  # reset on successful forage
         finally:
             if self._last_task_id:
                 with contextlib.suppress(Exception):
