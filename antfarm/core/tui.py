@@ -82,6 +82,7 @@ class AntfarmTUI:
 
         layout = Layout()
         layout.split_column(
+            Layout(name="banner", size=4),
             Layout(name="summary", size=8),
             Layout(name="workers", size=max(5, len(workers) + 4)),
             Layout(name="waiting", size=7),
@@ -90,6 +91,18 @@ class AntfarmTUI:
             Layout(name="merge", size=6),
             Layout(name="merged", size=6),
         )
+
+        # Banner — ANTFARM in half-height block letters with ant icons
+        line1 = "▄▀█ █▄░█ ▀█▀ █▀▀ █▀█ █▀█ █▀▄▀█"
+        line2 = "█▀█ █░▀█ ░█░ █▀░ █▀█ █▀▄ █░▀░█"
+        banner = Text()
+        banner.append("\n")
+        banner.append("  🐜·· ", style="dim")
+        banner.append(line1, style="bold dark_orange")
+        banner.append(" ··🐜\n", style="dim")
+        banner.append("       ", style="dim")
+        banner.append(line2, style="bold dark_orange")
+        layout["banner"].update(Panel(banner, style="green"))
 
         layout["summary"].update(
             Panel(
