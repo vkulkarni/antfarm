@@ -88,7 +88,7 @@ class AntfarmTUI:
             Layout(name="building", size=6),
             Layout(name="review", size=12),
             Layout(name="merge", size=6),
-            Layout(name="merged", size=4),
+            Layout(name="merged", size=6),
         )
 
         layout["summary"].update(
@@ -445,11 +445,11 @@ class AntfarmTUI:
         abbrev_map = {
             "building": "bld",
             "waiting": "wt",
-            "awaiting_review": "rev",
-            "under_review": "urev",
-            "merge_ready": "mrdy",
-            "merge_blocked": "mblk",
-            "merged": "mrg",
+            "awaiting_review": "await",
+            "under_review": "review",
+            "merge_ready": "ready",
+            "merge_blocked": "blocked",
+            "merged": "merged",
         }
 
         text = Text()
