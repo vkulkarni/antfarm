@@ -137,11 +137,15 @@ def _start_doctor_thread(backend: TaskBackend, config: dict, interval: float = 3
 
 **CLI flag:** `antfarm colony --no-doctor` to disable the daemon (like existing `--no-soldier`).
 
+**Smart worktree cleanup:** Doctor daemon also cleans up orphaned worktrees — worktrees under `workspace_root` with no active task or worker. If the worktree has no git-tracked changes beyond the base branch, it is auto-deleted. If it has uncommitted or unpushed changes, it is kept for debugging. (Inspired by Claude Code's worktree cleanup: delete if no changes, keep if work exists.)
+
 **Tests:**
 1. Doctor thread starts with colony and runs on interval
 2. Stale worker auto-deregistered after heartbeat TTL
 3. Stale active task auto-requeued to `ready`
 4. `--no-doctor` flag prevents daemon from starting
+5. Orphan worktree with no changes → auto-deleted
+6. Orphan worktree with uncommitted changes → kept, reported as finding
 
 ### 3. Cascade Invalidation
 
@@ -841,7 +845,23 @@ def _start_worker_on_node(self, node: dict, role: str) -> None:
     })
 ```
 
-### 3. GitHub Issue Sync
+### 3. Prompt Cache Sharing for Parallel Builders
+
+**Optimization:** When the autoscaler spawns multiple builders for the same mission, they share identical project context (codebase structure, conventions, CLAUDE.md, repo facts). Only the task-specific spec differs.
+
+Inspired by Claude Code's fork model (which shares KV cache across parallel agents by making API request prefixes byte-identical), Antfarm can reduce token cost by:
+
+1. Building a shared **context prefix** per mission: repo facts from memory store, project conventions, integration branch state
+2. Passing this prefix identically to all builder agents in the same mission
+3. Only the task-specific section (title, spec, workspace path) varies per builder
+
+This is agent-specific — only works with agents that support prompt caching (Claude, potentially others). For agents without caching support, this is a no-op.
+
+**Implementation:** The autoscaler or Queen generates a `mission_context` blob once per build phase. Worker runtime prepends it to the agent prompt. The blob is stored in `.antfarm/missions/{mission_id}_context.md`.
+
+**Expected savings:** For a mission with 8 builders, ~7x reduction in input token cost for shared context (cached tokens are 10% of input cost on Claude).
+
+### 4. GitHub Issue Sync
 
 **Automatic issue creation:** When a mission creates child tasks, create a GitHub issue for each.
 
@@ -1409,11 +1429,30 @@ Planner decomposes spec into 6 tasks but misses a critical dependency. Reviewer 
 
 ---
 
+## Design Influences
+
+Patterns validated or inspired by Claude Code's agent team architecture (source analysis, April 2026):
+
+| Pattern | Claude Code | Antfarm | Status |
+|---------|-------------|---------|--------|
+| Filesystem as coordination layer | `~/.claude/teams/`, `~/.claude/tasks/` JSON files | `.antfarm/tasks/{ready,active,done}/` JSON files | Already doing this |
+| Atomic task claiming | File locking on task JSON | `os.rename()` from `ready/` to `active/` (POSIX atomic) | Already doing this |
+| Dependency-based unblocking | `blockedBy` array, auto-unblock on completion | `depends_on` list, scheduler filters on `done_task_ids` | Already doing this |
+| Deterministic quality gate | `TaskCompleted` hook rejects with exit code 2 | Soldier merge gate (test + review before merge) | Already doing this |
+| Worktree isolation per task | `isolation: "worktree"` on Agent spawn | `workspace.py` creates per-attempt worktrees | Already doing this |
+| Smart worktree cleanup | Delete if no git-tracked changes, keep if work exists | Added to doctor daemon in v0.5.9 | **New** |
+| Prompt cache sharing | Fork model: byte-identical prefixes share KV cache | Mission context blob for parallel builders | **New (v0.6.1)** |
+| Pre-harvest validation hooks | `TaskCompleted` hook can reject | Not yet — could add pre-harvest hooks for lint/test | **Future consideration** |
+
+**Key architectural difference:** Claude Code's agents are in-process tool calls within a single harness. Antfarm's workers are external processes communicating over HTTP. This makes Antfarm agent-agnostic (works with Claude, Codex, Aider, or a bash script) at the cost of tighter integration. The right tradeoff for a multi-machine, multi-agent orchestrator.
+
+---
+
 ## Explicitly Deferred
 
 - **Multi-node autoscaling** — v0.6.1
 - **GitHub issue sync** — v0.6.1
-- **Claude Code plugin** — v0.7 (see SPEC_v07.md)
+- **Claude Code plugin** — v0.6.2 (see SPEC_v06_plugin.md)
 - **AI-assisted conflict resolution** in Soldier — future
 - **Vector DB / semantic memory** — out of scope
 - **Web dashboard** — out of scope
