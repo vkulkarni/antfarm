@@ -708,6 +708,7 @@ def get_app(
         """Return colony status summary."""
         result = _backend.status()
         result["soldier"] = _soldier_status
+        result["doctor"] = _doctor_status
         return result
 
     @app.get("/status/full", status_code=200)
@@ -724,6 +725,7 @@ def get_app(
             "tasks": _backend.list_tasks(),
             "workers": _backend.list_workers(),
             "soldier": _soldier_status,
+            "doctor": _doctor_status,
         }
 
     # ------------------------------------------------------------------

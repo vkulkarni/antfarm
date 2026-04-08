@@ -565,6 +565,11 @@ def check_orphan_workspaces(config: dict, fix: bool = False) -> list[Finding]:
     if not ws_path.exists():
         return findings
 
+    # Derive repo root from data_dir (parent of .antfarm/)
+    data_dir = config.get("data_dir", "")
+    data_path = Path(data_dir)
+    repo_path = str(data_path.parent) if data_path.name == ".antfarm" else str(data_path)
+
     # Worktree dirs are any subdirectories under workspace_root
     for entry in ws_path.iterdir():
         if entry.is_dir():
@@ -574,6 +579,7 @@ def check_orphan_workspaces(config: dict, fix: bool = False) -> list[Finding]:
                     subprocess.run(
                         ["git", "worktree", "remove", str(entry)],
                         capture_output=True, text=True, check=True,
+                        cwd=repo_path,
                     )
                     findings.append(Finding(
                         severity="info",
