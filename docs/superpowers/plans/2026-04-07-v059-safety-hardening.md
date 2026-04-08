@@ -10,6 +10,16 @@
 
 **Spec:** `docs/SPEC_v06.md` (frozen), section "v0.5.9 — Safety Hardening"
 
+**Design decisions (resolved before implementation):**
+
+1. **Global `max_attempts` propagation:** The colony server reads `max_attempts` from `.antfarm/config.json` at startup (default: 3). This value is passed to Soldier and the kickback API default. Per-task `max_attempts` field overrides it. The hardcoded `3` is only the fallback when no config exists.
+
+2. **Unblock does NOT reset attempt counter.** `unblock` changes status from `blocked → ready` but attempt history is append-only. The operator must understand that unblocking a task that already hit max_attempts will just get blocked again on the next kickback. To truly reset, the operator should create a new task or manually edit the task JSON. This is the safe, simple choice.
+
+3. **Smart worktree cleanup is default-safe.** If we cannot confidently prove the worktree is clean (any git command fails, no upstream configured, etc.), we keep the worktree. Only auto-delete when both checks succeed AND show nothing.
+
+4. **Cascade invalidation uses a visited set** to guard against malformed cyclic deps and prevent repeated traversal.
+
 ---
 
 ### Task 1: Max-Attempt Enforcement — Tests
@@ -241,62 +251,66 @@ Prevents infinite kickback loops during unattended operation."
 
 ---
 
-### Task 3: Update Soldier to Pass max_attempts
+### Task 3: Propagate max_attempts from Config Through API
 
 **Files:**
-- Modify: `antfarm/core/soldier.py:85-108` (kickback call sites)
+- Modify: `antfarm/core/serve.py` (load config, update endpoint)
 - Modify: `antfarm/core/colony_client.py` (kickback method signature)
-- Modify: `antfarm/core/serve.py` (kickback endpoint)
+- Modify: `antfarm/core/soldier.py` (Soldier init, _BackendAdapter)
 
-- [ ] **Step 1: Check how soldier calls kickback**
+- [ ] **Step 1: Load max_attempts from config in get_app()**
 
-Soldier calls `self.colony.kickback(task_id, reason)` at lines 90, 108, 225, 273. These go through `ColonyClient.kickback()` → `POST /tasks/{id}/kickback` → `backend.kickback()`.
+In `serve.py`, after the backend is created in `get_app()`, load the global default:
 
-The `max_attempts` default (3) in `file.py:kickback()` will take effect automatically for all existing call sites without changes. But we need the HTTP endpoint to support passing `max_attempts` so the config can be propagated.
+```python
+# After backend is created, load colony config
+_max_attempts = 3  # module-level default
+config_path = os.path.join(data_dir, "config.json")
+if os.path.exists(config_path):
+    with open(config_path) as f:
+        colony_config = json.load(f)
+    _max_attempts = colony_config.get("max_attempts", 3)
+```
 
-- [ ] **Step 2: Update KickbackRequest in serve.py**
-
-Find the `KickbackRequest` pydantic model in `serve.py` and add `max_attempts`:
+- [ ] **Step 2: Update KickbackRequest to use config default**
 
 ```python
 class KickbackRequest(BaseModel):
     reason: str
-    max_attempts: int = 3
+    max_attempts: int | None = None  # None = use colony default
 ```
 
-- [ ] **Step 3: Update kickback endpoint to pass max_attempts**
-
-In `serve.py`, update the `kickback_task` endpoint to pass `max_attempts`:
+- [ ] **Step 3: Update kickback endpoint to use config default**
 
 ```python
 @app.post("/tasks/{task_id}/kickback", status_code=200)
 def kickback_task(task_id: str, req: KickbackRequest):
     """Return a task to ready state with the given reason."""
+    effective_max = req.max_attempts if req.max_attempts is not None else _max_attempts
     try:
-        _backend.kickback(task_id, req.reason, max_attempts=req.max_attempts)
+        _backend.kickback(task_id, req.reason, max_attempts=effective_max)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     _emit_event("kickback", task_id, req.reason)
     return {"ok": True}
 ```
 
-- [ ] **Step 4: Update ColonyClient.kickback() to accept max_attempts**
-
-In `antfarm/core/colony_client.py`, find the `kickback` method and add `max_attempts`:
+- [ ] **Step 4: Update ColonyClient.kickback()**
 
 ```python
-def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
+def kickback(self, task_id: str, reason: str, max_attempts: int | None = None) -> None:
+    payload = {"reason": reason}
+    if max_attempts is not None:
+        payload["max_attempts"] = max_attempts
     r = self._client.post(
         f"{self.base_url}/tasks/{task_id}/kickback",
-        json={"reason": reason, "max_attempts": max_attempts},
+        json=payload,
         headers=self._headers(),
     )
     r.raise_for_status()
 ```
 
 - [ ] **Step 5: Update _BackendAdapter.kickback() in soldier.py**
-
-In `soldier.py`, the `_BackendAdapter` class wraps the backend directly. Update its `kickback` method:
 
 ```python
 def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
@@ -306,7 +320,7 @@ def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
 - [ ] **Step 6: Run full test suite**
 
 Run: `pytest tests/ -x -q`
-Expected: All tests pass (existing kickback tests use default max_attempts=3 which is higher than their attempt count)
+Expected: All tests pass
 
 - [ ] **Step 7: Run linter**
 
@@ -317,10 +331,11 @@ Expected: Clean
 
 ```bash
 git add antfarm/core/soldier.py antfarm/core/colony_client.py antfarm/core/serve.py
-git commit -m "feat(server): propagate max_attempts through kickback API
+git commit -m "feat(server): propagate max_attempts from colony config through API
 
-KickbackRequest now accepts max_attempts (default 3). Propagated
-through ColonyClient and _BackendAdapter to FileBackend.kickback()."
+Colony loads max_attempts from .antfarm/config.json (default 3).
+KickbackRequest uses colony default when not explicitly set.
+Per-task max_attempts field still overrides everything."
 ```
 
 ---
@@ -407,7 +422,16 @@ def _start_doctor_thread(
 
     from antfarm.core.doctor import run_doctor
 
-    config = {"data_dir": data_dir, "worker_ttl": 300, "guard_ttl": 300}
+    # Load doctor config from colony config, with sensible defaults
+    doctor_config = {"data_dir": data_dir, "worker_ttl": 300, "guard_ttl": 300}
+    config_path = os.path.join(data_dir, "config.json")
+    if os.path.exists(config_path):
+        import json as _json
+        with open(config_path) as f:
+            colony_cfg = _json.load(f)
+        doctor_config["worker_ttl"] = colony_cfg.get("worker_ttl", 300)
+        doctor_config["guard_ttl"] = colony_cfg.get("guard_ttl", 300)
+        interval = colony_cfg.get("doctor_interval", interval)
 
     def _doctor_loop():
         global _doctor_status
@@ -416,7 +440,7 @@ def _start_doctor_thread(
             while True:
                 time.sleep(interval)
                 try:
-                    findings = run_doctor(backend, config, fix=True)
+                    findings = run_doctor(backend, doctor_config, fix=True)
                     for f in findings:
                         if f.severity == "error":
                             logger.warning("doctor: %s", f.message)
@@ -557,8 +581,12 @@ Expected: Check behavior — test may pass if current code already detects orpha
 In `antfarm/core/doctor.py`, update `check_orphan_workspaces` to add the smart cleanup logic when `fix=True`. The key change: if the worktree has no uncommitted or unpushed changes, delete it.
 
 ```python
-def _worktree_has_changes(path: str) -> bool:
-    """Check if a worktree has uncommitted or unpushed changes."""
+def _worktree_is_clean(path: str) -> bool:
+    """Check if a worktree is provably clean (safe to delete).
+
+    Returns True ONLY when both checks succeed AND show no changes.
+    Any failure, missing upstream, or ambiguous state → returns False (keep it).
+    """
     try:
         # Check for uncommitted changes
         status = subprocess.run(
@@ -566,24 +594,27 @@ def _worktree_has_changes(path: str) -> bool:
             capture_output=True, text=True, check=True,
         )
         if status.stdout.strip():
-            return True
+            return False  # has uncommitted changes
 
-        # Check for unpushed commits
+        # Check for unpushed commits — requires upstream to be configured
         log = subprocess.run(
             ["git", "-C", path, "log", "@{u}..", "--oneline"],
             capture_output=True, text=True, check=False,
         )
-        if log.returncode == 0 and log.stdout.strip():
-            return True
+        if log.returncode != 0:
+            return False  # no upstream configured or git error — keep it
+        if log.stdout.strip():
+            return False  # has unpushed commits
 
-        return False
-    except (subprocess.CalledProcessError, Exception):
-        return True  # If we can't check, assume it has changes (safe default)
+        return True  # provably clean
+    except Exception:
+        return False  # any error → keep it (safe default)
 ```
 
 Then in the orphan cleanup section, when `fix=True`:
-- If worktree has no changes → `git worktree remove {path}` and report `fixed=True`
-- If worktree has changes → report finding but `fixed=False`, message says "kept: has uncommitted changes"
+- If `_worktree_is_clean(path)` returns True → `git worktree remove {path}` and report `fixed=True`
+- If `_worktree_is_clean(path)` returns False → report finding but `fixed=False`, message says "kept: has changes or could not verify clean state"
+- Key safety rule: only delete when we can **prove** clean. Any ambiguity → keep.
 
 - [ ] **Step 5: Run tests**
 
@@ -771,17 +802,29 @@ git commit -m "test(soldier): add cascade invalidation tests"
 After the `attempt_merge` method in `soldier.py`, add:
 
 ```python
-def kickback_with_cascade(self, task_id: str, reason: str) -> None:
+def kickback_with_cascade(
+    self, task_id: str, reason: str, _visited: set[str] | None = None,
+) -> None:
     """Kick back a task and recursively cascade to downstream done tasks.
 
     Only invalidates non-merged descendants in done status.
     Does NOT interrupt active tasks — let them finish and the merge
     gate or next cascade will catch staleness.
+    Uses a visited set to guard against cyclic deps and repeated traversal.
     """
+    if _visited is None:
+        _visited = set()
+    if task_id in _visited:
+        return  # already processed — prevent cycles
+    _visited.add(task_id)
+
     self.colony.kickback(task_id, reason)
 
     all_tasks = self.colony.list_tasks()
     for task in all_tasks:
+        tid = task.get("id", "")
+        if tid in _visited:
+            continue
         # Only cascade to done, non-merged tasks
         if task.get("status") != "done":
             continue
@@ -791,7 +834,7 @@ def kickback_with_cascade(self, task_id: str, reason: str) -> None:
         deps = task.get("depends_on") or []
         if task_id in deps:
             cascade_reason = f"cascade: upstream {task_id} was kicked back"
-            self.kickback_with_cascade(task["id"], cascade_reason)
+            self.kickback_with_cascade(tid, cascade_reason, _visited=_visited)
 ```
 
 - [ ] **Step 2: Update run() to use kickback_with_cascade**
