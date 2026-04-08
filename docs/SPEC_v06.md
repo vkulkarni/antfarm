@@ -246,6 +246,8 @@ class PlanArtifact:
 
 **`task_ids` contains ALL tasks in the mission:** implementation tasks, review tasks, the plan-review task, and re-plan tasks. Derived subsets (implementation-only, review-only) are computed dynamically by filtering on task ID prefix (`review-*`) and `capabilities_required` (`plan`, `review`).
 
+**v0.6.0 convention (not a permanent classification model):** Task kind is inferred from `capabilities_required` (empty = implementation, `["plan"]` = planner, `["review"]` = reviewer) and ID prefix (`review-*`). Future versions may introduce an explicit `task_kind` field if more task types are added.
+
 **Terminal state semantics:**
 - `COMPLETE` — best-effort terminal. All tasks are either merged or blocked. The morning digest tells you what succeeded and what needs human attention. This is the normal end state for overnight runs.
 - `BLOCKED` — forward progress has stopped for a durable reason (task hit max attempts, all remaining tasks depend on a blocked task). An operator can unblock a task to resume. Stays blocked indefinitely by default (`blocked_timeout_action = "wait"`). If configured with `blocked_timeout_action = "fail"`, transitions to `FAILED` after `blocked_timeout_minutes` (default: 120) with no operator action.
@@ -308,7 +310,7 @@ This is a behavioral change for mission-mode plans. Non-mission plans (direct `a
                     +-----------+
 ```
 
-**Terminal states:** `COMPLETE`, `FAILED`, `CANCELLED`. A mission in `BLOCKED` can transition to `BUILDING` if an operator unblocks a task, or to `FAILED` if the stall threshold is exceeded with no progress.
+**Terminal states:** `COMPLETE`, `FAILED`, `CANCELLED`. `BLOCKED` is NOT terminal — an operator can unblock a task to resume (`BLOCKED` → `BUILDING`). If configured with `blocked_timeout_action = "fail"`, a blocked mission transitions to `FAILED` after `blocked_timeout_minutes`.
 
 ### 2. Queen Controller
 
@@ -373,7 +375,7 @@ def _adaptive_interval(self, missions: list[dict]) -> float:
 | Detect stalls | Compare last progress timestamp against threshold | Does not fix stalls |
 | Detect completion | All tasks merged or blocked → mark complete | Does not merge |
 | Generate report | Build `MissionReport` from task data | Does not interpret results |
-| Signal autoscaler | Set `mission.desired_parallelism` | Does not start/stop workers |
+| Signal autoscaler | No-op in v0.6.0: autoscaler derives state from tasks/workers directly | Does not start/stop workers |
 | Mark blocked | When task hits max attempts, update `blocked_task_ids` | Does not unblock |
 
 ### 3. Mission Report (Morning Digest)
@@ -385,7 +387,7 @@ def _adaptive_interval(self, missions: list[dict]) -> float:
 class MissionReport:
     mission_id: str
     spec_summary: str              # first 200 chars of spec
-    status: MissionStatus           # terminal status: COMPLETE, BLOCKED, or FAILED
+    status: MissionStatus           # mission status at report time (COMPLETE, BLOCKED, or FAILED)
     duration_minutes: float
 
     # Task counts
@@ -1060,16 +1062,18 @@ antfarm mission --spec spec.md
 |    -> mission status: COMPLETE                 |
 |    -> generate MissionReport                   |
 |                                                |
-|  Some tasks blocked, rest merged?              |
+|  All tasks either merged or blocked?           |
 |    -> mission status: COMPLETE (best-effort)   |
-|    -> report shows blocked items               |
+|    -> report shows merged + blocked items      |
+|                                                |
+|  Some tasks blocked, others still progressing? |
+|    -> mission stays BUILDING                   |
+|    -> Queen tracks blocked_task_ids            |
 |                                                |
 |  No progress for stall_threshold?              |
-|    -> log warning                              |
-|    -> if 2x threshold: mission -> BLOCKED      |
-|                                                |
-|  All remaining tasks blocked?                  |
-|    -> mission status: FAILED                   |
+|    -> mission status: BLOCKED                  |
+|    -> stays blocked until operator intervenes  |
+|    -> (or auto-fails if configured)            |
 +---------------------+-------------------------+
                       |
                       v
@@ -1185,16 +1189,19 @@ antfarm mission --spec spec.md
        |                |
        v                |
   +-----------+   +---------+
-  | COMPLETE  |   | BLOCKED |---no forward progress
+  | COMPLETE  |   | BLOCKED |---no forward progress, operator can resume
   +-----------+   +----+----+
                        |
-                  stall timeout
-                  or all blocked
+                  operator unblocks task
+                  -> back to BUILDING
+                       |
+                  (if blocked_timeout_action="fail"
+                   and timeout exceeded)
                        |
                        v
                   +---------+
-                  | FAILED  |
-                  +---------+
+                  | FAILED  |---unrecoverable (system error, plan
+                  +---------+   rejected twice, or configured timeout)
 
                   +-----------+
                   | CANCELLED |---operator: antfarm mission cancel
@@ -1331,11 +1338,12 @@ Task re-forages with fresh attempt ✓
 
 ```
 10 tasks, 8 merged, 1 blocked, 1 waiting on blocked (dep)
-Queen: no more progress possible
-Mission → complete (best-effort) or blocked (depends on config)
+Queen: no more forward progress possible
+Mission → COMPLETE (best-effort default)
 Report generated:
   "8/10 merged. 1 blocked (task-auth-03: test failure, 3 attempts).
-   1 waiting (task-api-05: depends on blocked task-auth-03)."
+   1 waiting (task-api-05: depends on blocked task-auth-03).
+   Human attention needed for task-auth-03."
 ```
 
 ### Mission stall detection
@@ -1344,8 +1352,9 @@ Report generated:
 Mission in "building" state. No task progress for 30 minutes.
 Queen detects: last_progress_at + stall_threshold < now
 Queen logs warning in mission trail
-If stall persists for 2x threshold: mission → blocked
-Report: "mission stalled — no progress for 60 minutes. Check worker logs."
+Mission → BLOCKED (no forward progress)
+Stays blocked until operator intervenes or timeout configured.
+Report: "mission stalled — no progress for 30 minutes. Check worker logs."
 ```
 
 ---
