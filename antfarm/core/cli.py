@@ -124,6 +124,12 @@ def version():
     help="Disable the built-in Soldier merge engine.",
 )
 @click.option(
+    "--no-doctor",
+    is_flag=True,
+    default=False,
+    help="Disable the built-in Doctor health-check daemon.",
+)
+@click.option(
     "--backend",
     default="file",
     show_default=True,
@@ -150,6 +156,7 @@ def colony(
     backup_dest: str | None,
     backup_interval: int,
     no_soldier: bool,
+    no_doctor: bool,
     backend: str,
     github_repo: str | None,
     github_token: str | None,
@@ -173,6 +180,7 @@ def colony(
         data_dir=data_dir,
         auth_secret=auth_token,
         enable_soldier=not no_soldier,
+        enable_doctor=not no_doctor,
     )
     if auth_token:
         from antfarm.core.auth import generate_token

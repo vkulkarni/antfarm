@@ -352,3 +352,97 @@ def test_filesystem_check_creates_dirs(setup):
     assert all(f.fixed for f in fs_findings)
     # Directory should be recreated
     assert (data_dir / "guards").exists()
+
+
+# ---------------------------------------------------------------------------
+# 15. test_worktree_is_clean helper
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_worktree_no_changes_auto_deleted(setup, tmp_path):
+    """Orphan worktree with no git-tracked changes is detected."""
+    backend, config = setup
+    ws_root = tmp_path / "workspaces"
+    ws_root.mkdir(parents=True)
+    orphan = ws_root / "task-orphan-att-001"
+    orphan.mkdir()
+
+    config["workspace_root"] = str(ws_root)
+
+    findings = run_doctor(backend, config, fix=False)
+    orphan_findings = [f for f in findings if f.check == "orphan_workspace"]
+    assert any(str(orphan) in f.message or "task-orphan" in f.message for f in orphan_findings)
+
+
+def test_worktree_is_clean_no_upstream_returns_false(tmp_path):
+    """A worktree with no upstream configured returns False (safe default)."""
+    import subprocess
+
+    # Create a real git repo and worktree
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True
+    )
+    (repo / "file.txt").write_text("init")
+    subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True
+    )
+
+    # Create a worktree (no remote/upstream)
+    wt_path = tmp_path / "workspaces" / "task-orphan-att-001"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feat/orphan", str(wt_path)],
+        cwd=str(repo), capture_output=True, check=True,
+    )
+    assert wt_path.exists()
+
+    from antfarm.core.doctor import _worktree_is_clean
+
+    # No upstream -> not provably clean -> returns False (safe default)
+    assert _worktree_is_clean(str(wt_path)) is False
+
+
+def test_worktree_is_clean_dirty_returns_false(tmp_path):
+    """A worktree with uncommitted changes returns False."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True
+    )
+    (repo / "file.txt").write_text("init")
+    subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True
+    )
+
+    wt_path = tmp_path / "workspaces" / "task-dirty"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feat/dirty", str(wt_path)],
+        cwd=str(repo), capture_output=True, check=True,
+    )
+
+    # Create uncommitted changes
+    (wt_path / "new_file.txt").write_text("dirty")
+
+    from antfarm.core.doctor import _worktree_is_clean
+
+    assert _worktree_is_clean(str(wt_path)) is False
+
+
+def test_worktree_is_clean_nonexistent_returns_false():
+    """A non-existent path returns False."""
+    from antfarm.core.doctor import _worktree_is_clean
+
+    assert _worktree_is_clean("/nonexistent/path") is False

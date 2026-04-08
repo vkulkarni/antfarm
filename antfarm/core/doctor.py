@@ -52,7 +52,7 @@ def run_doctor(backend, config: dict, fix: bool = False) -> list[Finding]:
     findings.extend(check_stale_tasks(backend, config, fix))
     findings.extend(check_stale_guards(backend, config, fix))
     findings.extend(check_workspace_conflicts(backend))
-    findings.extend(check_orphan_workspaces(config))
+    findings.extend(check_orphan_workspaces(config, fix))
     findings.extend(check_state_consistency(backend))
     findings.extend(check_dependency_cycles(backend))
 
@@ -515,13 +515,43 @@ def check_workspace_conflicts(backend) -> list[Finding]:
 # Check 8: Orphan workspaces
 # ---------------------------------------------------------------------------
 
-def check_orphan_workspaces(config: dict) -> list[Finding]:
+def _worktree_is_clean(path: str) -> bool:
+    """Check if a worktree is provably clean (safe to delete).
+
+    Returns True ONLY when both checks succeed AND show no changes.
+    Any failure, missing upstream, or ambiguous state returns False (keep it).
+    """
+    try:
+        # Check for uncommitted changes
+        status = subprocess.run(
+            ["git", "-C", path, "status", "--porcelain"],
+            capture_output=True, text=True, check=True,
+        )
+        if status.stdout.strip():
+            return False  # has uncommitted changes
+
+        # Check for unpushed commits — requires upstream to be configured
+        log = subprocess.run(
+            ["git", "-C", path, "log", "@{u}..", "--oneline"],
+            capture_output=True, text=True, check=False,
+        )
+        if log.returncode != 0:
+            return False  # no upstream configured or git error — keep it
+        return not log.stdout.strip()  # clean only if no unpushed commits
+    except Exception:
+        return False  # any error → keep it (safe default)
+
+
+def check_orphan_workspaces(config: dict, fix: bool = False) -> list[Finding]:
     """List worktree dirs under workspace_root if configured.
 
-    Report only — no auto-delete in v0.1.
+    When fix=True, provably clean worktrees are auto-deleted via
+    ``git worktree remove``. Worktrees with uncommitted or unpushed
+    changes are kept for debugging.
 
     Args:
         config: Doctor config dict.
+        fix: If True, delete clean orphan worktrees.
 
     Returns:
         List of findings.
@@ -538,12 +568,50 @@ def check_orphan_workspaces(config: dict) -> list[Finding]:
     # Worktree dirs are any subdirectories under workspace_root
     for entry in ws_path.iterdir():
         if entry.is_dir():
-            findings.append(Finding(
-                severity="info",
-                check="orphan_workspace",
-                message=f"Worktree directory found with no associated active task: {entry}",
-                auto_fixable=False,
-            ))
+            if fix and _worktree_is_clean(str(entry)):
+                # Safe to delete — provably clean
+                try:
+                    subprocess.run(
+                        ["git", "worktree", "remove", str(entry)],
+                        capture_output=True, text=True, check=True,
+                    )
+                    findings.append(Finding(
+                        severity="info",
+                        check="orphan_workspace",
+                        message=f"Orphan worktree auto-deleted (clean): {entry}",
+                        auto_fixable=True,
+                        fixed=True,
+                    ))
+                except subprocess.CalledProcessError:
+                    findings.append(Finding(
+                        severity="info",
+                        check="orphan_workspace",
+                        message=(
+                            f"Worktree directory found with no associated active task: "
+                            f"{entry} (removal failed)"
+                        ),
+                        auto_fixable=False,
+                    ))
+            elif fix:
+                findings.append(Finding(
+                    severity="info",
+                    check="orphan_workspace",
+                    message=(
+                        f"Orphan worktree kept: has changes or could not verify "
+                        f"clean state: {entry}"
+                    ),
+                    auto_fixable=True,
+                    fixed=False,
+                ))
+            else:
+                findings.append(Finding(
+                    severity="info",
+                    check="orphan_workspace",
+                    message=(
+                        f"Worktree directory found with no associated active task: {entry}"
+                    ),
+                    auto_fixable=True,
+                ))
 
     return findings
 
