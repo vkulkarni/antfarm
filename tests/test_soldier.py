@@ -7,6 +7,7 @@ and colony interactions are fully exercised without mocking.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 
 import pytest
@@ -562,14 +563,14 @@ def test_cascade_does_not_interrupt_active(soldier_env):
 
 
 def test_cascade_does_not_touch_merged(soldier_env):
-    """Merged downstream tasks are not cascade-kicked-back."""
+    """Cascade from a kicked-back task must not affect downstream merged tasks."""
     cc = soldier_env["colony_client"]
     repo = soldier_env["repo_path"]
     soldier = soldier_env["soldier"]
 
     _carry_and_harvest(cc, repo, "task-m1", "feat/task-m1")
 
-    # Merge task-m1 first
+    # Merge task-m1 first (unblocks task-m2)
     results = soldier.run_once()
     assert results == [("task-m1", MergeResult.MERGED)]
 
@@ -580,10 +581,24 @@ def test_cascade_does_not_touch_merged(soldier_env):
     results2 = soldier.run_once()
     assert results2 == [("task-m2", MergeResult.MERGED)]
 
-    # Now verify m2 is merged
+    # Verify both are merged
+    task_m1 = cc.get_task("task-m1")
     task_m2 = cc.get_task("task-m2")
-    merged_attempts = [a for a in task_m2["attempts"] if a["status"] == "merged"]
-    assert len(merged_attempts) == 1
+    assert any(a["status"] == "merged" for a in task_m1["attempts"])
+    assert any(a["status"] == "merged" for a in task_m2["attempts"])
+
+    # Trigger cascade on task-m1. The kickback on an already-merged task
+    # may error (task is in done/ but state transition may fail). Either way,
+    # the cascade guard must protect task-m2 from being touched.
+    with contextlib.suppress(Exception):
+        soldier.kickback_with_cascade("task-m1", "retroactive invalidation")
+
+    # Critical assertion: task-m2 must still have exactly 1 merged attempt
+    m2_after = cc.get_task("task-m2")
+    m2_merged = [a for a in m2_after["attempts"] if a["status"] == "merged"]
+    assert len(m2_merged) == 1, (
+        f"task-m2 should still have exactly 1 merged attempt, got {m2_after['attempts']}"
+    )
 
 
 def test_cascade_recursive(soldier_env):
