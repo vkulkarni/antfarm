@@ -1,343 +1,1412 @@
-# Antfarm v0.6 — Specification
+# Antfarm v0.6 — Autonomous Runs
 
-**Status:** Draft (revised)
-**Date:** 2026-04-05
-**Prerequisite:** v0.5 shipped (canonical scheduler, structured artifacts, repo memory, planner, conflict prevention)
-**Goal:** Make Antfarm usable from Claude Code via MCP, with optional packaged plugin UX.
-
-**Build order:** MCP-first, slash commands second, hooks last.
+**Status:** Draft
+**Date:** 2026-04-07
+**Prerequisite:** v0.5.8 shipped (planner pipeline, review-as-task, structured artifacts, repo memory, conflict prevention)
+**Goal:** Spec in, merged code out, zero human intervention. You submit a mission, go to sleep, read the report in the morning.
 
 ---
 
 ## Philosophy
 
-**Antfarm core stays outside Claude. Plugin is the UX layer. MCP is the bridge.**
+**Antfarm v0.5 orchestrates tasks. Antfarm v0.6 orchestrates missions.**
 
-- Claude helps Antfarm think and act
-- Antfarm remembers and decides safely
-- State lives in Antfarm storage, not chat history
-- Scheduling, merging, and memory are never session-dependent
+A mission is a complete unit of work: one spec, one plan, all implementation tasks, all reviews, all merges, one report. The system plans, builds, reviews, merges, recovers from failures, scales workers, and reports results — autonomously.
+
+**Core principles:**
+
+1. **Safety before scale** — the system must stop looping, stop stalling, and stop wasting cycles before it scales to more workers
+2. **Durable state, not events** — orchestration reads persisted backend state, not SSE streams. Crash-recoverable, idempotent.
+3. **Mission is the primitive** — every task belongs to a mission. The mission is the answer to "is this done?" and "what do I read in the morning?"
+4. **Controller coordinates, subsystems decide** — the Queen advances mission phases. She does not plan, build, review, merge, or scale. Those stay in their own components.
+5. **Best-effort completion** — a mission is "done" when no more forward progress is possible. Not all-or-nothing.
 
 ---
 
 ## What v0.6 IS
 
-An MCP-first Claude Code integration, with optional packaged plugin UX:
-
-1. **MCP server** — Claude Code calls Antfarm tools directly (create tasks, claim work, report results)
-2. **Slash commands** — `/antfarm-plan`, `/antfarm-status`, `/antfarm-review` etc.
-3. **Subagents** — planner and reviewer roles as Claude Code agent definitions
-4. **Hooks** — heartbeat, failure trail (opt-in observation, never creates truth)
-
-The result: a developer opens Claude Code, types `/antfarm-plan "build auth system"`, and Antfarm decomposes it, assigns workers, and coordinates the build — all from within Claude Code.
-
-**Implementation rule:** Important logic lives in Python handlers and colony code, not in prompt text or shell scripts. Skills and agents orchestrate MCP tool calls — they do not define system truth.
+1. **Mission model** — first-class entity tying spec → plan → tasks → report
+2. **Queen** — thin controller that advances missions through phases
+3. **Safety hardening** — max-attempt enforcement, cascade invalidation, doctor daemon
+4. **Autoscaler** — starts/stops workers based on queue depth and scope overlap
+5. **Morning digest** — structured mission report: what merged, what's blocked, what needs you
+6. **Plan review** — reviewer validates the plan before builders burn API credits
 
 ## What v0.6 IS NOT
 
-- Not making Antfarm dependent on Claude internals
-- Not encoding task state in prompts
-- Not letting Claude own scheduling or merge gating
-- Not a web app or dashboard replacement
-- Not an enormous plugin — thin productivity layer only
+- Not an AI meta-agent (Queen is deterministic, like Soldier)
+- Not a web dashboard (TUI scout still works)
+- Not multi-node orchestration (single-host autoscaler first; multi-node is v0.6.1)
+- Not a Claude Code plugin (that's v0.7)
 
 ---
 
-## Architecture
+## Version Plan
+
+| Version | Theme | Scope |
+|---------|-------|-------|
+| **v0.5.9** | Safety hardening | Max attempts + `blocked`, doctor daemon, cascade invalidation |
+| **v0.6.0** | Autonomous runs | Mission model, Queen controller, plan review, single-host autoscaler, morning digest |
+| **v0.6.1** | Scale + integration | Node agent, multi-node autoscaler, GitHub issue sync |
+| **v0.6.2** | Claude Code plugin | MCP server, slash commands, hooks (full spec: SPEC_v06_plugin.md) |
+
+---
+
+## Non-Negotiable Invariants
+
+These rules apply to ALL v0.6 work. Violations are bugs.
+
+1. **No silent stalls.** A mission must never remain in a non-terminal state without either task progress or a visible blocking reason beyond a configured threshold (default: 30 minutes).
+
+2. **No infinite loops.** Every task has a max attempt count (default: 3). After exhaustion, the task transitions to `blocked` with a reason. It never re-enters `ready`.
+
+3. **No orphaned work.** Every task has a `mission_id`. Every mission tracks its `task_ids`. Reverse linkage is always consistent.
+
+4. **No SSE-driven orchestration.** SSE is for UI/notifications only. Queen and Autoscaler read durable backend state. They must produce correct behavior after a crash and restart with no event replay.
+
+5. **No monolithic controller.** Queen coordinates phases. She does NOT contain planner logic, review logic, merge logic, scheduling logic, or scaling logic. Those remain in their existing components.
+
+6. **Cascade is dependency-based, not scope-based.** When a task is kicked back, only its `depends_on` descendants are invalidated. Scope overlap between independent tasks is handled by the merge gate, not cascade.
+
+---
+
+## v0.5.9 — Safety Hardening
+
+**Goal:** Make the existing system safe for unattended operation. Three small, independent changes.
+
+### 1. Max-Attempt Enforcement
+
+**Problem:** `RETRY_POLICIES` in `worker.py:35` defines `max_retries` per failure type, but nothing enforces a global attempt limit. A task can be kicked back and re-attempted indefinitely.
+
+**Solution:** Add a configurable `max_attempts` limit (default: 3) enforced at kickback time.
+
+```python
+# In soldier.py or file.py kickback():
+def kickback(self, task_id: str, reason: str) -> None:
+    task = self.get_task(task_id)
+    attempt_count = len([
+        a for a in task["attempts"]
+        if a["status"] in ("done", "superseded")
+    ])
+
+    if attempt_count >= self.max_attempts:
+        self.mark_blocked(task_id, f"max attempts ({self.max_attempts}) reached: {reason}")
+        return
+
+    # Normal kickback: done/ → ready/, attempt → superseded
+    ...
+```
+
+**`blocked` status already exists** in the codebase (`TaskStatus.BLOCKED`, `cli.py` has `block`/`unblock` commands). This change makes the system USE it automatically.
+
+**Configuration:** `max_attempts` in `.antfarm/config.json` (default: 3). Overridable per-task via `max_attempts` field on the task.
+
+**Tests:**
+1. Task kicked back 3 times → transitions to `blocked`, not `ready`
+2. Blocked task is not forageable
+3. `unblock` command resets attempt counter and returns to `ready`
+4. Per-task `max_attempts` overrides global default
+
+### 2. Doctor Daemon
+
+**Problem:** Doctor only runs manually (`antfarm doctor --fix`). Stale workers and tasks pile up until a human notices.
+
+**Solution:** Run doctor checks as a daemon thread in the colony server, alongside Soldier.
+
+```python
+# In serve.py, next to _start_soldier_thread():
+def _start_doctor_thread(backend: TaskBackend, config: dict, interval: float = 300.0) -> None:
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                findings = run_doctor(backend, config, fix=True)
+                for f in findings:
+                    if f.severity == "error":
+                        logger.warning("doctor: %s", f.message)
+            except Exception as e:
+                logger.error("doctor daemon failed: %s", e)
+
+    thread = threading.Thread(target=_loop, daemon=True, name="doctor")
+    thread.start()
+```
+
+**Safe because:** Doctor `--fix` only does safe operations: deregister stale workers, requeue stale tasks, delete stale guards. Never deletes worktrees.
+
+**Configuration:** `doctor_interval` in `.antfarm/config.json` (default: 300 seconds). Set to 0 to disable.
+
+**CLI flag:** `antfarm colony --no-doctor` to disable the daemon (like existing `--no-soldier`).
+
+**Tests:**
+1. Doctor thread starts with colony and runs on interval
+2. Stale worker auto-deregistered after heartbeat TTL
+3. Stale active task auto-requeued to `ready`
+4. `--no-doctor` flag prevents daemon from starting
+
+### 3. Cascade Invalidation
+
+**Problem:** When task A is kicked back, downstream tasks that depend on A and are already in `done/` (built against stale code) waste a full build+review cycle before the merge gate catches them.
+
+**Solution:** When kickback occurs, proactively kick back all non-merged descendants.
+
+```python
+# In soldier.py:
+def kickback_with_cascade(self, task_id: str, reason: str) -> None:
+    self.colony.kickback(task_id, reason)
+
+    all_tasks = self.colony.list_tasks()
+    for task in all_tasks:
+        # Only cascade to done, non-merged tasks
+        if task["status"] != "done":
+            continue
+        if self._has_merged_attempt(task):
+            continue
+        # Only cascade along dependency edges
+        if task_id in (task.get("depends_on") or []):
+            cascade_reason = f"cascade: upstream {task_id} was kicked back"
+            self.kickback_with_cascade(task["id"], cascade_reason)
+```
+
+**Rules:**
+- Only invalidate **non-merged descendants** (status=done, no merged attempt)
+- Do NOT interrupt **active** downstream work — let it finish. The merge gate or next cascade will catch it.
+- Cascade is **dependency-based only** — not scope-based
+- Record the reason chain clearly: `cascade: upstream task-auth-01 was kicked back`
+- Trail entry logged on each cascaded task
+
+**Tests:**
+1. A kicked back → B (depends on A, status=done) also kicked back
+2. A kicked back → C (depends on A, status=active) NOT kicked back
+3. A kicked back → D (depends on A, status=merged) NOT kicked back
+4. A kicked back → B kicked back → E (depends on B, status=done) also kicked back (recursive)
+5. A kicked back → F (independent, status=done) NOT kicked back
+6. Trail shows cascade reason chain
+
+---
+
+## v0.6.0 — Autonomous Runs
+
+**Goal:** `antfarm mission --spec spec.md` and walk away.
+
+### 1. Mission Model
+
+**The missing primitive.** A first-class entity representing one complete unit of autonomous work.
+
+```python
+class MissionStatus(StrEnum):
+    PLANNING = "planning"             # plan task created, waiting for planner
+    REVIEWING_PLAN = "reviewing_plan" # plan done, review-plan task created
+    BUILDING = "building"             # child tasks created, builders working
+    BLOCKED = "blocked"               # no forward progress possible (durable reason)
+    COMPLETE = "complete"             # best-effort terminal: all tasks merged or blocked
+    FAILED = "failed"                 # unrecoverable: system failure, plan rejected twice, etc.
+    CANCELLED = "cancelled"           # operator cancelled via CLI
+
+
+@dataclass
+class Mission:
+    mission_id: str              # "mission-001"
+    spec: str                    # the input spec text
+    spec_file: str | None        # path to spec file (for reference)
+    status: MissionStatus
+    plan_task_id: str | None     # "plan-mission-001"
+    plan_artifact: PlanArtifact | None  # proposed plan from planner (before child task creation)
+    task_ids: list[str]          # ALL tasks in this mission (impl + review + plan-review)
+    blocked_task_ids: list[str]  # tasks that hit max attempts
+    config: MissionConfig
+    created_at: str
+    updated_at: str
+    completed_at: str | None
+    report: MissionReport | None # generated on completion
+
+
+@dataclass
+class MissionConfig:
+    max_attempts: int = 3             # per-task max before blocking
+    max_parallel_builders: int = 4    # cap on concurrent builders
+    require_plan_review: bool = True  # review plan before building
+    stall_threshold_minutes: int = 30 # no-progress timeout
+    completion_mode: str = "best_effort"  # "best_effort" or "all_or_nothing"
+    test_command: list[str] | None = None  # override soldier test command
+    integration_branch: str = "main"
+    blocked_timeout_action: str = "wait"  # "wait" (stay blocked) or "fail" (transition to failed)
+    blocked_timeout_minutes: int = 120    # only applies when blocked_timeout_action = "fail"
+
+
+@dataclass
+class PlanArtifact:
+    """Structured output from a planner worker for a mission plan."""
+    plan_task_id: str                  # plan task that produced this
+    attempt_id: str                    # which attempt
+    proposed_tasks: list[dict]         # JSON array of proposed tasks
+    task_count: int                    # len(proposed_tasks)
+    warnings: list[str]               # planner/validator warnings
+    dependency_summary: str            # "all parallel" or "task-01 → task-03, ..."
+```
+
+**`task_ids` contains ALL tasks in the mission:** implementation tasks, review tasks, the plan-review task, and re-plan tasks. Derived subsets (implementation-only, review-only) are computed dynamically by filtering on task ID prefix (`review-*`) and `capabilities_required` (`plan`, `review`).
+
+**Terminal state semantics:**
+- `COMPLETE` — best-effort terminal. All tasks are either merged or blocked. The morning digest tells you what succeeded and what needs human attention. This is the normal end state for overnight runs.
+- `BLOCKED` — forward progress has stopped for a durable reason (task hit max attempts, all remaining tasks depend on a blocked task). An operator can unblock a task to resume. Stays blocked indefinitely by default (`blocked_timeout_action = "wait"`). If configured with `blocked_timeout_action = "fail"`, transitions to `FAILED` after `blocked_timeout_minutes` (default: 120) with no operator action.
+- `FAILED` — unrecoverable. Plan review failed twice, system error, or stall timeout exceeded. Requires operator to investigate and potentially create a new mission.
+- `CANCELLED` — operator ran `antfarm mission cancel`.
+
+**Storage:** `.antfarm/missions/{mission_id}.json` — same pattern as tasks.
+
+**Reverse linkage:** Every task created under a mission gets a `mission_id` field. This is set:
+- On the plan task at creation (by Queen)
+- On child tasks at creation (by Queen, after plan review passes)
+- On review tasks when the Soldier creates them (Soldier reads `mission_id` from the original task)
+
+**Plan-to-tasks flow (changed from v0.5.8):** When a plan task is part of a mission, the planner worker does NOT create child tasks directly. Instead:
+1. Planner outputs the proposed plan as a `[PLAN_RESULT]` JSON artifact
+2. Worker stores the plan in the plan task's harvest artifact (not as carried tasks)
+3. Queen reads the plan artifact from the harvested plan task
+4. If `require_plan_review=true`: Queen creates a plan-review task first, waits for approval
+5. After approval (or if review disabled): Queen creates child tasks via `colony.carry()`, setting `mission_id` and `spawned_by` on each
+
+This is a behavioral change for mission-mode plans. Non-mission plans (direct `antfarm carry --type plan`) retain the v0.5.8 behavior where the planner creates child tasks immediately.
+
+**Lineage fields on child tasks:**
+- `mission_id` — reverse link to mission
+- `spawned_by.task_id` — the plan task that proposed this task
+- `spawned_by.attempt_id` — which plan attempt
+
+**Lifecycle:**
 
 ```
-┌─────────────────────────────────────────────┐
-│           Claude Code Session               │
-│                                             │
-│  /antfarm-plan "build auth"                 │
-│  /antfarm-status                            │
-│  /antfarm-review task-42                    │
-│                                             │
-│  ┌──────────────────────────────────┐       │
-│  │  Antfarm Plugin                  │       │
-│  │  • slash commands (skills)       │       │
-│  │  • agent definitions (.md)       │       │
-│  │  • hooks (PostToolUse)           │       │
-│  └──────────┬───────────────────────┘       │
-│             │ MCP tools                     │
-│  ┌──────────▼───────────────────────┐       │
-│  │  Antfarm MCP Server              │       │
-│  │  • HTTP bridge to colony API     │       │
-│  │  • Tool schemas for Claude       │       │
-│  └──────────┬───────────────────────┘       │
-└─────────────┼───────────────────────────────┘
-              │ HTTP + JSON
-              ▼
-┌─────────────────────────────────────────────┐
-│  Antfarm Colony (unchanged)                 │
-│  • Scheduler • Backend • Soldier • Memory   │
-└─────────────────────────────────────────────┘
+  mission --spec spec.md
+        |
+        v
+  +----------+   plan task     +-----------------+
+  | PLANNING |   done          | REVIEWING_PLAN  |
+  +----+-----+   +----------->+--------+--------+
+       |                                |
+       |  (plan review                  | plan review
+       |   disabled)                    | passed
+       |                                |
+       +----------+-----+--------------+
+                  |     |
+                  v     v
+             +----------+
+             | BUILDING |<---------+
+             +----+-----+         |
+                  |               | (tasks kicked back,
+                  |               |  not all blocked)
+                  v               |
+          +-------+-------+       |
+          |               |       |
+          v               v       |
+    +-----------+   +---------+   |
+    | COMPLETE  |   | BLOCKED |---+
+    +-----------+   +---------+
+                          |
+                          v (all blocked or operator cancels)
+                    +-----------+
+                    |  FAILED   |
+                    +-----------+
+```
+
+**Terminal states:** `COMPLETE`, `FAILED`, `CANCELLED`. A mission in `BLOCKED` can transition to `BUILDING` if an operator unblocks a task, or to `FAILED` if the stall threshold is exceeded with no progress.
+
+### 2. Queen Controller
+
+**What:** A daemon thread in the colony server that advances missions through their lifecycle. Deterministic, stateless, crash-recoverable.
+
+**Where:** `antfarm/core/queen.py`, started via `_start_queen_thread()` in `serve.py`.
+
+**Behavior:** Poll-based with adaptive interval.
+
+```python
+class Queen:
+    def __init__(self, backend: TaskBackend, config: dict):
+        self.backend = backend
+        self.poll_interval = 30.0  # base interval
+
+    def run(self) -> None:
+        """Main queen loop. Runs indefinitely."""
+        while True:
+            missions = self.backend.list_missions()
+            for mission in missions:
+                if mission["status"] in ("complete", "failed", "cancelled"):
+                    continue
+                self._advance(mission)
+            time.sleep(self._adaptive_interval(missions))
+
+    def _advance(self, mission: dict) -> None:
+        """Advance a single mission by one step. Idempotent."""
+        status = mission["status"]
+
+        if status == "planning":
+            self._check_plan_complete(mission)
+        elif status == "reviewing_plan":
+            self._check_plan_review(mission)
+        elif status == "building":
+            self._check_build_progress(mission)
+            self._check_stall(mission)
+        elif status == "blocked":
+            self._check_unblocked(mission)
+            self._check_stall_timeout(mission)
+```
+
+**Adaptive polling:**
+```python
+def _adaptive_interval(self, missions: list[dict]) -> float:
+    active = [m for m in missions if m["status"] in ("planning", "reviewing_plan", "building")]
+    if not active:
+        return 60.0   # idle: check every minute
+    # Any recent progress in last 5 min? Poll faster.
+    recent = any(self._had_recent_progress(m, minutes=5) for m in active)
+    if recent:
+        return 10.0   # active: check every 10s
+    return 30.0       # waiting: check every 30s
+```
+
+**Queen's responsibilities (exhaustive list):**
+
+| Responsibility | What Queen does | What Queen does NOT do |
+|---------------|----------------|----------------------|
+| Create plan task | POST `/tasks` with `capabilities_required: ["plan"]` | Does not plan |
+| Create plan review task | POST `/tasks` with `capabilities_required: ["review"]` | Does not review |
+| Track child tasks | Read `mission.task_ids`, check statuses | Does not schedule or assign |
+| Detect stalls | Compare last progress timestamp against threshold | Does not fix stalls |
+| Detect completion | All tasks merged or blocked → mark complete | Does not merge |
+| Generate report | Build `MissionReport` from task data | Does not interpret results |
+| Signal autoscaler | Set `mission.desired_parallelism` | Does not start/stop workers |
+| Mark blocked | When task hits max attempts, update `blocked_task_ids` | Does not unblock |
+
+### 3. Mission Report (Morning Digest)
+
+**A first-class feature, not an afterthought.** This is what you read when you wake up.
+
+```python
+@dataclass
+class MissionReport:
+    mission_id: str
+    spec_summary: str              # first 200 chars of spec
+    status: MissionStatus           # terminal status: COMPLETE, BLOCKED, or FAILED
+    duration_minutes: float
+
+    # Task counts
+    total_tasks: int
+    merged_tasks: int
+    blocked_tasks: int
+    failed_reviews: int
+
+    # Detail
+    merged: list[MissionReportTask]      # title, PR url, lines changed
+    blocked: list[MissionReportBlocked]  # title, reason, attempt count
+    risks: list[str]                     # aggregated from task artifacts
+
+    # Links
+    pr_urls: list[str]
+    branches: list[str]
+
+    # What changed
+    total_lines_added: int
+    total_lines_removed: int
+    files_changed: list[str]
+
+    # Generated
+    generated_at: str
+```
+
+```python
+@dataclass
+class MissionReportTask:
+    task_id: str
+    title: str
+    pr_url: str
+    lines_added: int
+    lines_removed: int
+    files_changed: list[str]
+
+
+@dataclass
+class MissionReportBlocked:
+    task_id: str
+    title: str
+    reason: str
+    attempt_count: int
+    last_failure_type: str
+```
+
+**Output formats:**
+
+| Format | Where | How |
+|--------|-------|-----|
+| JSON | `.antfarm/missions/{mission_id}_report.json` | Always generated |
+| Terminal | `antfarm mission status {mission_id}` | Formatted rich output |
+| Markdown | `antfarm mission report {mission_id} --format md` | For pasting into issues/PRs |
+
+**Example terminal output:**
+
+```
+Mission: mission-auth-jwt (complete)
+Duration: 3h 42m
+Spec: "Build JWT authentication system with login, registration, and token refresh"
+
+Merged (7/8):
+  task-auth-jwt-01  Add User model + migration          +142 -0   PR #47
+  task-auth-jwt-02  Add JWT token service                +89  -3   PR #48
+  task-auth-jwt-03  Add login endpoint                   +67  -2   PR #49
+  task-auth-jwt-04  Add registration endpoint            +73  -1   PR #50
+  task-auth-jwt-05  Add token refresh endpoint           +41  -0   PR #51
+  task-auth-jwt-06  Add auth middleware                  +52  -8   PR #52
+  task-auth-jwt-07  Add auth tests                       +186 -0   PR #53
+
+Blocked (1/8):
+  task-auth-jwt-08  Add rate limiting to auth endpoints
+    Reason: max attempts (3) reached: test failure
+    Last failure: TEST_FAILURE — rate limit test expects Redis, but no Redis in test env
+    Needs: human decision — add Redis to test env or mock it
+
+Total: +650 -14 across 18 files
+```
+
+### 4. Plan Review
+
+**Problem:** Planner produces a plan. Nobody checks if it's actually good before N builders start burning API credits.
+
+**Solution:** After the planner completes, Queen creates a `review-plan-{mission_id}` task. The existing reviewer infrastructure handles it — no new subsystem.
+
+**Flow:**
+
+```
+Queen creates plan task → Planner decomposes → Plan task harvested
+    |                                           (plan stored as artifact,
+    |                                            no child tasks created yet)
+    v
+Queen reads plan artifact from harvested plan task
+Queen checks: config.require_plan_review?
+    |
+    +-- no  → Queen creates child tasks from plan artifact → mission → building
+    |
+    +-- yes → Queen creates review-plan-{mission_id} task
+              with plan JSON in the spec.
+              Reviewer forages it, checks deps/scopes/completeness.
+              Reviewer outputs [REVIEW_VERDICT]:
+                |
+                +-- pass → Queen creates child tasks from plan artifact
+                |          → mission → building
+                +-- needs_changes → Queen creates re-plan task (max 1 re-plan)
+                |                   with reviewer feedback in spec
+                +-- blocked → mission → failed
+```
+
+**Plan review spec (what the reviewer checks):**
+
+```
+Review this implementation plan for: "{mission spec summary}"
+
+Plan:
+{JSON array of proposed tasks}
+
+Check:
+1. Are dependencies logically correct? (no missing deps, no unnecessary deps)
+2. Are scopes complete? (does the plan cover the full spec?)
+3. Is each task independently implementable?
+4. Are complexity ratings reasonable?
+5. Could any tasks be parallelized further?
+
+Output [REVIEW_VERDICT] with verdict: pass/needs_changes/blocked
+If needs_changes, include specific findings about what to fix.
+```
+
+**Max 1 re-plan.** If the second plan also fails review, mission transitions to `failed` with reason "plan review failed twice."
+
+**Configuration:** `require_plan_review` in `MissionConfig` (default: true). Can be disabled for small/trusted specs.
+
+### 5. Autoscaler
+
+**What:** A daemon thread that starts and stops workers based on queue state. Single-host only in v0.6.0.
+
+**Where:** `antfarm/core/autoscaler.py`, started via `_start_autoscaler_thread()` in `serve.py`.
+
+**Algorithm:**
+
+```python
+class Autoscaler:
+    def __init__(self, backend: TaskBackend, config: AutoscalerConfig):
+        self.backend = backend
+        self.config = config
+        self.managed_workers: dict[str, subprocess.Popen] = {}
+
+    def run(self) -> None:
+        while True:
+            self._reconcile()
+            time.sleep(30)
+
+    def _reconcile(self) -> None:
+        """Compare desired state with actual state, start/stop workers."""
+        tasks = self.backend.list_tasks()
+        workers = self.backend.list_workers()
+
+        desired = self._compute_desired(tasks, workers)
+        actual = self._count_actual(workers)
+
+        # Planner: 0 or 1
+        self._reconcile_role("planner", desired["planner"], actual["planner"])
+        # Builders: 0 to max
+        self._reconcile_role("builder", desired["builder"], actual["builder"])
+        # Reviewers: 0 to max
+        self._reconcile_role("reviewer", desired["reviewer"], actual["reviewer"])
+
+    def _compute_desired(self, tasks, workers) -> dict:
+        ready_plan = [t for t in tasks if t["status"] == "ready"
+                      and "plan" in t.get("capabilities_required", [])]
+        # v0.6.0 convention: implementation tasks have empty capabilities_required.
+        # Future task types may need explicit task-kind classification.
+        ready_build = [t for t in tasks if t["status"] == "ready"
+                       and not t.get("capabilities_required")]
+        done_no_review = [t for t in tasks if t["status"] == "done"
+                          and not t["id"].startswith("review-")
+                          and not self._has_verdict(t)
+                          and not self._has_merged(t)]
+        ready_review = [t for t in tasks if t["status"] == "ready"
+                        and "review" in t.get("capabilities_required", [])]
+
+        # Cap builders by non-overlapping scope groups
+        scope_groups = self._count_scope_groups(ready_build)
+        active_builders = [w for w in workers if "review" not in w.get("capabilities", [])
+                           and "plan" not in w.get("capabilities", [])
+                           and w.get("status") != "offline"]
+        rate_limited = [w for w in active_builders
+                        if self._is_rate_limited(w)]
+
+        desired_builders = min(
+            scope_groups,                         # non-overlapping work
+            self.config.max_builders,             # hard cap
+            len(ready_build),                     # no more than queue depth
+        )
+
+        # Don't scale up if most builders are rate-limited
+        if len(rate_limited) > len(active_builders) // 2:
+            desired_builders = min(desired_builders, len(active_builders))
+
+        return {
+            "planner": 1 if ready_plan else 0,
+            "builder": desired_builders,
+            "reviewer": min(
+                max(1 if (done_no_review or ready_review) else 0,
+                    len(ready_review)),
+                self.config.max_reviewers,
+            ),
+        }
+
+    def _count_scope_groups(self, tasks: list[dict]) -> int:
+        """Count non-overlapping scope groups among ready tasks."""
+        if not tasks:
+            return 0
+        groups: list[set[str]] = []
+        for t in tasks:
+            touches = set(t.get("touches", []))
+            if not touches:
+                groups.append(set())
+                continue
+            merged = False
+            for g in groups:
+                if g & touches:
+                    g.update(touches)
+                    merged = True
+                    break
+            if not merged:
+                groups.append(touches)
+        return len(groups)
+```
+
+**Worker lifecycle management:**
+
+The autoscaler tracks managed workers with explicit role metadata, not by name convention. Decisions to stop workers use colony state (worker status = idle), not local process state.
+
+```python
+@dataclass
+class ManagedWorker:
+    name: str
+    role: str           # "planner", "builder", "reviewer"
+    worker_id: str      # "{node_id}/{name}" — matches colony registry
+    process: subprocess.Popen
+
+class Autoscaler:
+    managed: dict[str, ManagedWorker] = {}
+
+    def _start_worker(self, role: str) -> None:
+        """Start a worker subprocess."""
+        seq = sum(1 for w in self.managed.values() if w.role == role) + 1
+        name = f"{role}-{seq}"
+        worker_id = f"{self.config.node_id}/{name}"
+        cmd = [
+            "antfarm", "worker", "start",
+            "--agent", self.config.agent_type,
+            "--type", role,
+            "--node", self.config.node_id,
+            "--name", name,
+            "--repo-path", self.config.repo_path,
+            "--integration-branch", self.config.integration_branch,
+        ]
+        if self.config.token:
+            cmd.extend(["--token", self.config.token])
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.managed[name] = ManagedWorker(name=name, role=role,
+                                            worker_id=worker_id, process=proc)
+        logger.info("autoscaler started worker=%s role=%s pid=%d", name, role, proc.pid)
+
+    def _stop_idle_worker(self, role: str) -> None:
+        """Stop an idle worker, verified against colony state."""
+        colony_workers = self.backend.list_workers()
+        idle_colony = {w["worker_id"] for w in colony_workers
+                       if w.get("status") == "idle"}
+
+        for name, mw in list(self.managed.items()):
+            if mw.role == role and mw.worker_id in idle_colony and mw.process.poll() is None:
+                mw.process.terminate()
+                mw.process.wait(timeout=10)
+                del self.managed[name]
+                logger.info("autoscaler stopped worker=%s (confirmed idle in colony)", name)
+                return
+
+    def _cleanup_exited(self) -> None:
+        """Remove managed workers whose processes have exited."""
+        for name, mw in list(self.managed.items()):
+            if mw.process.poll() is not None:
+                del self.managed[name]
+                logger.info("autoscaler cleaned up exited worker=%s", name)
+```
+
+**Configuration:**
+
+```python
+@dataclass
+class AutoscalerConfig:
+    enabled: bool = False              # opt-in for v0.6.0
+    agent_type: str = "claude-code"
+    node_id: str = "local"
+    repo_path: str = "."
+    integration_branch: str = "main"
+    max_builders: int = 4
+    max_reviewers: int = 2
+    token: str | None = None
+```
+
+**CLI:**
+```
+antfarm colony --autoscaler                    # enable autoscaler
+antfarm colony --autoscaler --max-builders 6   # with custom cap
+antfarm colony --no-autoscaler                 # disable (default)
+```
+
+**Tests:**
+1. No ready tasks → 0 desired workers
+2. 3 ready build tasks, all different scopes → 3 desired builders
+3. 3 ready build tasks, all same scope → 1 desired builder
+4. Done tasks with no verdict → at least 1 reviewer
+5. Rate-limited builders → don't scale up
+6. Builder process exits → cleaned up from managed_workers
+7. Planner: exactly 0 or 1, never more
+
+### 6. CLI Changes
+
+**New command group:**
+
+```
+antfarm mission --spec spec.md                          # create + start
+antfarm mission --spec spec.md --no-plan-review         # skip plan review
+antfarm mission --spec spec.md --max-builders 6         # override scaling
+antfarm mission status {mission_id}                     # show current state
+antfarm mission report {mission_id}                     # show morning digest
+antfarm mission report {mission_id} --format md         # markdown output
+antfarm mission cancel {mission_id}                     # cancel a running mission
+antfarm mission list                                    # list all missions
+```
+
+**Task changes:**
+- `antfarm carry` gains `--mission` option to attach a task to an existing mission
+- `antfarm scout` TUI gains a Mission panel showing mission-level status
+
+### 7. API Changes
+
+**New endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/missions` | Create a mission |
+| GET | `/missions` | List missions |
+| GET | `/missions/{id}` | Get mission detail |
+| PATCH | `/missions/{id}` | Update mission status (Queen internal) |
+| POST | `/missions/{id}/cancel` | Cancel a mission |
+| GET | `/missions/{id}/report` | Get mission report |
+
+**Task endpoint changes:**
+- `POST /tasks` accepts optional `mission_id` field
+- `GET /tasks` accepts optional `?mission_id=` filter
+- `GET /status/full` includes mission summary
+
+### 8. Backend Changes
+
+**FileBackend additions:**
+
+```
+.antfarm/
+  missions/                    # NEW
+    mission-001.json           # mission state
+    mission-001_report.json   # generated report
+  tasks/
+    ready/
+    active/
+    done/
+  ...
+```
+
+**TaskBackend ABC additions:**
+
+```python
+# New methods on TaskBackend:
+def create_mission(self, mission: dict) -> str: ...
+def get_mission(self, mission_id: str) -> dict | None: ...
+def list_missions(self, status: str | None = None) -> list[dict]: ...
+def update_mission(self, mission_id: str, updates: dict) -> None: ...
+```
+
+**Task dict gains `mission_id` field:**
+```python
+# On Task dataclass:
+mission_id: str | None = None  # reverse linkage to mission
 ```
 
 ---
 
-## Components
+## v0.6.1 — Scale + Integration
 
-### 1. MCP Server (#84)
+**Goal:** Multi-node scaling and GitHub integration.
 
-**What:** A local MCP server that exposes Antfarm's colony API as MCP tools. Claude Code discovers and calls these tools natively.
+### 1. Node Agent
 
-**Location:** `antfarm/mcp/server.py`
+A lightweight daemon running on each worker machine.
 
-**Tools exposed:**
-
-| Tool | Maps to | Description |
-|------|---------|-------------|
-| `antfarm_carry` | `POST /tasks` | Create a task |
-| `antfarm_plan_spec` | Planner (v0.5) | Decompose a spec into tasks |
-| `antfarm_list_tasks` | `GET /tasks` | List tasks by status |
-| `antfarm_forage` | `POST /tasks/pull` | Claim next task for a worker |
-| `antfarm_trail` | `POST /tasks/{id}/trail` | Log progress |
-| `antfarm_harvest` | `POST /tasks/{id}/harvest` | Mark task complete with artifact |
-| `antfarm_status` | `GET /status/full` | Colony status + tasks + workers |
-| `antfarm_blockers` | `GET /tasks?status=blocked` + signals | List blocked tasks and signals |
-| `antfarm_memory` | Memory store (v0.5) | Get repo facts, hotspots, failure patterns |
-| `antfarm_review_pack` | Review pack (v0.5) | Get review pack for a completed task |
-| `antfarm_merge_ready` | `GET /tasks?status=done` | List tasks ready for merge |
-| `antfarm_workers` | `GET /workers` | List active workers |
-
-**Configuration:** The MCP server reads from the existing `.antfarm/config.json` — one config source, not two. This is the same config file that the FileBackend and colony already use. The MCP server reads `colony_url` and `token` from it.
-
-```json
-// .antfarm/config.json (existing, authoritative)
-{
-  "colony_url": "http://localhost:7433",
-  "token": "optional-bearer-token",
-  "repo": "vkulkarni/antfarm",
-  "integration_branch": "dev"
-}
+```
+antfarm node-agent --colony-url http://colony:7433 --repo-path /path/to/repo
 ```
 
-Claude Code MCP server config references the Antfarm module, which reads `.antfarm/config.json` at startup:
+**Responsibilities:**
+- Register node with colony on startup
+- Accept worker start/stop commands from autoscaler
+- Manage local `WorkerRuntime` processes
+- Report node capacity (CPU count, available memory, running workers)
+- Keep local git repo in sync (`git fetch origin` periodically)
 
-```json
-{
-  "mcpServers": {
-    "antfarm": {
-      "command": "python3",
-      "args": ["-m", "antfarm.mcp.server"]
-    }
-  }
-}
+**API (node-local, not exposed to internet):**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/workers/start` | Start a worker process |
+| POST | `/workers/stop` | Stop a worker process |
+| GET | `/workers` | List running workers |
+| GET | `/capacity` | Report node capacity |
+
+**Colony tracks node agent URLs:**
+```python
+# Extended Node model:
+@dataclass
+class Node:
+    node_id: str
+    joined_at: str
+    last_seen: str
+    agent_url: str | None = None     # "http://192.168.1.10:7434"
+    max_workers: int = 4
+    capabilities: list[str] = field(default_factory=list)  # e.g. ["gpu", "docker"]
 ```
 
-Environment variables (`ANTFARM_URL`, `ANTFARM_TOKEN`) override `.antfarm/config.json` when set, for CI/remote use cases.
+### 2. Multi-Node Autoscaler
 
-**Auth and error guarantees:**
-- Auth errors are surfaced as structured tool errors (not silent failures or generic exceptions)
-- Tokens are never printed in logs, trails, or tool output
-- Unauthorized calls do not partially mutate state — they fail atomically
+Extends the single-host autoscaler to distribute across nodes.
 
-**Protocol:** MCP stdio transport (standard for Claude Code MCP servers). The server reads JSON-RPC from stdin, calls the colony HTTP API, and writes results to stdout.
+**Distribution strategy:**
+- Round-robin across nodes with available capacity
+- Respect node-level `max_workers` cap
+- Prefer nodes with matching capabilities (e.g., GPU tasks to GPU nodes)
+- If a node is unreachable, skip it and try the next
 
-**Complexity:** M
+**The autoscaler calls node agents instead of spawning local subprocesses:**
+
+```python
+def _start_worker_on_node(self, node: dict, role: str) -> None:
+    url = node["agent_url"]
+    httpx.post(f"{url}/workers/start", json={
+        "type": role,
+        "agent": self.config.agent_type,
+    })
+```
+
+### 3. GitHub Issue Sync
+
+**Automatic issue creation:** When a mission creates child tasks, create a GitHub issue for each.
+
+**Issue ↔ Task linkage:**
+- Task `id` stored in issue body metadata
+- Issue number stored on task as `github_issue`
+- Task status changes update issue labels (`ready`, `active`, `done`, `blocked`)
+- Kickbacks add a comment to the issue with the failure reason
+- Merge adds a comment with the PR URL
+
+**Mission-level issue:** A parent issue or project board column for the mission itself, linking to all child issues.
 
 ---
 
-### 2. Slash Commands (Plugin Skills)
+## Visual Workflow — v0.6.0
 
-**What:** Claude Code skills bundled as a plugin. Users install once, get commands in every session.
+### What you do vs what the system does
 
-**Location:** `antfarm/plugin/skills/`
+```
+YOU:
+  antfarm colony --autoscaler
+  antfarm mission --spec spec.md
+  (go to sleep)
+  antfarm mission report {id}
 
-| Command | What it does |
-|---------|-------------|
-| `/antfarm-plan` | Takes a spec/issue, runs the v0.5 planner, shows proposed tasks, carries on confirmation |
-| `/antfarm-status` | Shows colony status in a formatted view (nodes, workers, task counts, blockers) |
-| `/antfarm-blockers` | Lists blocked/failed/stale tasks that need attention |
-| `/antfarm-review` | Shows review pack for a specific task (or all done tasks) |
-| `/antfarm-start` | Registers as a worker, forages a task, sets up workspace — one command to start working (see edge cases below) |
-| `/antfarm-done` | Harvests current task with artifact, forages next — one command to finish and continue |
-| `/antfarm-merge-ready` | Lists tasks ready for Soldier to merge |
-
-**Each skill is a markdown file** with a system prompt that instructs Claude Code to call the MCP tools. Example:
-
-```markdown
-# /antfarm-plan
-
-Takes a feature spec and decomposes it into Antfarm tasks.
-
-## Instructions
-
-1. Read the user's spec (argument or file)
-2. Call `antfarm_memory` tool to get repo facts (test command, build command, hot files)
-3. Decompose into 3-10 tasks with: title, spec, depends_on, touches, priority
-4. Show the proposed tasks to the user
-5. On confirmation, call `antfarm_carry` for each task
-6. Show final task list with `antfarm_status`
+=========================== EVERYTHING BELOW IS AUTOMATED ==========================
 ```
 
-**`/antfarm-start` edge cases:**
+### Full pipeline — step by step
 
-| Condition | Behavior |
-|-----------|----------|
-| No task available | Report "queue empty" clearly, do not register an idle worker |
-| Worker already active on a task | Refuse to start — surface current task ID, suggest `/antfarm-done` first |
-| Workspace setup fails (git error) | Trail the failure, deregister worker, surface error. Do not leave task claimed with no workspace |
-| Colony unreachable | Fail with clear error before any local side effects |
-
-**Complexity:** S per skill, M total
-
----
-
-### 3. Hooks
-
-**What:** Claude Code hooks that fire automatically to keep Antfarm informed. Hooks **observe and synchronize** — they never create canonical state. The final artifact and merge state come only from explicit, deterministic Antfarm flows (`/antfarm-done`, harvest API).
-
-**Location:** `antfarm/plugin/hooks/`
-
-| Hook | Event | What it does | Default |
-|------|-------|-------------|---------|
-| `heartbeat.sh` | PostToolUse | Sends heartbeat to colony | **On** |
-| `failure_trail.sh` | PostToolUseFailure | Logs failure context as a trail entry | **On** |
-| `workspace_observe.sh` | PostToolUse | Writes provisional changed-file observations to trail (not the artifact) | **Opt-in** |
-
-**Hooks that were considered and rejected:**
-
-| Hook | Why rejected |
-|------|-------------|
-| `artifact_update.sh` (mutate artifact on file edit) | The final TaskArtifact must be a harvest-time, deterministic record. Hooks should not keep mutating the canonical artifact during editing. |
-| `on_complete.sh` (auto-harvest on session stop) | A Claude session ending does not mean the task is complete. Auto-harvesting would silently produce bad state — half-done work marked done. This violates the trust model built in v0.5. On session stop, the safe actions are: trail a status update, finalize heartbeat, leave task active. Harvest requires explicit `/antfarm-done`. |
-
-**Design principle:** Hooks can write provisional observations, dirty-file hints, heartbeats, progress trail entries, and failure notes. They must **not** mutate the canonical final artifact or trigger state transitions (harvest, kickback, merge).
-
-**Complexity:** S
-
----
-
-### 4. Agent Definitions (Subagents)
-
-**What:** Claude Code agent definitions for Antfarm roles. These already partially exist in `adapters/claude_code/agents/`.
-
-**Location:** `antfarm/plugin/agents/`
-
-| Agent | Role | When to use |
-|-------|------|-------------|
-| `worker.md` | Engineer | Forage a task, implement it, harvest | 
-| `planner.md` | Decomposer | Break a spec into tasks via MCP tools |
-| `reviewer.md` | Reviewer | Read a PR diff, generate review pack via MCP tools |
-
-These are enhanced versions of the existing adapter agents — they use MCP tools instead of CLI commands, making them faster and more integrated.
-
-**`reviewer.md` depends on v0.5 review contract.** The reviewer agent consumes `ReviewVerdict` and the review pack generation from v0.5. The plugin UX is surfacing an existing trust primitive, not inventing a new one.
-
-**Complexity:** S
-
----
-
-### 5. Plugin Package
-
-**What:** A single installable Claude Code plugin that bundles MCP server + skills + hooks + agents.
-
-**Location:** `antfarm/plugin/`
-
-**Structure:**
 ```
-antfarm/
-  mcp/                            # MCP server — part of Antfarm's integration layer, not plugin
-    __init__.py
-    server.py                     # MCP stdio server — reads JSON-RPC, calls colony API
-    tools.py                      # Tool definitions + handler dispatch
-  plugin/                         # Plugin assets — UX layer for Claude Code
-    package.json                  # Plugin manifest
-    skills/
-      antfarm-plan.md
-      antfarm-status.md
-      antfarm-blockers.md
-      antfarm-review.md
-      antfarm-start.md
-      antfarm-done.md
-    hooks/
-      heartbeat.sh                # PostToolUse: heartbeat (default on)
-      failure_trail.sh            # PostToolUseFailure: log failure to trail (default on)
-      workspace_observe.sh        # PostToolUse: observe workspace changes (opt-in)
-    agents/
-      worker.md
-      planner.md
-      reviewer.md
+antfarm mission --spec spec.md
+        |
+        v
++-----------------------------------------------+
+|  QUEEN creates plan task                       |
+|  plan-{mission_id} with cap: ["plan"]          |
+|  mission status: PLANNING                      |
++---------------------+-------------------------+
+                      |
+                      v
++-----------------------------------------------+
+|  AUTOSCALER detects ready plan task            |
+|  Starts 1 planner worker (subprocess)          |
++---------------------+-------------------------+
+                      |
+                      v
++-----------------------------------------------+
+|  PLANNER worker forages plan task              |
+|  Creates worktree, launches claude --agent      |
+|  planner                                       |
+|  Agent reads codebase, outputs [PLAN_RESULT]   |
+|  Worker parses JSON, validates (max 10 tasks,  |
+|  no forward deps, title+spec required)         |
+|  Harvests plan task with PLAN ARTIFACT         |
+|  (no child tasks created — artifact only)      |
++---------------------+-------------------------+
+                      |
+                      v
++-----------------------------------------------+
+|  QUEEN reads plan artifact from harvested task |
+|  config.require_plan_review = true?            |
+|                                                |
+|  YES: creates review-plan-{mission_id}         |
+|       plan JSON included in review spec        |
+|       mission status: REVIEWING_PLAN           |
+|                                                |
+|  NO:  skips straight to child task creation    |
++--------+--------------------+-----------------+
+         |                    |
+         v                    |
++-------------------------+   |
+|  REVIEWER worker forages |   |
+|  plan review task        |   |
+|  Checks deps, scopes,   |   |
+|  completeness            |   |
+|  Outputs [REVIEW_VERDICT]|   |
++--------+----------------+   |
+         |                    |
+    pass | needs_changes      |
+    |    |                    |
+    |    v                    |
+    |  QUEEN creates re-plan  |
+    |  task (max 1 re-plan)   |
+    |  If 2nd also fails:     |
+    |  mission -> FAILED      |
+    |                         |
+    v                         v
++-----------------------------------------------+
+|  QUEEN creates N child tasks from plan artifact|
+|  Each task gets mission_id = {mission_id}      |
+|  Each task gets spawned_by = plan task          |
+|  capabilities_required = [] (builder tasks)    |
+|  mission.task_ids updated                      |
+|  mission status: BUILDING                      |
++---------------------+-------------------------+
+                      |
+                      v
++-----------------------------------------------+
+|  AUTOSCALER computes desired workers           |
+|                                                |
+|  Builders:                                     |
+|    scope_groups = non-overlapping touch groups  |
+|    desired = min(scope_groups, max_builders,    |
+|                  ready_count)                   |
+|    if >50% rate limited: don't scale up        |
+|                                                |
+|  Reviewers:                                    |
+|    1+ when review backlog exists               |
+|                                                |
+|  Starts/stops worker subprocesses              |
++---------------------+-------------------------+
+                      |
+                      v
++-----------------------------------------------+
+|  BUILDER workers forage in parallel            |
+|                                                |
+|  For each builder:                             |
+|    scheduler.select_task():                    |
+|      1. deps met?                              |
+|      2. cap match? (general builder)           |
+|      3. pin check                              |
+|      4. prefer non-overlapping scopes          |
+|      5. cooler hotspots first                  |
+|      6. lower priority number                  |
+|      7. oldest created_at (FIFO)               |
+|                                                |
+|    os.rename(ready/ -> active/)                |
+|    new Attempt created                         |
+|    git worktree add (isolated branch)          |
+|    claude -p --agent worker (subprocess)       |
+|    agent implements, tests, commits, pushes    |
+|    gh pr create                                |
+|    harvest: active/ -> done/                   |
+|                                                |
+|  On failure:                                   |
+|    classify: timeout/infra/lint/build/test     |
+|    trail [FAILURE_RECORD]                      |
+|    task stays active/ (doctor recovers)        |
++---------+-----------+-------------------------+
+          |           |
+     success      failure
+          |           |
+          v           v
++------------------+  +------------------------+
+| task -> done/    |  | doctor daemon recovers  |
+| attempt: done    |  | task -> ready/          |
+| SSE: harvested   |  | fresh attempt next time |
++--------+---------+  +------------------------+
+         |
+         v
++-----------------------------------------------+
+|  SOLDIER detects done task                     |
+|  process_done_tasks():                         |
+|    creates review-{task_id}                    |
+|    cap: ["review"], priority: 1                |
+|    spec includes branch, PR, review pack       |
++---------------------+-------------------------+
+                      |
+                      v
++-----------------------------------------------+
+|  REVIEWER worker forages review task           |
+|  Reads PR diff, runs tests                    |
+|  Outputs [REVIEW_VERDICT]:                     |
+|    pass / needs_changes / blocked              |
+|  Verdict stored on original task's attempt     |
++--------+--------+----------------------------+
+         |        |
+      pass    needs_changes/blocked
+         |        |
+         v        v
++----------------+ +----------------------------+
+| SOLDIER checks | | SOLDIER kickback            |
+| merge queue    | |   done/ -> ready/           |
+|                | |   attempt -> superseded     |
+| Filters:       | |   CASCADE: kick back        |
+|  status=done   | |   downstream done tasks     |
+|  deps merged   | |   that depend on this one   |
+|  review=pass   | |                             |
+|  has branch    | |   attempt_count >= 3?        |
+|                | |   YES: task -> blocked       |
+| Sort:          | |   Queen updates mission      |
+|  override pos  | |                              |
+|  priority      | +----------------------------+
+|  FIFO          |
++-------+--------+
+        |
+        v
++-----------------------------------------------+
+|  SOLDIER attempt_merge()                       |
+|                                                |
+|  git fetch origin                              |
+|  git checkout -b antfarm/temp-merge            |
+|       origin/{integration_branch}              |
+|  git merge --no-ff {feature_branch}            |
+|    conflict? -> FAILED -> kickback             |
+|  run test_command (pytest -x -q)               |
+|    tests fail? -> FAILED -> kickback           |
+|  git checkout {integration_branch}             |
+|  git merge --ff-only antfarm/temp-merge        |
+|  git push origin {integration_branch}          |
+|                                                |
+|  SUCCESS: mark_merged()                        |
+|    attempt status -> merged                    |
+|    dependent tasks now unblocked               |
+|    SSE: merged                                 |
+|                                                |
+|  finally: _cleanup()                           |
+|    abort merge, checkout main, delete temp,    |
+|    git clean -fd, git reset --hard             |
++---------------------+-------------------------+
+                      |
+                      v
++-----------------------------------------------+
+|  QUEEN checks mission progress                 |
+|                                                |
+|  All tasks merged?                             |
+|    -> mission status: COMPLETE                 |
+|    -> generate MissionReport                   |
+|                                                |
+|  Some tasks blocked, rest merged?              |
+|    -> mission status: COMPLETE (best-effort)   |
+|    -> report shows blocked items               |
+|                                                |
+|  No progress for stall_threshold?              |
+|    -> log warning                              |
+|    -> if 2x threshold: mission -> BLOCKED      |
+|                                                |
+|  All remaining tasks blocked?                  |
+|    -> mission status: FAILED                   |
++---------------------+-------------------------+
+                      |
+                      v
++-----------------------------------------------+
+|  MISSION REPORT (morning digest)               |
+|                                                |
+|  antfarm mission report {mission_id}           |
+|                                                |
+|  Mission: mission-auth-jwt (complete)          |
+|  Duration: 3h 42m                              |
+|                                                |
+|  Merged (7/8):                                 |
+|    task-01  Add User model      +142  PR #47   |
+|    task-02  Add JWT service      +89  PR #48   |
+|    ...                                         |
+|                                                |
+|  Blocked (1/8):                                |
+|    task-08  Add rate limiting                  |
+|    Reason: TEST_FAILURE (3 attempts)            |
+|    Needs: human decision                       |
+|                                                |
+|  Total: +650 -14 across 18 files               |
++-----------------------------------------------+
 ```
 
-**Architectural note:** The MCP server lives in `antfarm/mcp/`, not under `antfarm/plugin/`. The MCP bridge is part of Antfarm's integration layer — it has value independent of the plugin packaging. The plugin references the MCP server but does not contain it.
+### Task state machine (v0.6)
 
-**Installation:**
-```bash
-# From the antfarm repo
-claude plugins install ./antfarm/plugin
-
-# Or from npm (future)
-claude plugins install antfarm-plugin
+```
+                   carry / planner
+                        |
+                        v
+                   +---------+
+            +----->|  READY  |<-----+
+            |      +----+----+      |
+            |           |           |
+            |    forage (scheduler) |
+            |           |           |
+            |           v           |
+            |      +---------+      |
+            |      | ACTIVE  |      |
+            |      +----+----+      |
+            |           |           |
+            |      +----+----+     kickback (soldier)
+            |      |         |     cascade kickback
+            |      v         v      |
+            |  harvest    failure   |
+            |      |     (doctor    |
+            |      v      recovers) |
+            |  +---------+    |     |
+            |  |  DONE   |----+-----+
+            |  +----+----+
+            |       |
+            |  +----+----+
+            |  |         |
+            |  v         v
+            | review   review
+            | pass     fail/blocked
+            |  |         |
+            |  v         |
+            | merge      |
+            |  |         |
+            |  v         |
+            | +--------+ |
+            | | MERGED | |
+            | +--------+ |
+            |             |
+            |  attempt_count >= max_attempts?
+            |       |
+            |    NO | YES
+            |       |    |
+            +-------+    v
+                     +---------+
+                     | BLOCKED |
+                     +---------+
+                          |
+                     unblock (operator)
+                     or stall timeout
+                          |
+                          v
+                     +---------+
+                     | FAILED  | (mission-level)
+                     +---------+
 ```
 
-**Complexity:** M (packaging + testing)
+### Mission state machine
+
+```
+  antfarm mission --spec spec.md
+        |
+        v
+  +----------+
+  | PLANNING |---plan task created, planner working
+  +----+-----+
+       |
+       | plan task done
+       v
+  +-----------------+
+  | REVIEWING_PLAN  |---plan review task created (if enabled)
+  +--------+--------+
+           |
+      pass | needs_changes (max 1 re-plan)
+           |       |
+           |    re-plan fails: mission -> FAILED
+           |
+           v
+  +----------+
+  | BUILDING |<--------+
+  +----+-----+         |
+       |                |
+       | all merged     | task unblocked
+       | or all         | (operator)
+       | accounted for  |
+       |                |
+       v                |
+  +-----------+   +---------+
+  | COMPLETE  |   | BLOCKED |---no forward progress
+  +-----------+   +----+----+
+                       |
+                  stall timeout
+                  or all blocked
+                       |
+                       v
+                  +---------+
+                  | FAILED  |
+                  +---------+
+
+                  +-----------+
+                  | CANCELLED |---operator: antfarm mission cancel
+                  +-----------+
+```
+
+### Worker scaling visual
+
+```
+Queue state:                Autoscaler decision:
+
+ready/ has:                 Starts:
+  plan-001 (cap: plan)        1 planner
+  (nothing else yet)          0 builders
+                              0 reviewers
+
+After planner completes:    Adjusts:
+  task-01 (auth)              0 planners (no plan tasks)
+  task-02 (api)               3 builders (3 scope groups)
+  task-03 (db)                0 reviewers (no review tasks yet)
+  task-04 (api, dep: 02)
+  task-05 (auth, dep: 01)
+
+After 3 tasks done:         Adjusts:
+  done: 01, 02, 03           scale down to 2 builders (2 ready)
+  ready: 04, 05              start 1 reviewer (review backlog)
+  review-01, review-02,
+  review-03 in ready/
+
+All tasks done:             Adjusts:
+  done: all                   0 builders (queue empty)
+  reviews pending             1 reviewer (review backlog)
+
+All merged:                 Adjusts:
+  nothing in ready/           0 everything
+                              workers exit naturally
+```
 
 ---
 
-## Release Milestones
+## Edge Cases
 
-### Milestone 1 — MCP + Core Commands
+### Task A kicked back, Task B depends on A, B already done with passing review
 
-The true foundation. Antfarm is usable from Claude Code after this milestone.
+```
+t0: A and B both created by planner
+t1: A built, harvested → done
+t2: B forages (A is in done_task_ids)
+t3: B built against origin/main (A not merged yet)
+t4: A review → pass, B review → pass
+t5: Soldier merges A
+t6: Soldier tries to merge B onto main+A
+    ├─ Conflict or test failure → kickback B → B rebuilds fresh ✓
+    └─ Clean merge + tests pass → merged ✓
 
-- MCP server with stdio transport (`antfarm/mcp/`)
-- Tool definitions mapping to colony API
-- Config reads from `.antfarm/config.json`
-- Tests with mock colony
-- Core slash commands: `/antfarm-plan`, `/antfarm-status`, `/antfarm-start`, `/antfarm-done`, `/antfarm-review`
-- Review flow working end-to-end via MCP tools
-- Error handling: colony unavailable, auth failure, stale MCP connection, timeouts
+BUT if A is kicked back at t5 instead:
+t5': A kicked back → ready/
+t6': CASCADE: B also kicked back (depends on A, status=done)
+t7': A re-forages, rebuilds fresh
+t8': A merged
+t9': B re-forages, builds against main+A (correct code)
+t10': B reviewed, merged ✓
+```
 
-### Milestone 2 — Plugin UX
+### Independent tasks, one fails
 
-Packaging, automation, and polish. Value is high but not blocking.
+```
+A (touches: auth) and B (touches: api) — no dependency
+A review → needs_changes → kicked back
+B review → pass → merged ✓ (independent, not blocked)
+A rebuilds, re-reviewed, merged ✓
 
-- Plugin `package.json` + `claude plugins install` workflow
-- Remaining slash commands: `/antfarm-blockers`, `/antfarm-merge-ready`
-- Safe hooks: heartbeat (default on), failure trail (default on), workspace observe (opt-in)
-- Agent definitions: `worker.md`, `planner.md`, `reviewer.md`
-- End-to-end test: `/antfarm-plan` → workers build → `/antfarm-review` → merge
-- Install docs and skill reference
+Cascade does NOT apply — no dependency edge.
+```
+
+### Scope overlap without dependency
+
+```
+A and B both touch api/ — no dependency declared
+A merges first (higher priority)
+B merge attempt: git merge onto main+A
+  ├─ Conflict → kickback B, rebuild on main+A ✓
+  └─ No conflict, tests pass → merged ✓
+
+Planner should have declared a dependency. Plan review catches this.
+```
+
+### Infinite kickback loop (prevented)
+
+```
+Task A fails tests. Kicked back, attempt 1.
+A re-forages, rebuilt. Same tests fail. Kicked back, attempt 2.
+A re-forages, rebuilt. Same tests fail. Attempt 3 = max_attempts.
+A → blocked status.
+Queen updates mission: blocked_task_ids += [A]
+If all remaining tasks depend on A → mission → blocked
+Morning report: "task-auth-03 blocked after 3 attempts: TEST_FAILURE"
+```
+
+### Planner produces bad plan
+
+```
+Plan review catches: "task-02 should depend on task-03 (JWT needs user table)"
+Reviewer verdict: needs_changes
+Queen creates re-plan task with feedback
+Planner re-plans with corrected deps
+Re-plan review → pass
+Child tasks created with correct deps ✓
+
+If re-plan also fails review: mission → failed
+```
+
+### Rate limit exhaustion
+
+```
+8 builders running. All hit API rate limit.
+All report cooldown_until via heartbeat.
+Autoscaler sees: 8/8 in cooldown.
+Action: do NOT start more (rate limits are per-account, not per-worker).
+Workers resume when cooldown expires.
+```
+
+### Node goes offline mid-build
+
+```
+Builder on mac-studio-1 loses network.
+Heartbeat stops → doctor daemon detects stale worker (5 min interval)
+Doctor --fix: deregisters worker, requeues task
+Autoscaler: sees fewer builders, starts replacement (on available node)
+Task re-forages with fresh attempt ✓
+```
+
+### All tasks done, some blocked
+
+```
+10 tasks, 8 merged, 1 blocked, 1 waiting on blocked (dep)
+Queen: no more progress possible
+Mission → complete (best-effort) or blocked (depends on config)
+Report generated:
+  "8/10 merged. 1 blocked (task-auth-03: test failure, 3 attempts).
+   1 waiting (task-api-05: depends on blocked task-auth-03)."
+```
+
+### Mission stall detection
+
+```
+Mission in "building" state. No task progress for 30 minutes.
+Queen detects: last_progress_at + stall_threshold < now
+Queen logs warning in mission trail
+If stall persists for 2x threshold: mission → blocked
+Report: "mission stalled — no progress for 60 minutes. Check worker logs."
+```
 
 ---
 
-## Success Criteria
+## Colony Daemon Threads (v0.6.0)
 
-### Scenario A: Plan from Claude Code
-User types `/antfarm-plan "Build user auth with JWT"` in Claude Code. Antfarm decomposes into 5 tasks, shows them, user confirms, tasks appear in colony queue.
-
-### Scenario B: Work from Claude Code
-User types `/antfarm-start`. Claude Code registers as worker, forages a task, sets up worktree, and starts implementing. Heartbeat runs automatically via hook.
-
-### Scenario C: Review from Claude Code
-User types `/antfarm-review task-42`. Claude Code fetches the review pack (artifact, files changed, risks) and presents a formatted review.
-
-### Scenario D: Status at a Glance
-User types `/antfarm-status`. Sees: 2 workers active, 3 tasks done, 1 blocked (needs human decision), 1 ready.
-
-### Scenario E: Colony Unavailable
-Colony is down or auth fails. Claude Code surfaces a clear error ("Cannot reach Antfarm colony at http://localhost:7433 — is it running?") and does not leave the user guessing about plugin state. MCP tools return structured error responses, not silent failures.
-
-### Scenario F: Session Interruption
-Claude Code session stops mid-task (crash, user closes terminal, network drop). Antfarm does **not** falsely harvest the task. Task remains in `active/` status. Heartbeat expires naturally. Doctor detects the stale task and can recover it. Operator can resume or reassign cleanly.
-
-### Scenario G: Stale MCP Connection
-Colony restarts but MCP client has a cached connection. Next MCP tool call gets a connection error. MCP server retries with a fresh connection and surfaces the error clearly if retry also fails. No silent data loss or phantom success.
+| Thread | Responsibility | Poll interval | Started by |
+|--------|---------------|---------------|------------|
+| **Soldier** | Merge done tasks into integration branch | 30s | `--no-soldier` to disable |
+| **Queen** | Advance missions through lifecycle phases | 10-60s (adaptive) | Active when missions exist |
+| **Doctor** | Detect and fix stale workers/tasks/guards | 300s | `--no-doctor` to disable |
+| **Autoscaler** | Start/stop workers based on queue state | 30s | `--autoscaler` to enable |
 
 ---
 
 ## Dependencies
 
-- **v0.5 must be shipped first** — planner, memory, artifacts, conflict prevention are prerequisites
-- **`mcp` Python package** — for MCP stdio server implementation
-- **Claude Code plugin format** — follow current plugin packaging conventions
+No new external dependencies. All new components use existing primitives:
+- Mission storage uses FileBackend patterns (JSON files in `.antfarm/missions/`)
+- Queen uses ColonyClient or BackendAdapter (like Soldier)
+- Autoscaler uses `subprocess.Popen` for worker management
+- Plan review uses existing reviewer worker + `[REVIEW_VERDICT]` protocol
+
+```toml
+# No changes to pyproject.toml dependencies for v0.6.0
+```
+
+---
+
+## Success Criteria
+
+### Scenario A: Full Autonomous Run
+```
+$ antfarm colony --autoscaler
+$ antfarm mission --spec auth-system-spec.md
+# Go to sleep. Wake up.
+$ antfarm mission report mission-auth-system
+# See: 7/8 merged, 1 blocked, all PRs listed, report shows what needs attention.
+```
+
+### Scenario B: Cascade Recovery
+Task A fails review. Task B (depends on A) was already done. B is automatically kicked back. A is rebuilt, reviewed, merged. B re-forages, builds against correct main, reviewed, merged. No manual intervention.
+
+### Scenario C: Stall Detection
+A builder crashes and doctor hasn't run yet. Queen detects no progress for 30 minutes. Mission marked as stalled. Doctor eventually recovers the task. Builder re-forages. Mission continues.
+
+### Scenario D: Conservative Scaling
+8 tasks queued, but 5 touch the same `api/` scope. Autoscaler starts 4 builders (3 scope groups + 1), not 8. No conflict storms.
+
+### Scenario E: Plan Review Catches Bad Plan
+Planner decomposes spec into 6 tasks but misses a critical dependency. Reviewer catches it. Queen triggers re-plan. Second plan is correct. Builders start with good tasks.
+
+---
 
 ## Explicitly Deferred
 
-- npm publishing of the plugin
-- Agent SDK worker integration (complex, wait for SDK maturity)
-- Multi-colony MCP routing (one colony per MCP server is enough)
-- Web-based MCP (stdio only for v0.6)
+- **Multi-node autoscaling** — v0.6.1
+- **GitHub issue sync** — v0.6.1
+- **Claude Code plugin** — v0.7 (see SPEC_v07.md)
+- **AI-assisted conflict resolution** in Soldier — future
+- **Vector DB / semantic memory** — out of scope
+- **Web dashboard** — out of scope
+- **Recursive missions** (mission spawning sub-missions) — future
+- **Cost tracking / API budget enforcement** — future
