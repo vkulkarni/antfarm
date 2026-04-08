@@ -87,7 +87,7 @@ class Soldier:
                 if result == MergeResult.MERGED:
                     self.colony.mark_merged(task["id"], attempt_id)
                 else:
-                    self.colony.kickback(task["id"], self.last_failure_reason)
+                    self.kickback_with_cascade(task["id"], self.last_failure_reason)
 
     def run_once(self) -> list[tuple[str, MergeResult]]:
         """Process the merge queue once and return results.
@@ -105,7 +105,7 @@ class Soldier:
             if result == MergeResult.MERGED:
                 self.colony.mark_merged(task["id"], attempt_id)
             else:
-                self.colony.kickback(task["id"], self.last_failure_reason)
+                self.kickback_with_cascade(task["id"], self.last_failure_reason)
             results.append((task["id"], result))
         return results
 
@@ -219,10 +219,10 @@ class Soldier:
                     if result == MergeResult.MERGED:
                         self.colony.mark_merged(task_id, attempt_id)
                     else:
-                        self.colony.kickback(task_id, self.last_failure_reason)
+                        self.kickback_with_cascade(task_id, self.last_failure_reason)
                     results.append((task_id, result))
                 else:
-                    self.colony.kickback(task_id, f"review failed: {reason}")
+                    self.kickback_with_cascade(task_id, f"review failed: {reason}")
                     results.append((task_id, MergeResult.FAILED))
                 continue
 
@@ -249,7 +249,7 @@ class Soldier:
             review_verdict = self._extract_verdict_from_review_task(review_task)
             if review_verdict is None:
                 # Review done but no verdict — treat as failure
-                self.colony.kickback(
+                self.kickback_with_cascade(
                     task_id, "review task completed without a ReviewVerdict"
                 )
                 results.append((task_id, MergeResult.FAILED))
@@ -270,10 +270,10 @@ class Soldier:
                 if result == MergeResult.MERGED:
                     self.colony.mark_merged(task_id, attempt_id)
                 else:
-                    self.colony.kickback(task_id, self.last_failure_reason)
+                    self.kickback_with_cascade(task_id, self.last_failure_reason)
                 results.append((task_id, result))
             else:
-                self.colony.kickback(task_id, f"review failed: {reason}")
+                self.kickback_with_cascade(task_id, f"review failed: {reason}")
                 results.append((task_id, MergeResult.FAILED))
 
         return results
@@ -454,6 +454,41 @@ class Soldier:
 
         finally:
             self._cleanup()
+
+    def kickback_with_cascade(
+        self,
+        task_id: str,
+        reason: str,
+        _visited: set[str] | None = None,
+    ) -> None:
+        """Kick back a task and recursively cascade to downstream done tasks.
+
+        Only invalidates non-merged descendants in done status.
+        Does NOT interrupt active tasks — let them finish and the merge
+        gate or next cascade will catch staleness.
+        Uses a visited set to guard against cyclic deps and repeated traversal.
+        """
+        if _visited is None:
+            _visited = set()
+        if task_id in _visited:
+            return
+        _visited.add(task_id)
+
+        self.colony.kickback(task_id, reason)
+
+        all_tasks = self.colony.list_tasks()
+        for task in all_tasks:
+            tid = task.get("id", "")
+            if tid in _visited:
+                continue
+            if task.get("status") != "done":
+                continue
+            if self._has_merged_attempt(task):
+                continue
+            deps = task.get("depends_on") or []
+            if task_id in deps:
+                cascade_reason = f"cascade: upstream {task_id} was kicked back"
+                self.kickback_with_cascade(tid, cascade_reason, _visited=_visited)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -804,12 +839,8 @@ class _BackendAdapter:
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
         self._backend.mark_merged(task_id, attempt_id)
 
-    def kickback(
-        self, task_id: str, reason: str, max_attempts: int = 3
-    ) -> None:
-        self._backend.kickback(
-            task_id, reason, max_attempts=max_attempts
-        )
+    def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
+        self._backend.kickback(task_id, reason, max_attempts=max_attempts)
 
     def store_review_verdict(
         self, task_id: str, attempt_id: str, verdict: dict

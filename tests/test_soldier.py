@@ -498,3 +498,126 @@ def test_cleanup_after_test_failure(soldier_env):
 
     branches = _git(["git", "branch"], cwd=repo)
     assert "antfarm/temp-merge" not in branches.stdout
+
+
+# ---------------------------------------------------------------------------
+# Cascade invalidation tests
+# ---------------------------------------------------------------------------
+
+
+def test_cascade_kickback_downstream_done(soldier_env):
+    """When A is kicked back, B (depends on A, status=done) is also kicked back."""
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+    soldier = soldier_env["soldier"]
+
+    _carry_and_harvest(cc, repo, "task-a", "feat/task-a-cascade")
+    _carry_and_harvest(cc, repo, "task-b", "feat/task-b-cascade", depends_on=["task-a"])
+
+    # Both are done. Kick back A via soldier's cascade method.
+    soldier.kickback_with_cascade("task-a", "merge conflict")
+
+    task_a = cc.get_task("task-a")
+    task_b = cc.get_task("task-b")
+    assert task_a["status"] == "ready"
+    assert task_b["status"] == "ready"
+
+    # B's trail should mention cascade
+    b_trail = [e["message"] for e in task_b["trail"]]
+    assert any("cascade" in msg.lower() for msg in b_trail)
+
+
+def test_cascade_does_not_interrupt_active(soldier_env):
+    """Active downstream tasks are not cascade-kicked-back."""
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+    soldier = soldier_env["soldier"]
+
+    _carry_and_harvest(cc, repo, "task-p", "feat/task-p-active")
+
+    # Create task-q that depends on task-p, but only forage it (leave active)
+    worker_id = "worker-active-q"
+    cc.register_worker(
+        worker_id=worker_id,
+        node_id="node-1",
+        agent_type="generic",
+        workspace_root="/tmp/ws",
+    )
+    cc._client.post(
+        "/tasks",
+        json={
+            "id": "task-q",
+            "title": "Task Q",
+            "spec": "spec",
+            "depends_on": ["task-p"],
+        },
+    ).raise_for_status()
+    task_q = cc.forage(worker_id)
+    assert task_q is not None  # task-q is now active
+
+    soldier.kickback_with_cascade("task-p", "failure")
+
+    task_q_after = cc.get_task("task-q")
+    assert task_q_after["status"] == "active"  # NOT kicked back
+
+
+def test_cascade_does_not_touch_merged(soldier_env):
+    """Merged downstream tasks are not cascade-kicked-back."""
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+    soldier = soldier_env["soldier"]
+
+    _carry_and_harvest(cc, repo, "task-m1", "feat/task-m1")
+
+    # Merge task-m1 first
+    results = soldier.run_once()
+    assert results == [("task-m1", MergeResult.MERGED)]
+
+    # Create and harvest task-m2 that depends on task-m1
+    _carry_and_harvest(cc, repo, "task-m2", "feat/task-m2", depends_on=["task-m1"])
+
+    # Merge m2
+    results2 = soldier.run_once()
+    assert results2 == [("task-m2", MergeResult.MERGED)]
+
+    # Now verify m2 is merged
+    task_m2 = cc.get_task("task-m2")
+    merged_attempts = [a for a in task_m2["attempts"] if a["status"] == "merged"]
+    assert len(merged_attempts) == 1
+
+
+def test_cascade_recursive(soldier_env):
+    """Cascade propagates recursively: A kicked -> B kicked -> C kicked."""
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+    soldier = soldier_env["soldier"]
+
+    _carry_and_harvest(cc, repo, "task-r1", "feat/task-r1")
+    _carry_and_harvest(cc, repo, "task-r2", "feat/task-r2", depends_on=["task-r1"])
+    _carry_and_harvest(cc, repo, "task-r3", "feat/task-r3", depends_on=["task-r2"])
+
+    soldier.kickback_with_cascade("task-r1", "root failure")
+
+    assert cc.get_task("task-r1")["status"] == "ready"
+    assert cc.get_task("task-r2")["status"] == "ready"
+    assert cc.get_task("task-r3")["status"] == "ready"
+
+    # All should have trail entries
+    for tid in ["task-r2", "task-r3"]:
+        trail = [e["message"] for e in cc.get_task(tid)["trail"]]
+        assert any("cascade" in msg.lower() for msg in trail)
+
+
+def test_cascade_does_not_affect_independent(soldier_env):
+    """Independent done tasks are not cascade-kicked-back."""
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+    soldier = soldier_env["soldier"]
+
+    _carry_and_harvest(cc, repo, "task-ind-a", "feat/task-ind-a")
+    _carry_and_harvest(cc, repo, "task-ind-b", "feat/task-ind-b")  # no dep on A
+
+    soldier.kickback_with_cascade("task-ind-a", "failure")
+
+    assert cc.get_task("task-ind-a")["status"] == "ready"
+    assert cc.get_task("task-ind-b")["status"] == "done"  # untouched
