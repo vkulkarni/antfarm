@@ -863,3 +863,134 @@ def test_harvest_without_artifact_backward_compat(backend: FileBackend) -> None:
             assert "artifact" not in a
             break
 
+
+# ---------------------------------------------------------------------------
+# Max-attempt enforcement
+# ---------------------------------------------------------------------------
+
+
+def _kickback_cycle(backend: FileBackend, task_id: str) -> None:
+    """Helper: pull -> harvest -> kickback a task through one full cycle."""
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    assert pulled["id"] == task_id
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested(task_id, attempt_id, pr="pr", branch="branch")
+    backend.kickback(task_id, reason="tests failed", max_attempts=3)
+
+
+def test_kickback_blocks_after_max_attempts(
+    backend: FileBackend, tmp_path: Path
+) -> None:
+    """After max_attempts kickbacks, task transitions to blocked/."""
+    backend.carry(_make_task("task-1"))
+
+    # First two kickbacks: task goes back to ready
+    _kickback_cycle(backend, "task-1")
+    assert backend.get_task("task-1")["status"] == TaskStatus.READY.value
+
+    _kickback_cycle(backend, "task-1")
+    assert backend.get_task("task-1")["status"] == TaskStatus.READY.value
+
+    # Third kickback: blocked (max_attempts=3 means 3 total attempts)
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested(
+        "task-1", attempt_id, pr="pr", branch="branch"
+    )
+    backend.kickback("task-1", reason="tests failed again", max_attempts=3)
+
+    task = backend.get_task("task-1")
+    assert task is not None
+    assert task["status"] == TaskStatus.BLOCKED.value
+    blocked_file = (
+        tmp_path / ".antfarm" / "tasks" / "blocked" / "task-1.json"
+    )
+    assert blocked_file.exists()
+
+
+def test_blocked_task_not_forageable(backend: FileBackend) -> None:
+    """A task in blocked/ should not be returned by pull()."""
+    backend.carry(_make_task("task-1"))
+
+    # Exhaust max attempts (max_attempts=1 -> blocked after first kickback)
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
+    backend.kickback("task-1", reason="fail", max_attempts=1)
+
+    # Task is now blocked — pull should return nothing
+    result = backend.pull("worker-1")
+    assert result is None
+
+
+def test_kickback_under_max_attempts_goes_to_ready(
+    backend: FileBackend,
+) -> None:
+    """Kickback before reaching max_attempts transitions task to ready."""
+    backend.carry(_make_task("task-1"))
+
+    # With max_attempts=5, first kickback should go to ready
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
+    backend.kickback("task-1", reason="fail", max_attempts=5)
+
+    task = backend.get_task("task-1")
+    assert task is not None
+    assert task["status"] == TaskStatus.READY.value
+
+
+def test_per_task_max_attempts_override(backend: FileBackend) -> None:
+    """Task-level max_attempts field overrides the function parameter."""
+    task = _make_task("task-1")
+    task["max_attempts"] = 1  # task says 1 attempt max
+    backend.carry(task)
+
+    # Even though function default is 3, task-level override of 1 wins
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
+    backend.kickback("task-1", reason="fail", max_attempts=3)
+
+    task = backend.get_task("task-1")
+    assert task is not None
+    assert task["status"] == TaskStatus.BLOCKED.value
+
+
+def test_unblock_does_not_reset_attempt_counter(
+    backend: FileBackend,
+) -> None:
+    """After unblocking, the next kickback blocks again (no reset)."""
+    backend.carry(_make_task("task-1"))
+
+    # Exhaust max attempts (max_attempts=1)
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
+    backend.kickback("task-1", reason="fail", max_attempts=1)
+    assert (
+        backend.get_task("task-1")["status"] == TaskStatus.BLOCKED.value
+    )
+
+    # Unblock it
+    backend.unblock_task("task-1")
+    assert (
+        backend.get_task("task-1")["status"] == TaskStatus.READY.value
+    )
+
+    # Another cycle should block again since attempts still counted
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
+    backend.kickback("task-1", reason="fail again", max_attempts=1)
+    assert (
+        backend.get_task("task-1")["status"] == TaskStatus.BLOCKED.value
+    )
+

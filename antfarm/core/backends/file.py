@@ -342,12 +342,18 @@ class FileBackend(TaskBackend):
             self._write_json(active_path, data)
             os.rename(active_path, done_path)
 
-    def kickback(self, task_id: str, reason: str) -> None:
-        """Move task from done/ to ready/. SUPERSEDE current attempt.
+    def kickback(
+        self, task_id: str, reason: str, max_attempts: int = 3
+    ) -> None:
+        """Move task from done/ to ready/ or blocked/ if max attempts exhausted.
 
         Soldier calls kickback after a failed integration merge. The task
         is in done/ at that point (harvested but not yet merged).
         Sets current_attempt to None. Adds failure TrailEntry.
+
+        If total completed/superseded attempts >= effective max, transitions
+        to BLOCKED instead of READY. Per-task ``max_attempts`` overrides the
+        function parameter.
         """
         with self._lock:
             done_path = self._done_path(task_id)
@@ -355,7 +361,6 @@ class FileBackend(TaskBackend):
                 raise FileNotFoundError(f"Task '{task_id}' not found in done/")
 
             data = self._read_json(done_path)
-            assert_task_transition(data["status"], TaskStatus.READY.value)
             now = _now_iso()
 
             current_attempt_id = data.get("current_attempt")
@@ -374,12 +379,34 @@ class FileBackend(TaskBackend):
             data.setdefault("trail", [])
             data["trail"].append(trail_entry.to_dict())
 
-            data["status"] = TaskStatus.READY.value
             data["current_attempt"] = None
             data["updated_at"] = now
 
-            self._write_json(done_path, data)
-            os.rename(done_path, self._ready_path(task_id))
+            # Determine effective max_attempts (per-task overrides parameter)
+            effective_max = data.get("max_attempts") or max_attempts
+
+            # Count completed/superseded attempts
+            finished = sum(
+                1
+                for a in data["attempts"]
+                if a["status"]
+                in (AttemptStatus.DONE.value, AttemptStatus.SUPERSEDED.value)
+            )
+
+            if finished >= effective_max:
+                assert_task_transition(
+                    data["status"], TaskStatus.BLOCKED.value
+                )
+                data["status"] = TaskStatus.BLOCKED.value
+                self._write_json(done_path, data)
+                os.rename(done_path, self._blocked_path(task_id))
+            else:
+                assert_task_transition(
+                    data["status"], TaskStatus.READY.value
+                )
+                data["status"] = TaskStatus.READY.value
+                self._write_json(done_path, data)
+                os.rename(done_path, self._ready_path(task_id))
 
     def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
         """Transition task from ACTIVE to HARVEST_PENDING.
