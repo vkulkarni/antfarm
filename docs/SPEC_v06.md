@@ -1,6 +1,6 @@
 # Antfarm v0.6 — Autonomous Runs
 
-**Status:** Draft
+**Status:** FROZEN — approved for implementation
 **Date:** 2026-04-07
 **Prerequisite:** v0.5.8 shipped (planner pipeline, review-as-task, structured artifacts, repo memory, conflict prevention)
 **Goal:** Spec in, merged code out, zero human intervention. You submit a mission, go to sleep, read the report in the morning.
