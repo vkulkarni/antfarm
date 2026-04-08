@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import threading
 import time
 from datetime import UTC, datetime
@@ -144,6 +145,7 @@ class HarvestRequest(BaseModel):
 
 class KickbackRequest(BaseModel):
     reason: str
+    max_attempts: int | None = None  # None = use colony default
 
 
 class ReviewVerdictRequest(BaseModel):
@@ -208,6 +210,14 @@ def get_app(
         from antfarm.core.backends.file import FileBackend
 
         _backend = FileBackend(root=data_dir)
+
+    # Load colony config for max_attempts default
+    _max_attempts = 3
+    config_path = os.path.join(data_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            colony_config = json.load(f)
+        _max_attempts = colony_config.get("max_attempts", 3)
 
     app = FastAPI(title="Antfarm Colony")
 
@@ -394,8 +404,11 @@ def get_app(
     @app.post("/tasks/{task_id}/kickback", status_code=200)
     def kickback_task(task_id: str, req: KickbackRequest):
         """Return a task to ready state with the given reason."""
+        effective_max = (
+            req.max_attempts if req.max_attempts is not None else _max_attempts
+        )
         try:
-            _backend.kickback(task_id, req.reason)
+            _backend.kickback(task_id, req.reason, max_attempts=effective_max)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         _emit_event("kickback", task_id, req.reason)

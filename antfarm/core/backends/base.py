@@ -87,15 +87,20 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
-    def kickback(self, task_id: str, reason: str) -> None:
+    def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
         """Transition task to READY, current attempt to SUPERSEDED.
 
         Sets current_attempt to None. Next pull() creates a fresh attempt.
         Adds a failure TrailEntry with the reason.
 
+        If the number of completed/superseded attempts >= max_attempts,
+        the task transitions to BLOCKED instead of READY.
+        Per-task max_attempts field overrides the default.
+
         Args:
             task_id: ID of the task.
             reason: Human-readable reason for the kickback.
+            max_attempts: Maximum number of attempts before blocking (default 3).
         """
         ...
 

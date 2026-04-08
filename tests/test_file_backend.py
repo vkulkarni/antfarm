@@ -863,3 +863,110 @@ def test_harvest_without_artifact_backward_compat(backend: FileBackend) -> None:
             assert "artifact" not in a
             break
 
+
+# ---------------------------------------------------------------------------
+# Max-attempt enforcement
+# ---------------------------------------------------------------------------
+
+
+def test_kickback_blocks_after_max_attempts(backend: FileBackend, tmp_path: Path) -> None:
+    """Task transitions to blocked after max_attempts kickbacks."""
+    backend.carry(_make_task("task-max"))
+
+    for i in range(3):
+        pulled = backend.pull("worker-1")
+        assert pulled is not None
+        attempt_id = pulled["current_attempt"]
+        backend.mark_harvested("task-max", attempt_id, pr=f"pr/{i}", branch=f"feat/{i}")
+        backend.kickback("task-max", reason=f"failure {i}", max_attempts=3)
+
+    # After 3 kickbacks, task should be blocked, not ready
+    blocked_file = tmp_path / ".antfarm" / "tasks" / "blocked" / "task-max.json"
+    ready_file = tmp_path / ".antfarm" / "tasks" / "ready" / "task-max.json"
+    assert blocked_file.exists()
+    assert not ready_file.exists()
+
+    data = json.loads(blocked_file.read_text())
+    assert data["status"] == TaskStatus.BLOCKED.value
+    assert "max attempts" in data["trail"][-1]["message"].lower()
+
+
+def test_blocked_task_not_forageable(backend: FileBackend) -> None:
+    """A blocked task should not be returned by pull()."""
+    backend.carry(_make_task("task-blk"))
+
+    # Pull, harvest, kickback to blocked
+    for i in range(3):
+        pulled = backend.pull("worker-1")
+        assert pulled is not None
+        attempt_id = pulled["current_attempt"]
+        backend.mark_harvested("task-blk", attempt_id, pr=f"pr/{i}", branch=f"feat/{i}")
+        backend.kickback("task-blk", reason=f"failure {i}", max_attempts=3)
+
+    # Now try to pull — should return None (only task is blocked)
+    result = backend.pull("worker-1")
+    assert result is None
+
+
+def test_kickback_under_max_attempts_goes_to_ready(
+    backend: FileBackend, tmp_path: Path
+) -> None:
+    """Kickback before max_attempts still transitions to ready."""
+    backend.carry(_make_task("task-ok"))
+    pulled = backend.pull("worker-1")
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-ok", attempt_id, pr="pr/1", branch="feat/1")
+    backend.kickback("task-ok", reason="failure 1", max_attempts=3)
+
+    ready_file = tmp_path / ".antfarm" / "tasks" / "ready" / "task-ok.json"
+    assert ready_file.exists()
+
+
+def test_per_task_max_attempts_override(
+    backend: FileBackend, tmp_path: Path
+) -> None:
+    """Task-level max_attempts overrides the default."""
+    task = _make_task("task-override")
+    task["max_attempts"] = 1
+    backend.carry(task)
+
+    pulled = backend.pull("worker-1")
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-override", attempt_id, pr="pr/1", branch="feat/1")
+    backend.kickback("task-override", reason="failure 1", max_attempts=5)
+
+    # Task had max_attempts=1, should be blocked after 1 kickback
+    blocked_file = tmp_path / ".antfarm" / "tasks" / "blocked" / "task-override.json"
+    assert blocked_file.exists()
+
+
+def test_unblock_does_not_reset_attempt_counter(
+    backend: FileBackend, tmp_path: Path
+) -> None:
+    """Unblocking a task that hit max_attempts will block again on next kickback."""
+    backend.carry(_make_task("task-unblk"))
+
+    # Exhaust max_attempts (3 kickbacks -> blocked)
+    for i in range(3):
+        pulled = backend.pull("worker-1")
+        assert pulled is not None
+        attempt_id = pulled["current_attempt"]
+        backend.mark_harvested("task-unblk", attempt_id, pr=f"pr/{i}", branch=f"feat/{i}")
+        backend.kickback("task-unblk", reason=f"failure {i}", max_attempts=3)
+
+    assert backend.get_task("task-unblk")["status"] == "blocked"
+
+    # Operator unblocks — task goes back to ready
+    backend.unblock_task("task-unblk")
+    assert backend.get_task("task-unblk")["status"] == "ready"
+
+    # Next cycle: pull, harvest, kickback — should block again immediately
+    # because attempt history is NOT reset
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-unblk", attempt_id, pr="pr/retry", branch="feat/retry")
+    backend.kickback("task-unblk", reason="still failing", max_attempts=3)
+
+    assert backend.get_task("task-unblk")["status"] == "blocked"
+

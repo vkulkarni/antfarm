@@ -804,8 +804,8 @@ class _BackendAdapter:
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
         self._backend.mark_merged(task_id, attempt_id)
 
-    def kickback(self, task_id: str, reason: str) -> None:
-        self._backend.kickback(task_id, reason)
+    def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
+        self._backend.kickback(task_id, reason, max_attempts=max_attempts)
 
     def store_review_verdict(
         self, task_id: str, attempt_id: str, verdict: dict
