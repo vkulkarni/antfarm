@@ -150,8 +150,18 @@ class ColonyClient:
         r = self._client.post(f"/tasks/{task_id}/harvest", json=payload)
         r.raise_for_status()
 
-    def kickback(self, task_id: str, reason: str) -> None:
-        r = self._client.post(f"/tasks/{task_id}/kickback", json={"reason": reason})
+    def kickback(
+        self,
+        task_id: str,
+        reason: str,
+        max_attempts: int | None = None,
+    ) -> None:
+        payload: dict = {"reason": reason}
+        if max_attempts is not None:
+            payload["max_attempts"] = max_attempts
+        r = self._client.post(
+            f"/tasks/{task_id}/kickback", json=payload
+        )
         r.raise_for_status()
 
     def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:

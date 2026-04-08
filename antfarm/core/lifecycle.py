@@ -50,7 +50,8 @@ LEGAL_TASK_TRANSITIONS: dict[str, set[str]] = {
     "claimed": {"active"},
     "active": {"harvest_pending", "paused"},
     "harvest_pending": {"done", "failed"},
-    "done": {"merge_ready", "kicked_back", "queued"},  # "queued" = legacy kickback (done→ready)
+    # "queued" = legacy kickback, "blocked" = max-attempt exhaustion
+    "done": {"merge_ready", "kicked_back", "queued", "blocked"},
     "kicked_back": {"queued"},
     "merge_ready": {"merged"},
     "merged": set(),  # terminal

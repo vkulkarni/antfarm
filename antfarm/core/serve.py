@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import threading
 import time
 from datetime import UTC, datetime
@@ -25,6 +26,7 @@ from antfarm.core.backends.base import TaskBackend
 # Module-level state — set by get_app()
 _lock = threading.Lock()
 _backend: TaskBackend | None = None
+_max_attempts: int = 3
 _soldier_status: str = "not started"
 _soldier_thread: threading.Thread | None = None
 
@@ -144,6 +146,7 @@ class HarvestRequest(BaseModel):
 
 class KickbackRequest(BaseModel):
     reason: str
+    max_attempts: int | None = None
 
 
 class ReviewVerdictRequest(BaseModel):
@@ -200,7 +203,7 @@ def get_app(
     Returns:
         Configured FastAPI application.
     """
-    global _backend
+    global _backend, _max_attempts
 
     if backend is not None:
         _backend = backend
@@ -208,6 +211,16 @@ def get_app(
         from antfarm.core.backends.file import FileBackend
 
         _backend = FileBackend(root=data_dir)
+
+    # Load max_attempts default from config
+    config_path = os.path.join(data_dir, "config.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path) as f:
+                cfg = json.load(f)
+            _max_attempts = cfg.get("max_attempts", 3)
+        except (json.JSONDecodeError, OSError):
+            pass
 
     app = FastAPI(title="Antfarm Colony")
 
@@ -393,9 +406,16 @@ def get_app(
 
     @app.post("/tasks/{task_id}/kickback", status_code=200)
     def kickback_task(task_id: str, req: KickbackRequest):
-        """Return a task to ready state with the given reason."""
+        """Return a task to ready (or blocked if max attempts exhausted)."""
+        effective = (
+            req.max_attempts
+            if req.max_attempts is not None
+            else _max_attempts
+        )
         try:
-            _backend.kickback(task_id, req.reason)
+            _backend.kickback(
+                task_id, req.reason, max_attempts=effective
+            )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         _emit_event("kickback", task_id, req.reason)

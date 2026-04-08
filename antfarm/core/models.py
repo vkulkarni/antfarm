@@ -410,6 +410,7 @@ class Task:
     capabilities_required: list[str] = field(default_factory=list)
     pinned_to: str | None = None
     merge_override: int | None = None
+    max_attempts: int | None = None
     status: TaskStatus = TaskStatus.READY
     current_attempt: str | None = None
     attempts: list[Attempt] = field(default_factory=list)
@@ -428,6 +429,7 @@ class Task:
             "capabilities_required": list(self.capabilities_required),
             "pinned_to": self.pinned_to,
             "merge_override": self.merge_override,
+            "max_attempts": self.max_attempts,
             "status": self.status.value,
             "current_attempt": self.current_attempt,
             "attempts": [a.to_dict() for a in self.attempts],
@@ -451,6 +453,7 @@ class Task:
             capabilities_required=list(data.get("capabilities_required", [])),
             pinned_to=data.get("pinned_to"),
             merge_override=data.get("merge_override"),
+            max_attempts=data.get("max_attempts"),
             status=TaskStatus(data.get("status", TaskStatus.READY)),
             current_attempt=data.get("current_attempt"),
             attempts=[Attempt.from_dict(a) for a in data.get("attempts", [])],
