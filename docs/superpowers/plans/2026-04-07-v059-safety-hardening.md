@@ -106,9 +106,41 @@ def test_per_task_max_attempts_override(backend: FileBackend, tmp_path: Path) ->
     assert blocked_file.exists()
 ```
 
-- [ ] **Step 5: Run tests to verify they fail**
+- [ ] **Step 5: Write test — unblock does NOT reset attempt counter**
 
-Run: `pytest tests/test_file_backend.py -k "max_attempts or blocked_task_not_forageable or under_max or per_task_max" -v`
+```python
+def test_unblock_does_not_reset_attempt_counter(backend: FileBackend, tmp_path: Path) -> None:
+    """Unblocking a task that hit max_attempts will block again on next kickback."""
+    backend.carry(_make_task("task-unblk"))
+
+    # Exhaust max_attempts (3 kickbacks → blocked)
+    for i in range(3):
+        pulled = backend.pull("worker-1")
+        assert pulled is not None
+        attempt_id = pulled["current_attempt"]
+        backend.mark_harvested("task-unblk", attempt_id, pr=f"pr/{i}", branch=f"feat/{i}")
+        backend.kickback("task-unblk", reason=f"failure {i}", max_attempts=3)
+
+    assert backend.get_task("task-unblk")["status"] == "blocked"
+
+    # Operator unblocks — task goes back to ready
+    backend.unblock_task("task-unblk")
+    assert backend.get_task("task-unblk")["status"] == "ready"
+
+    # Next cycle: pull, harvest, kickback — should block again immediately
+    # because attempt history is NOT reset
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-unblk", attempt_id, pr="pr/retry", branch="feat/retry")
+    backend.kickback("task-unblk", reason="still failing", max_attempts=3)
+
+    assert backend.get_task("task-unblk")["status"] == "blocked"
+```
+
+- [ ] **Step 6: Run tests to verify they fail**
+
+Run: `pytest tests/test_file_backend.py -k "max_attempts or blocked_task_not_forageable or under_max or per_task_max or unblock_does_not" -v`
 Expected: FAIL — `kickback()` doesn't accept `max_attempts` parameter yet
 
 - [ ] **Step 6: Commit test file**
@@ -345,37 +377,44 @@ Per-task max_attempts field still overrides everything."
 **Files:**
 - Modify: `tests/test_serve.py`
 
-- [ ] **Step 1: Write test — doctor thread starts with colony**
+- [ ] **Step 1: Write test fixture to reset doctor globals between tests**
 
 ```python
-def test_doctor_thread_starts_with_colony(tmp_path: Path) -> None:
-    """Doctor daemon thread starts when enable_doctor=True."""
-    from antfarm.core.serve import get_app, _doctor_thread
+import antfarm.core.serve as serve_mod
 
-    backend = FileBackend(root=str(tmp_path / ".antfarm"))
-    app = get_app(backend=backend, enable_doctor=True)
-    # Give thread a moment to start
-    import time
-    time.sleep(0.2)
-
-    from antfarm.core import serve
-    assert serve._doctor_thread is not None
-    assert serve._doctor_thread.is_alive()
-```
-
-- [ ] **Step 2: Write test — doctor thread does not start when disabled**
-
-```python
-def test_doctor_thread_not_started_when_disabled(tmp_path: Path) -> None:
-    """Doctor daemon does not start when enable_doctor=False."""
-    from antfarm.core.serve import get_app
-
-    backend = FileBackend(root=str(tmp_path / ".antfarm"))
-    # Reset global state
-    import antfarm.core.serve as serve_mod
+@pytest.fixture(autouse=False)
+def reset_doctor_globals():
+    """Reset doctor daemon globals to prevent bleed between tests."""
+    old_thread = serve_mod._doctor_thread
+    old_status = serve_mod._doctor_status
     serve_mod._doctor_thread = None
     serve_mod._doctor_status = "not started"
+    yield
+    # Restore (thread is daemon, will die with process)
+    serve_mod._doctor_thread = old_thread
+    serve_mod._doctor_status = old_status
+```
 
+- [ ] **Step 2: Write test — doctor thread starts with colony**
+
+```python
+def test_doctor_thread_starts_with_colony(tmp_path: Path, reset_doctor_globals) -> None:
+    """Doctor daemon thread starts when enable_doctor=True."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_doctor=True)
+    import time
+    time.sleep(0.3)
+
+    assert serve_mod._doctor_thread is not None
+    assert serve_mod._doctor_thread.is_alive()
+```
+
+- [ ] **Step 3: Write test — doctor thread does not start when disabled**
+
+```python
+def test_doctor_thread_not_started_when_disabled(tmp_path: Path, reset_doctor_globals) -> None:
+    """Doctor daemon does not start when enable_doctor=False."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
     app = get_app(backend=backend, enable_doctor=False)
 
     assert serve_mod._doctor_thread is None
@@ -571,10 +610,37 @@ def test_orphan_worktree_no_changes_auto_deleted(setup, tmp_path):
     assert any(str(orphan) in f.message or "task-orphan" in f.message for f in orphan_findings)
 ```
 
-- [ ] **Step 3: Run test to verify current behavior**
+- [ ] **Step 3: Write test — clean orphan worktree is deleted on fix**
+
+```python
+def test_orphan_worktree_clean_deleted_on_fix(tmp_path):
+    """A provably clean orphan worktree is auto-deleted with --fix."""
+    # Create a real git repo and worktree to test actual cleanup
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True)
+    (repo / "file.txt").write_text("init")
+    subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True)
+
+    # Create a worktree (simulating orphan — no active task owns it)
+    wt_path = tmp_path / "workspaces" / "task-orphan-att-001"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feat/orphan", str(wt_path)],
+        cwd=str(repo), capture_output=True, check=True,
+    )
+    assert wt_path.exists()
+
+    from antfarm.core.doctor import _worktree_is_clean
+    assert _worktree_is_clean(str(wt_path)) is True  # no changes
+```
+
+- [ ] **Step 4: Run test to verify current behavior**
 
 Run: `pytest tests/test_doctor.py -k "orphan" -v`
-Expected: Check behavior — test may pass if current code already detects orphans
+Expected: Check behavior — new test may fail if `_worktree_is_clean` doesn't exist yet
 
 - [ ] **Step 4: Update check_orphan_workspaces for smart cleanup**
 
@@ -811,6 +877,11 @@ def kickback_with_cascade(
     Does NOT interrupt active tasks — let them finish and the merge
     gate or next cascade will catch staleness.
     Uses a visited set to guard against cyclic deps and repeated traversal.
+
+    Trail semantics:
+    - Root task gets the original reason (e.g. "merge conflict")
+    - Downstream tasks get cascade reason (e.g. "cascade: upstream task-a was kicked back")
+    - visited set ensures no task is kicked back or trailed twice
     """
     if _visited is None:
         _visited = set()
