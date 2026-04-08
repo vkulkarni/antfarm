@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import json
+import logging
 import os
 import threading
 import time
@@ -22,6 +23,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from antfarm.core.backends.base import TaskBackend
+
+logger = logging.getLogger(__name__)
 
 # Module-level state — set by get_app()
 _lock = threading.Lock()
@@ -80,6 +83,53 @@ def _start_soldier_thread(backend: TaskBackend, data_dir: str) -> None:
 
     _soldier_thread = threading.Thread(target=_soldier_loop, daemon=True, name="soldier")
     _soldier_thread.start()
+
+
+_doctor_thread: threading.Thread | None = None
+_doctor_status: str = "not started"
+
+
+def _start_doctor_thread(
+    backend: TaskBackend, data_dir: str, interval: float = 300.0
+) -> None:
+    """Start the Doctor as a daemon thread (singleton guard)."""
+    global _doctor_thread, _doctor_status
+
+    if _doctor_thread is not None and _doctor_thread.is_alive():
+        return
+
+    from antfarm.core.doctor import run_doctor
+
+    # Load doctor config from colony config, with sensible defaults
+    doctor_config: dict = {"data_dir": data_dir, "worker_ttl": 300, "guard_ttl": 300}
+    config_path = os.path.join(data_dir, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            colony_cfg = json.load(f)
+        doctor_config["worker_ttl"] = colony_cfg.get("worker_ttl", 300)
+        doctor_config["guard_ttl"] = colony_cfg.get("guard_ttl", 300)
+        interval = colony_cfg.get("doctor_interval", interval)
+
+    def _doctor_loop():
+        global _doctor_status
+        _doctor_status = "running"
+        try:
+            while True:
+                time.sleep(interval)
+                try:
+                    findings = run_doctor(backend, doctor_config, fix=True)
+                    for f in findings:
+                        if f.severity == "error":
+                            logger.warning("doctor: %s", f.message)
+                except Exception as e:
+                    logger.error("doctor daemon check failed: %s", e)
+        except Exception as e:
+            _doctor_status = f"error: {e}"
+
+    _doctor_thread = threading.Thread(
+        target=_doctor_loop, daemon=True, name="doctor"
+    )
+    _doctor_thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +238,7 @@ def get_app(
     data_dir: str = ".antfarm",
     auth_secret: str | None = None,
     enable_soldier: bool = False,
+    enable_doctor: bool = False,
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -199,6 +250,7 @@ def get_app(
                      all endpoints except GET /status require a valid token.
         enable_soldier: If True (default), start the Soldier merge engine as a
                         daemon thread.
+        enable_doctor: If True, start the Doctor health-check daemon thread.
 
     Returns:
         Configured FastAPI application.
@@ -231,6 +283,9 @@ def get_app(
 
     if enable_soldier:
         _start_soldier_thread(_backend, data_dir)
+
+    if enable_doctor:
+        _start_doctor_thread(_backend, data_dir)
 
     # ------------------------------------------------------------------
     # Nodes
@@ -653,6 +708,7 @@ def get_app(
         """Return colony status summary."""
         result = _backend.status()
         result["soldier"] = _soldier_status
+        result["doctor"] = _doctor_status
         return result
 
     @app.get("/status/full", status_code=200)
@@ -669,6 +725,7 @@ def get_app(
             "tasks": _backend.list_tasks(),
             "workers": _backend.list_workers(),
             "soldier": _soldier_status,
+            "doctor": _doctor_status,
         }
 
     # ------------------------------------------------------------------

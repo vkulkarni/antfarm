@@ -11,6 +11,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+import antfarm.core.serve as serve_mod
 from antfarm.core.serve import get_app
 
 
@@ -723,3 +724,43 @@ def test_sse_events_on_harvest(tmp_path):
     assert len(events) >= 1
     assert events[0]["type"] == "harvested"
     assert events[0]["task_id"] == "task-001"
+
+
+# ---------------------------------------------------------------------------
+# Doctor daemon thread (#147)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=False)
+def reset_doctor_globals():
+    """Reset doctor daemon globals to prevent bleed between tests."""
+    old_thread = serve_mod._doctor_thread
+    old_status = serve_mod._doctor_status
+    serve_mod._doctor_thread = None
+    serve_mod._doctor_status = "not started"
+    yield
+    # Restore (thread is daemon, will die with process)
+    serve_mod._doctor_thread = old_thread
+    serve_mod._doctor_status = old_status
+
+
+def test_doctor_thread_starts_with_colony(tmp_path, reset_doctor_globals):
+    """Doctor daemon thread starts when enable_doctor=True."""
+    from antfarm.core.backends.file import FileBackend
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    get_app(backend=backend, enable_doctor=True)
+    time.sleep(0.3)
+
+    assert serve_mod._doctor_thread is not None
+    assert serve_mod._doctor_thread.is_alive()
+
+
+def test_doctor_thread_not_started_when_disabled(tmp_path, reset_doctor_globals):
+    """Doctor daemon does not start when enable_doctor=False."""
+    from antfarm.core.backends.file import FileBackend
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    get_app(backend=backend, enable_doctor=False)
+
+    assert serve_mod._doctor_thread is None
