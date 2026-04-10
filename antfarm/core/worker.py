@@ -382,13 +382,30 @@ class WorkerRuntime:
                 task, attempt_id, result.stdout + result.stderr
             )
             if plan_result:
-                artifact = {
-                    "plan_task_id": task_id,
-                    "created_task_ids": plan_result["created_ids"],
-                    "task_count": len(plan_result["created_ids"]),
-                    "warnings": plan_result["warnings"],
-                    "dependency_summary": plan_result["dep_summary"],
-                }
+                is_mission_mode = plan_result.get("mission_mode", False)
+                if is_mission_mode:
+                    artifact = {
+                        "plan_task_id": task_id,
+                        "plan_artifact": plan_result["plan_artifact"],
+                        "task_count": plan_result["plan_artifact"]["task_count"],
+                        "warnings": plan_result["warnings"],
+                        "dependency_summary": plan_result["dep_summary"],
+                    }
+                    trail_msg = (
+                        f"plan complete (mission mode): "
+                        f"{plan_result['plan_artifact']['task_count']} tasks proposed"
+                    )
+                else:
+                    artifact = {
+                        "plan_task_id": task_id,
+                        "created_task_ids": plan_result["created_ids"],
+                        "task_count": len(plan_result["created_ids"]),
+                        "warnings": plan_result["warnings"],
+                        "dependency_summary": plan_result["dep_summary"],
+                    }
+                    trail_msg = (
+                        f"plan complete: created {len(plan_result['created_ids'])} tasks"
+                    )
                 with contextlib.suppress(Exception):
                     self.colony.mark_harvest_pending(task_id, attempt_id)
                 with contextlib.suppress(Exception):
@@ -397,10 +414,7 @@ class WorkerRuntime:
                         artifact=artifact,
                     )
                 with contextlib.suppress(Exception):
-                    self.colony.trail(
-                        task_id, self.worker_id,
-                        f"plan complete: created {len(plan_result['created_ids'])} tasks",
-                    )
+                    self.colony.trail(task_id, self.worker_id, trail_msg)
                 return True
 
             # Plan parsing failed — trail the error
@@ -759,7 +773,36 @@ class WorkerRuntime:
         warnings = engine.generate_warnings(plan_result)
         warn_strs = [str(w) for w in warnings] if isinstance(warnings, list) else []
 
-        # Carry each child task
+        # Build dependency summary
+        dep_pairs: list[str] = []
+        for i, t in enumerate(resolved_tasks):
+            for dep in t.depends_on:
+                dep_pairs.append(f"{dep} → {child_ids[i]}")
+        dep_summary = ", ".join(dep_pairs) if dep_pairs else "all parallel"
+
+        # ---- MISSION MODE ----
+        if task.get("mission_id"):
+            from antfarm.core.missions import PlanArtifact as MissionPlanArtifact
+
+            plan_artifact = MissionPlanArtifact(
+                plan_task_id=task["id"],
+                attempt_id=attempt_id,
+                proposed_tasks=[
+                    t.to_carry_dict(child_ids[i])
+                    for i, t in enumerate(resolved_tasks)
+                ],
+                task_count=len(resolved_tasks),
+                warnings=warn_strs,
+                dependency_summary=dep_summary,
+            )
+            return {
+                "mission_mode": True,
+                "plan_artifact": plan_artifact.to_dict(),
+                "warnings": warn_strs,
+                "dep_summary": dep_summary,
+            }
+
+        # ---- LEGACY (non-mission) MODE: carry each child task ----
         created_ids: list[str] = []
         failed_ids: list[str] = []
         for i, proposed_task in enumerate(resolved_tasks):
@@ -811,13 +854,6 @@ class WorkerRuntime:
                     f"{len(failed_ids)} failed: {', '.join(failed_ids)}",
                 )
             return None
-
-        # Build dependency summary
-        dep_pairs: list[str] = []
-        for i, t in enumerate(resolved_tasks):
-            for dep in t.depends_on:
-                dep_pairs.append(f"{dep} → {child_ids[i]}")
-        dep_summary = ", ".join(dep_pairs) if dep_pairs else "all parallel"
 
         return {
             "created_ids": created_ids,

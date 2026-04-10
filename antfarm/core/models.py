@@ -193,6 +193,9 @@ class TaskArtifact:
     risks: list[str] = field(default_factory=list)
     review_focus: list[str] = field(default_factory=list)
 
+    # Mission-mode plan output (only present on planner tasks in a mission)
+    plan_artifact: dict | None = None
+
     def to_dict(self) -> dict:
         return {
             "task_id": self.task_id,
@@ -219,6 +222,7 @@ class TaskArtifact:
             "summary": self.summary,
             "risks": list(self.risks),
             "review_focus": list(self.review_focus),
+            "plan_artifact": self.plan_artifact,
         }
 
     @classmethod
@@ -248,6 +252,7 @@ class TaskArtifact:
             summary=data.get("summary"),
             risks=list(data.get("risks", [])),
             review_focus=list(data.get("review_focus", [])),
+            plan_artifact=data.get("plan_artifact"),
         )
 
 
