@@ -35,6 +35,10 @@ _soldier_thread: threading.Thread | None = None
 _queen_thread: threading.Thread | None = None
 _queen_status: str = "not started"
 
+_autoscaler_thread: threading.Thread | None = None
+_autoscaler_status: str = "not started"
+_autoscaler_instance = None
+
 # SSE event bus
 _event_queue: collections.deque = collections.deque(maxlen=1000)
 _event_counter: int = 0
@@ -160,6 +164,35 @@ def _start_queen_thread(backend: TaskBackend) -> None:
     _queen_thread.start()
 
 
+def _start_autoscaler_thread(
+    backend: TaskBackend,
+    autoscaler_config,
+) -> None:
+    """Start the Autoscaler as a daemon thread (singleton guard)."""
+    global _autoscaler_thread, _autoscaler_status, _autoscaler_instance
+
+    if _autoscaler_thread is not None and _autoscaler_thread.is_alive():
+        return
+
+    from antfarm.core.autoscaler import Autoscaler
+
+    _autoscaler_instance = Autoscaler(backend, autoscaler_config)
+
+    def _autoscaler_loop():
+        global _autoscaler_status
+        _autoscaler_status = "running"
+        try:
+            _autoscaler_instance.run()
+        except Exception as e:
+            _autoscaler_status = f"error: {e}"
+            logger.error("autoscaler thread crashed: %s", e)
+
+    _autoscaler_thread = threading.Thread(
+        target=_autoscaler_loop, daemon=True, name="autoscaler"
+    )
+    _autoscaler_thread.start()
+
+
 # ---------------------------------------------------------------------------
 # Request models
 # ---------------------------------------------------------------------------
@@ -280,6 +313,7 @@ def get_app(
     enable_soldier: bool = False,
     enable_doctor: bool = False,
     enable_queen: bool = True,
+    autoscaler_config=None,
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -294,6 +328,8 @@ def get_app(
         enable_doctor: If True, start the Doctor health-check daemon thread.
         enable_queen: If True (default), start the Queen mission controller as
                       a daemon thread. Requires FileBackend — skips for GitHubBackend.
+        autoscaler_config: Optional AutoscalerConfig. When provided and
+                           ``enabled=True``, starts the Autoscaler daemon thread.
 
     Returns:
         Configured FastAPI application.
@@ -337,6 +373,9 @@ def get_app(
             logger.info("queen: skipping — GitHubBackend not supported in v0.6.0")
         else:
             _start_queen_thread(_backend)
+
+    if autoscaler_config is not None and autoscaler_config.enabled:
+        _start_autoscaler_thread(_backend, autoscaler_config)
 
     # ------------------------------------------------------------------
     # Nodes
@@ -887,6 +926,7 @@ def get_app(
         result["soldier"] = _soldier_status
         result["doctor"] = _doctor_status
         result["queen"] = _queen_status
+        result["autoscaler"] = _autoscaler_status
         return result
 
     @app.get("/status/full", status_code=200)
@@ -905,6 +945,7 @@ def get_app(
             "soldier": _soldier_status,
             "doctor": _doctor_status,
             "queen": _queen_status,
+            "autoscaler": _autoscaler_status,
         }
 
     # ------------------------------------------------------------------
