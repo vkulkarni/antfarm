@@ -196,3 +196,26 @@ def test_get_mission_report_returns_report(client):
     data = r.json()
     assert data["mission_id"] == "mission-001"
     assert data["total_tasks"] == 5
+
+
+# ---------------------------------------------------------------------------
+# GitHubBackend preflight
+# ---------------------------------------------------------------------------
+
+
+def test_create_mission_rejects_github_backend(tmp_path):
+    """POST /missions returns 400 when backend is GitHubBackend."""
+    from unittest.mock import MagicMock
+
+    from antfarm.core.backends.github import GitHubBackend
+
+    mock_backend = MagicMock(spec=GitHubBackend)
+    # Make isinstance() check work
+    mock_backend.__class__ = GitHubBackend
+    app = get_app(backend=mock_backend)
+    gh_client = TestClient(app)
+
+    r = gh_client.post("/missions", json={"spec": "test"})
+    assert r.status_code == 400
+    assert "FileBackend" in r.json()["detail"]
+    assert "v0.6.0" in r.json()["detail"]

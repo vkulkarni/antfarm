@@ -388,12 +388,11 @@ def get_app(
         }
         if req.spawned_by:
             task["spawned_by"] = req.spawned_by
-        if req.mission_id:
-            task["mission_id"] = req.mission_id
 
         if req.mission_id:
             from antfarm.core.missions import link_task_to_mission
 
+            task["mission_id"] = req.mission_id
             try:
                 task_id = link_task_to_mission(_backend, task, req.mission_id)
             except FileNotFoundError as exc:
