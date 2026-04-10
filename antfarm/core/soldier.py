@@ -673,11 +673,25 @@ class Soldier:
 
         Idempotent: if review-{task_id} already exists, returns None without error.
         Includes review pack in the spec when artifact is available.
+        Propagates mission_id from the parent task to the review task.
+        Suppresses review-task creation when the parent mission is CANCELLED.
 
         Returns the review task ID, or None if creation failed or already exists.
         """
         task_id = task["id"]
         review_task_id = f"review-{task_id}"
+
+        # Suppress review-task creation for cancelled missions
+        parent_mission_id = task.get("mission_id")
+        if parent_mission_id:
+            mission = self.colony.get_mission(parent_mission_id)
+            if mission is not None and mission.get("status") == "cancelled":
+                logger.info(
+                    "suppressing review task for %s: mission %s is cancelled",
+                    task_id,
+                    parent_mission_id,
+                )
+                return None
 
         # Idempotency: skip if review task already exists
         existing = self.colony.get_task(review_task_id)
@@ -730,6 +744,7 @@ class Soldier:
                 priority=1,
                 complexity="S",
                 capabilities_required=["review"],
+                mission_id=parent_mission_id,
             )
             return review_task_id
         except Exception:
@@ -783,6 +798,7 @@ class _BackendAdapter:
         from datetime import UTC, datetime
 
         now = datetime.now(UTC).isoformat()
+        mission_id = kwargs.get("mission_id")
         task = {
             "id": kwargs.get("task_id", ""),
             "title": kwargs.get("title", ""),
@@ -792,6 +808,7 @@ class _BackendAdapter:
             "depends_on": kwargs.get("depends_on") or [],
             "touches": kwargs.get("touches") or [],
             "capabilities_required": kwargs.get("capabilities_required") or [],
+            "mission_id": mission_id,
             "created_by": "soldier",
             "status": "ready",
             "current_attempt": None,
@@ -801,7 +818,12 @@ class _BackendAdapter:
             "created_at": now,
             "updated_at": now,
         }
-        task_id = self._backend.carry(task)
+        if mission_id:
+            from antfarm.core.missions import link_task_to_mission
+
+            task_id = link_task_to_mission(self._backend, task, mission_id)
+        else:
+            task_id = self._backend.carry(task)
         return {"task_id": task_id}
 
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
@@ -814,3 +836,6 @@ class _BackendAdapter:
         self, task_id: str, attempt_id: str, verdict: dict
     ) -> None:
         self._backend.store_review_verdict(task_id, attempt_id, verdict)
+
+    def get_mission(self, mission_id: str) -> dict | None:
+        return self._backend.get_mission(mission_id)

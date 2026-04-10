@@ -636,3 +636,173 @@ def test_cascade_does_not_affect_independent(soldier_env):
 
     assert cc.get_task("task-ind-a")["status"] == "ready"
     assert cc.get_task("task-ind-b")["status"] == "done"  # untouched
+
+
+# ---------------------------------------------------------------------------
+# Mission-ID propagation tests
+# ---------------------------------------------------------------------------
+
+
+def _make_mission(backend, mission_id, status="building"):
+    """Helper to create a mission directly in the backend."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    mission = {
+        "mission_id": mission_id,
+        "spec": "test spec",
+        "spec_file": None,
+        "status": status,
+        "plan_task_id": None,
+        "plan_artifact": None,
+        "task_ids": [],
+        "blocked_task_ids": [],
+        "config": {
+            "max_attempts": 3,
+            "max_parallel_builders": 4,
+            "require_plan_review": True,
+            "stall_threshold_minutes": 30,
+            "completion_mode": "best_effort",
+            "test_command": None,
+            "integration_branch": "main",
+            "blocked_timeout_action": "wait",
+            "blocked_timeout_minutes": 120,
+        },
+        "created_at": now,
+        "updated_at": now,
+        "completed_at": None,
+        "report": None,
+        "last_progress_at": now,
+        "re_plan_count": 0,
+    }
+    backend.create_mission(mission)
+    return mission
+
+
+def _make_done_task_with_mission(backend, task_id, mission_id=None):
+    """Helper to create a done task with a mission_id and a current attempt."""
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    attempt_id = f"att-{task_id}"
+    task = {
+        "id": task_id,
+        "title": f"Task {task_id}",
+        "spec": "do the thing",
+        "complexity": "M",
+        "priority": 10,
+        "depends_on": [],
+        "touches": [],
+        "capabilities_required": [],
+        "mission_id": mission_id,
+        "created_by": "test",
+        "status": "ready",
+        "current_attempt": None,
+        "attempts": [],
+        "trail": [],
+        "signals": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    backend.carry(task)
+
+    # Register worker, pull, and harvest to get a proper done task with attempt
+    worker = {
+        "worker_id": f"w-{task_id}",
+        "node_id": "node-1",
+        "agent_type": "generic",
+        "workspace_root": "/tmp/ws",
+        "status": "idle",
+        "registered_at": now,
+        "last_heartbeat": now,
+    }
+    backend.register_worker(worker)
+    backend.pull(f"w-{task_id}")
+    pulled = backend.get_task(task_id)
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested(task_id, attempt_id, pr=f"PR-{task_id}", branch=f"feat/{task_id}")
+    return backend.get_task(task_id)
+
+
+def test_soldier_review_task_inherits_mission_id(tmp_path):
+    """Review task created by Soldier inherits mission_id from parent task."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    mission_id = "mission-test-inherit"
+    _make_mission(backend, mission_id)
+
+    task = _make_done_task_with_mission(backend, "task-mi-1", mission_id=mission_id)
+    # Add task to mission's task_ids
+    backend.update_mission(mission_id, {"task_ids": [task["id"]]})
+
+    soldier = Soldier.from_backend(
+        backend,
+        repo_path=str(tmp_path),
+        require_review=True,
+    )
+    review_id = soldier.create_review_task(task)
+    assert review_id == "review-task-mi-1"
+
+    review_task = backend.get_task(review_id)
+    assert review_task is not None
+    assert review_task.get("mission_id") == mission_id
+
+
+def test_soldier_review_task_appended_to_mission_task_ids(tmp_path):
+    """Review task ID is appended to the parent mission's task_ids."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    mission_id = "mission-test-append"
+    _make_mission(backend, mission_id)
+
+    task = _make_done_task_with_mission(backend, "task-mi-2", mission_id=mission_id)
+    backend.update_mission(mission_id, {"task_ids": [task["id"]]})
+
+    soldier = Soldier.from_backend(
+        backend,
+        repo_path=str(tmp_path),
+        require_review=True,
+    )
+    review_id = soldier.create_review_task(task)
+    assert review_id == "review-task-mi-2"
+
+    mission = backend.get_mission(mission_id)
+    assert review_id in mission["task_ids"]
+
+
+def test_soldier_review_task_no_mission_id_when_parent_has_none(tmp_path):
+    """When parent task has no mission_id, review task also has no mission_id."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+
+    task = _make_done_task_with_mission(backend, "task-no-mission", mission_id=None)
+
+    soldier = Soldier.from_backend(
+        backend,
+        repo_path=str(tmp_path),
+        require_review=True,
+    )
+    review_id = soldier.create_review_task(task)
+    assert review_id == "review-task-no-mission"
+
+    review_task = backend.get_task(review_id)
+    assert review_task is not None
+    assert review_task.get("mission_id") is None
+
+
+def test_soldier_suppresses_review_for_cancelled_mission(tmp_path):
+    """Soldier does NOT create a review task when mission is CANCELLED."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    mission_id = "mission-cancelled"
+    _make_mission(backend, mission_id, status="cancelled")
+
+    task = _make_done_task_with_mission(backend, "task-cancelled", mission_id=mission_id)
+
+    soldier = Soldier.from_backend(
+        backend,
+        repo_path=str(tmp_path),
+        require_review=True,
+    )
+    review_id = soldier.create_review_task(task)
+    assert review_id is None
+
+    # Confirm no review task was created
+    review_task = backend.get_task("review-task-cancelled")
+    assert review_task is None
