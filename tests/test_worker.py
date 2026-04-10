@@ -1056,3 +1056,190 @@ def test_planner_prompt_includes_plan_instructions(tmp_path, http_client):
     assert "PLANNER" in prompt
     assert "[PLAN_RESULT]" in prompt
     assert "Maximum 10 tasks" in prompt
+
+
+# ---------------------------------------------------------------------------
+# v0.6.0: Planner mission mode (#164)
+# ---------------------------------------------------------------------------
+
+
+def _carry_mission_plan(tc, task_id="plan-mission", title="Mission Plan", spec="plan this",
+                        mission_id="mission-001"):
+    """Carry a plan task with mission_id set."""
+    # First create the mission so link_task_to_mission works
+    tc.post("/missions", json={"mission_id": mission_id, "spec": "test mission"})
+    r = tc.post("/tasks", json={
+        "id": task_id,
+        "title": title,
+        "spec": spec,
+        "capabilities_required": ["plan"],
+        "mission_id": mission_id,
+    })
+    assert r.status_code == 201
+    return r.json()
+
+
+def test_planner_mission_mode_stores_artifact(tc, tmp_path, http_client):
+    """Plan task with mission_id stores plan_artifact, no children carried."""
+    _carry_mission_plan(tc, task_id="plan-m-001", mission_id="mission-art")
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    plan_json = _json.dumps([
+        {"title": "Task A", "spec": "do A", "touches": ["api"],
+         "depends_on": [], "priority": 5, "complexity": "S"},
+        {"title": "Task B", "spec": "do B", "touches": ["db"],
+         "depends_on": [1], "priority": 10, "complexity": "M"},
+    ])
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(
+            returncode=0,
+            stdout=_plan_agent_output(plan_json),
+            stderr="",
+            branch="",
+        )
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    # Plan task should be harvested (done)
+    r = tc.get("/tasks/plan-m-001")
+    task = r.json()
+    assert task["status"] == "done"
+
+    # Harvest artifact should contain plan_artifact
+    attempt = task["attempts"][0]
+    assert attempt["status"] == "done"
+    artifact = attempt.get("artifact", {})
+    assert artifact is not None
+    assert "plan_artifact" in artifact
+    pa = artifact["plan_artifact"]
+    assert pa["plan_task_id"] == "plan-m-001"
+    assert pa["task_count"] == 2
+    assert len(pa["proposed_tasks"]) == 2
+    assert pa["proposed_tasks"][0]["title"] == "Task A"
+
+    # No children should have been carried
+    r = tc.get("/tasks/task-m-001-01")
+    assert r.status_code == 404
+
+    r = tc.get("/tasks/task-m-001-02")
+    assert r.status_code == 404
+
+    # Trail should mention mission mode
+    messages = [e["message"] for e in task["trail"]]
+    assert any("mission mode" in m for m in messages)
+
+
+def test_planner_legacy_mode_carries_children(tc, tmp_path, http_client):
+    """Plan task without mission_id carries children directly (existing behavior)."""
+    _carry_plan(tc, task_id="plan-legacy")
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    plan_json = _json.dumps([
+        {"title": "Legacy Child", "spec": "do legacy", "touches": ["api"],
+         "depends_on": [], "priority": 5, "complexity": "S"},
+    ])
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(
+            returncode=0,
+            stdout=_plan_agent_output(plan_json),
+            stderr="",
+            branch="",
+        )
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    # Plan task should be done
+    r = tc.get("/tasks/plan-legacy")
+    assert r.json()["status"] == "done"
+
+    # Child task SHOULD have been carried (legacy mode)
+    r = tc.get("/tasks/task-legacy-01")
+    assert r.status_code == 200
+    assert r.json()["title"] == "Legacy Child"
+
+
+def test_planner_mission_mode_invalid_plan_trails_and_no_artifact(tc, tmp_path, http_client):
+    """Mission plan task with invalid plan output trails error, no artifact."""
+    _carry_mission_plan(tc, task_id="plan-m-bad", mission_id="mission-bad")
+    rt = _make_planner_runtime(tmp_path, http_client)
+
+    def plan_agent(task, workspace) -> AgentResult:
+        return AgentResult(
+            returncode=0,
+            stdout="no plan tags here",
+            stderr="",
+            branch="",
+        )
+
+    rt._launch_agent = plan_agent
+    rt.run()
+
+    # Plan task stays active (not harvested)
+    r = tc.get("/tasks/plan-m-bad")
+    task = r.json()
+    assert task["status"] == "active"
+
+    # Trail should mention parsing failure
+    messages = [e["message"] for e in task["trail"]]
+    assert any("could not parse" in m for m in messages)
+
+
+def test_task_artifact_plan_artifact_roundtrip():
+    """TaskArtifact.plan_artifact field roundtrips through to_dict/from_dict."""
+    from antfarm.core.models import TaskArtifact
+
+    plan_data = {
+        "plan_task_id": "plan-rt",
+        "attempt_id": "att-001",
+        "proposed_tasks": [{"title": "T1", "spec": "do T1"}],
+        "task_count": 1,
+        "warnings": ["watch out"],
+        "dependency_summary": "all parallel",
+    }
+
+    art = TaskArtifact(
+        task_id="plan-rt",
+        attempt_id="att-001",
+        worker_id="w1",
+        branch="feat/plan-rt",
+        pr_url=None,
+        base_commit_sha="abc",
+        head_commit_sha="def",
+        target_branch="main",
+        target_branch_sha_at_harvest="ghi",
+        plan_artifact=plan_data,
+    )
+
+    d = art.to_dict()
+    assert d["plan_artifact"] == plan_data
+
+    restored = TaskArtifact.from_dict(d)
+    assert restored.plan_artifact == plan_data
+
+
+def test_task_artifact_plan_artifact_none_by_default():
+    """TaskArtifact.plan_artifact is None by default (non-plan tasks)."""
+    from antfarm.core.models import TaskArtifact
+
+    art = TaskArtifact(
+        task_id="t1",
+        attempt_id="att-001",
+        worker_id="w1",
+        branch="feat/t1",
+        pr_url=None,
+        base_commit_sha="abc",
+        head_commit_sha="def",
+        target_branch="main",
+        target_branch_sha_at_harvest="ghi",
+    )
+
+    assert art.plan_artifact is None
+    d = art.to_dict()
+    assert d["plan_artifact"] is None
+
+    restored = TaskArtifact.from_dict(d)
+    assert restored.plan_artifact is None
