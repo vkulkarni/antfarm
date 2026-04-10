@@ -66,7 +66,7 @@ class AntfarmTUI:
                 pass
 
     def _build_display(self) -> Layout:
-        """Fetch status + tasks + workers and build the display."""
+        """Fetch status + tasks + workers + missions and build the display."""
         try:
             full = self._fetch("/status/full")
             status = full.get("status", {})
@@ -78,11 +78,18 @@ class AntfarmTUI:
             layout.update(Panel(f"[red]Connection error: {exc}[/red]", title="Antfarm TUI"))
             return layout
 
+        try:
+            missions = self._fetch("/missions")
+        except Exception:
+            missions = []
+
         snap = self._classify_tasks(tasks)
 
         layout = Layout()
+        missions_size = max(5, min(len(missions) + 4, 10)) if missions else 5
         layout.split_column(
             Layout(name="header", size=10),
+            Layout(name="missions", size=missions_size),
             Layout(name="workers", size=max(5, len(workers) + 5)),
             Layout(name="waiting", size=7),
             Layout(name="planning", size=5),
@@ -116,6 +123,13 @@ class AntfarmTUI:
             Panel(
                 self._render_summary(status, tasks, workers, snap, soldier_status),
                 title="[bold blue]Antfarm Colony[/bold blue]",
+            )
+        )
+
+        layout["missions"].update(
+            Panel(
+                self._render_missions(missions),
+                title=f"[bold bright_white]Missions ({len(missions)})[/bold bright_white]",
             )
         )
 
@@ -434,6 +448,84 @@ class AntfarmTUI:
         table.add_row("Pipeline", self._render_pipeline_bar(counts))
 
         return table
+
+    def _render_missions(self, missions: list[dict], max_shown: int = 5) -> Table:
+        """Render mission list with status, task counts, and progress time."""
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
+        table.add_column("ID", max_width=25, no_wrap=True)
+        table.add_column("Status", max_width=15, no_wrap=True)
+        table.add_column("Tasks", max_width=8, no_wrap=True)
+        table.add_column("Progress", max_width=20, no_wrap=True)
+
+        if not missions:
+            table.add_row("[dim]--[/dim]", "[dim]No active missions.[/dim]", "", "")
+            return table
+
+        status_style = {
+            "planning": "magenta",
+            "reviewing_plan": "magenta",
+            "building": "yellow",
+            "blocked": "red",
+            "complete": "green",
+            "failed": "red",
+            "cancelled": "dim",
+        }
+
+        shown = missions[:max_shown]
+        for m in shown:
+            mid = m.get("mission_id", "")
+            mstatus = m.get("status", "")
+            style = status_style.get(mstatus, "dim")
+
+            # Task counts: total / merged / blocked
+            task_ids = m.get("task_ids", [])
+            blocked_ids = m.get("blocked_task_ids", [])
+            total = len(task_ids)
+            blocked = len(blocked_ids)
+
+            # Derive merged count from report if available
+            report = m.get("report")
+            merged = report.get("merged_tasks", 0) if report else 0
+            tasks_text = f"{merged}/{total}"
+            if blocked > 0:
+                tasks_text += f" ({blocked}blk)"
+
+            # Progress column
+            progress = self._format_mission_progress(m)
+
+            table.add_row(
+                Text(mid[:23], style=style),
+                Text(mstatus, style=style),
+                Text(tasks_text, style="dim"),
+                Text(progress, style="dim"),
+            )
+
+        self._add_overflow_hint(table, len(missions), max_shown)
+        return table
+
+    def _format_mission_progress(self, mission: dict) -> str:
+        """Format progress column for a mission.
+
+        - complete/failed/cancelled: "done"
+        - blocked with last_progress_at: "stalled <elapsed>"
+        - active with last_progress_at: "<elapsed> ago"
+        - no last_progress_at: "--"
+        """
+        mstatus = mission.get("status", "")
+        if mstatus in ("complete", "failed", "cancelled"):
+            return "done"
+
+        last_progress = mission.get("last_progress_at", "")
+        if not last_progress:
+            return "--"
+
+        elapsed = self._format_elapsed_since(last_progress)
+        if not elapsed:
+            return "--"
+
+        if mstatus == "blocked":
+            return f"stalled {elapsed}"
+        return f"{elapsed} ago"
 
     def _render_pipeline_bar(self, counts: dict, width: int = 50) -> Text:
         """Render colored block chars representing pipeline distribution."""
