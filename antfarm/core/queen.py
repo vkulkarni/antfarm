@@ -25,6 +25,7 @@ from antfarm.core.missions import (
     MissionStatus,
     PlanArtifact,
     is_infra_task,
+    link_task_to_mission,
 )
 
 logger = logging.getLogger(__name__)
@@ -116,7 +117,6 @@ class Queen:
                 mission["mission_id"],
                 {
                     "plan_task_id": plan_task_id,
-                    "task_ids": mission["task_ids"] + [plan_task_id],
                     "last_progress_at": _now_iso(),
                 },
             )
@@ -379,7 +379,7 @@ class Queen:
         }
 
         with contextlib.suppress(ValueError):
-            self.backend.carry(task)  # idempotent: duplicate ID is fine
+            link_task_to_mission(self.backend, task, mission_id)
         return plan_task_id
 
     def _create_plan_review_task(
@@ -428,7 +428,7 @@ class Queen:
         }
 
         with contextlib.suppress(ValueError):
-            self.backend.carry(task)  # idempotent
+            link_task_to_mission(self.backend, task, mission_id)
         return review_task_id
 
     def _create_re_plan_task(self, mission: dict, verdict: dict) -> str:
@@ -468,7 +468,7 @@ class Queen:
         }
 
         with contextlib.suppress(ValueError):
-            self.backend.carry(task)  # idempotent
+            link_task_to_mission(self.backend, task, mission_id)
         return re_plan_task_id
 
     def _spawn_child_tasks(
@@ -520,14 +520,7 @@ class Queen:
             }
 
             with contextlib.suppress(ValueError):
-                self.backend.carry(task)  # idempotent: crash-resume safe
-
-        # Update mission with child task IDs
-        all_task_ids = mission["task_ids"] + child_ids
-        self.backend.update_mission(
-            mission["mission_id"],
-            {"task_ids": all_task_ids},
-        )
+                link_task_to_mission(self.backend, task, mission_id)
 
         return child_ids
 
