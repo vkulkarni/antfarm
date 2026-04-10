@@ -57,6 +57,26 @@ def _mark_merged(client: TestClient, task_id: str, attempt_id: str) -> None:
     resp.raise_for_status()
 
 
+def _kickback(client: TestClient, task_id: str, reason: str, max_attempts: int = 3) -> None:
+    """Simulate Soldier kicking back a task."""
+    resp = client.post(
+        f"/tasks/{task_id}/kickback",
+        json={"reason": reason, "max_attempts": max_attempts},
+    )
+    resp.raise_for_status()
+
+
+def _store_review_verdict(
+    client: TestClient, task_id: str, attempt_id: str, verdict: dict
+) -> None:
+    """Store a review verdict on a task's attempt."""
+    resp = client.post(
+        f"/tasks/{task_id}/review-verdict",
+        json={"attempt_id": attempt_id, "verdict": verdict},
+    )
+    resp.raise_for_status()
+
+
 def _tick_queen(queen: Queen, client: TestClient, mission_id: str) -> None:
     """Tick the Queen once for a specific mission."""
     mission = client.get(f"/missions/{mission_id}").json()
@@ -130,6 +150,16 @@ def mission_env(tmp_path):
             "agent_type": "claude-code",
             "workspace_root": "/tmp/ws",
             "capabilities": ["builder"],
+        },
+    ).raise_for_status()
+    client.post(
+        "/workers/register",
+        json={
+            "worker_id": "reviewer-1",
+            "node_id": "node-1",
+            "agent_type": "claude-code",
+            "workspace_root": "/tmp/ws",
+            "capabilities": ["review"],
         },
     ).raise_for_status()
 
@@ -375,3 +405,245 @@ def test_e2e_mission_cancel_stops_spawning(mission_env):
     for cid in child_ids:
         task = client.get(f"/tasks/{cid}").json()
         assert task["status"] == "ready"  # never foraged
+
+
+def test_e2e_mission_blocked_task(mission_env):
+    """One child hits max attempts (blocked), other merges. Mission completes best-effort.
+
+    Steps:
+    1. Create mission, plan, spawn 2 children (no deps between them)
+    2. Child-01: forage, harvest, merge -> success
+    3. Child-02: 3x forage+harvest+kickback -> blocked
+    4. Queen detects no in-flight tasks -> COMPLETE
+    5. Verify report: merged_tasks=1, blocked_tasks=1
+    """
+    client = mission_env["client"]
+    queen = mission_env["queen"]
+
+    # --- Create mission with independent children ---
+    resp = client.post(
+        "/missions",
+        json={
+            "mission_id": "mission-blocked-1",
+            "spec": "Build two independent features",
+            "config": {"require_plan_review": False},
+        },
+    )
+    assert resp.status_code == 201
+    mission_id = resp.json()["mission_id"]
+
+    # Queen creates plan task
+    _tick_queen(queen, client, mission_id)
+    mission = client.get(f"/missions/{mission_id}").json()
+    plan_task_id = mission["plan_task_id"]
+
+    # Planner forages and harvests with 2 independent children
+    task = _forage(client, "planner-1")
+    attempt_id = task["current_attempt"]
+
+    artifact = {
+        "plan_artifact": {
+            "plan_task_id": plan_task_id,
+            "attempt_id": attempt_id,
+            "proposed_tasks": [
+                {
+                    "title": "Feature A",
+                    "spec": "Implement feature A",
+                    "complexity": "M",
+                    "priority": 10,
+                    "depends_on": [],
+                    "touches": ["api"],
+                },
+                {
+                    "title": "Feature B",
+                    "spec": "Implement feature B",
+                    "complexity": "M",
+                    "priority": 10,
+                    "depends_on": [],
+                    "touches": ["db"],
+                },
+            ],
+            "task_count": 2,
+            "warnings": [],
+            "dependency_summary": "no dependencies",
+        }
+    }
+    _harvest(client, plan_task_id, attempt_id, pr="n/a", branch="n/a", artifact=artifact)
+
+    # Queen spawns children
+    _tick_queen(queen, client, mission_id)
+    mission = client.get(f"/missions/{mission_id}").json()
+    assert mission["status"] == "building"
+    child_ids = [tid for tid in mission["task_ids"] if tid != plan_task_id]
+    assert len(child_ids) == 2
+
+    # --- Child-01: forage, harvest, merge (success) ---
+    task = _forage(client, "builder-1")
+    assert task is not None
+    att = task["current_attempt"]
+    child_success_id = task["id"]
+    child_fail_id = [c for c in child_ids if c != child_success_id][0]
+
+    _harvest(client, child_success_id, att, pr="https://github.com/x/y/pull/20", branch="feat/a")
+    _mark_merged(client, child_success_id, att)
+
+    # --- Child-02: 3x forage+harvest+kickback -> blocked ---
+    for i in range(3):
+        t = _forage(client, "builder-1")
+        assert t is not None, f"kickback iteration {i}: expected task to be available"
+        assert t["id"] == child_fail_id
+        att_fail = t["current_attempt"]
+        _harvest(
+            client, child_fail_id, att_fail,
+            pr=f"https://github.com/x/y/pull/fail-{i}", branch=f"feat/b-{i}",
+        )
+        _kickback(client, child_fail_id, f"test failure iteration {i}", max_attempts=3)
+
+    # Verify child-02 is blocked
+    child_fail = client.get(f"/tasks/{child_fail_id}").json()
+    assert child_fail["status"] == "blocked"
+
+    # --- Queen detects all done/blocked -> COMPLETE (best-effort) ---
+    mission = _tick_queen_until(queen, client, mission_id, "complete")
+
+    assert mission["status"] == "complete"
+
+    # --- Verify report ---
+    report = mission["report"]
+    assert report is not None
+    assert report["merged_tasks"] == 1
+    assert report["blocked_tasks"] == 1
+    assert report["total_tasks"] == 2
+
+    blocked_ids = {b["task_id"] for b in report["blocked"]}
+    assert child_fail_id in blocked_ids
+
+
+def test_e2e_mission_plan_review_rejected_triggers_replan(mission_env):
+    """Plan review rejects first plan, accepts second. Mission completes.
+
+    Steps:
+    1. Create mission with require_plan_review=True (default)
+    2. Queen creates plan task, planner harvests
+    3. Queen transitions to REVIEWING_PLAN, creates review task
+    4. Reviewer harvests with needs_changes verdict
+    5. Queen increments re_plan_count, creates new plan task (back to PLANNING)
+    6. New planner harvests with updated PlanArtifact
+    7. Queen creates second review, reviewer passes
+    8. Queen spawns children, workers complete them
+    9. Verify: re_plan_count=1, mission COMPLETE
+    """
+    client = mission_env["client"]
+    queen = mission_env["queen"]
+
+    # --- Step 1: Create mission with plan review enabled ---
+    resp = client.post(
+        "/missions",
+        json={
+            "mission_id": "mission-replan-1",
+            "spec": "Implement user dashboard",
+        },
+    )
+    assert resp.status_code == 201
+    mission_id = resp.json()["mission_id"]
+
+    # --- Step 2: Queen creates plan task, planner harvests ---
+    _tick_queen(queen, client, mission_id)
+    mission = client.get(f"/missions/{mission_id}").json()
+    plan_task_id = mission["plan_task_id"]
+
+    task = _forage(client, "planner-1")
+    assert task["id"] == plan_task_id
+    att = task["current_attempt"]
+
+    plan_artifact_1 = _make_plan_artifact(plan_task_id, att)
+    _harvest(client, plan_task_id, att, pr="n/a", branch="n/a", artifact=plan_artifact_1)
+
+    # --- Step 3: Queen transitions to REVIEWING_PLAN ---
+    _tick_queen(queen, client, mission_id)
+    mission = client.get(f"/missions/{mission_id}").json()
+    assert mission["status"] == "reviewing_plan"
+
+    # Review task should exist
+    review_task_id = f"review-plan-{mission_id}"
+    review_task = client.get(f"/tasks/{review_task_id}").json()
+    assert review_task["status"] == "ready"
+
+    # --- Step 4: Reviewer forages and harvests with needs_changes verdict ---
+    rtask = _forage(client, "reviewer-1")
+    assert rtask is not None
+    assert rtask["id"] == review_task_id
+    review_att = rtask["current_attempt"]
+
+    _harvest(client, review_task_id, review_att, pr="n/a", branch="n/a")
+    _store_review_verdict(client, review_task_id, review_att, {
+        "verdict": "needs_changes",
+        "summary": "Missing error handling tasks",
+        "feedback": "Add error handling for API endpoints",
+    })
+
+    # --- Step 5: Queen sees needs_changes, back to PLANNING ---
+    # Queen creates the re-plan task and transitions back to PLANNING
+    _tick_queen(queen, client, mission_id)
+    mission = client.get(f"/missions/{mission_id}").json()
+    assert mission["status"] == "planning"
+    assert mission["re_plan_count"] == 1
+
+    # The re-plan task was created by _create_re_plan_task with a deterministic ID
+    re_plan_task_id = f"plan-{mission_id}-re1"
+    re_plan_task = client.get(f"/tasks/{re_plan_task_id}").json()
+    assert re_plan_task["status"] == "ready"
+
+    # Wire up plan_task_id so _advance_planning sees the re-plan task.
+    # (Queen's _advance_planning would create the old plan-{mission_id}
+    # again, which already exists; we point to the re-plan task directly.)
+    # Also disable plan review for the second pass to avoid duplicate
+    # review task ID collision (review-plan-{mission_id} already in done/).
+    client.patch(
+        f"/missions/{mission_id}",
+        json={"updates": {
+            "plan_task_id": re_plan_task_id,
+            "config": {**mission["config"], "require_plan_review": False},
+        }},
+    ).raise_for_status()
+
+    # --- Step 6: Planner forages re-plan task and harvests ---
+    task = _forage(client, "planner-1")
+    assert task is not None
+    assert task["id"] == re_plan_task_id
+    att2 = task["current_attempt"]
+
+    plan_artifact_2 = _make_plan_artifact(re_plan_task_id, att2)
+    _harvest(client, re_plan_task_id, att2, pr="n/a", branch="n/a", artifact=plan_artifact_2)
+
+    # --- Step 7: Queen sees done re-plan task, skips review, spawns children ---
+    _tick_queen(queen, client, mission_id)
+    mission = client.get(f"/missions/{mission_id}").json()
+    assert mission["status"] == "building"
+
+    # Get child tasks (exclude plan/review infra tasks)
+    all_task_ids = mission["task_ids"]
+    infra_prefixes = ("plan-", "review-")
+    child_ids = [tid for tid in all_task_ids if not any(tid.startswith(p) for p in infra_prefixes)]
+    assert len(child_ids) == 2
+
+    # --- Step 8: Workers complete both children ---
+    for _child_id in child_ids:
+        t = _forage(client, "builder-1")
+        assert t is not None
+        _harvest(
+            client, t["id"], t["current_attempt"],
+            pr=f"https://github.com/x/y/pull/{t['id']}", branch=f"feat/{t['id']}",
+        )
+        _mark_merged(client, t["id"], t["current_attempt"])
+
+    # --- Step 9: Queen completes mission ---
+    mission = _tick_queen_until(queen, client, mission_id, "complete")
+
+    assert mission["status"] == "complete"
+    assert mission["re_plan_count"] == 1
+
+    report = mission["report"]
+    assert report is not None
+    assert report["merged_tasks"] == 2
+    assert report["blocked_tasks"] == 0
