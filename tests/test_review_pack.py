@@ -1,7 +1,7 @@
 """Tests for antfarm.core.review_pack generation."""
 
 from antfarm.core.models import TaskArtifact
-from antfarm.core.review_pack import generate_review_pack
+from antfarm.core.review_pack import extract_verdict_from_review_task, generate_review_pack
 
 
 def _make_artifact(**overrides) -> TaskArtifact:
@@ -107,3 +107,79 @@ def test_review_pack_minimal_artifact():
     pack = generate_review_pack(artifact)
     assert "t1" in pack
     assert "Checks" in pack
+
+
+# --- extract_verdict_from_review_task tests ---
+
+
+def _review_task(*, current_attempt="att-1", attempts=None, trail=None):
+    task = {"current_attempt": current_attempt}
+    if attempts is not None:
+        task["attempts"] = attempts
+    if trail is not None:
+        task["trail"] = trail
+    return task
+
+
+def test_extract_verdict_from_artifact_key():
+    task = _review_task(
+        attempts=[
+            {
+                "attempt_id": "att-1",
+                "artifact": {"verdict": "approve", "comments": "LGTM"},
+            }
+        ],
+    )
+    result = extract_verdict_from_review_task(task)
+    assert result == {"verdict": "approve", "comments": "LGTM"}
+
+
+def test_extract_verdict_from_review_verdict_field():
+    task = _review_task(
+        attempts=[
+            {
+                "attempt_id": "att-1",
+                "artifact": None,
+                "review_verdict": {"verdict": "request_changes", "reason": "missing tests"},
+            }
+        ],
+    )
+    result = extract_verdict_from_review_task(task)
+    assert result == {"verdict": "request_changes", "reason": "missing tests"}
+
+
+def test_extract_verdict_from_trail_fallback():
+    task = _review_task(
+        attempts=[{"attempt_id": "att-1"}],
+        trail=[
+            {"message": "started review"},
+            {"message": '[REVIEW_VERDICT] {"verdict":"approve"}'},
+        ],
+    )
+    result = extract_verdict_from_review_task(task)
+    assert result == {"verdict": "approve"}
+
+
+def test_extract_verdict_none_when_no_current_attempt():
+    task = _review_task(current_attempt=None)
+    assert extract_verdict_from_review_task(task) is None
+
+
+def test_extract_verdict_none_when_malformed_trail_json():
+    task = _review_task(
+        attempts=[{"attempt_id": "att-1"}],
+        trail=[{"message": "[REVIEW_VERDICT] {not valid json}"}],
+    )
+    assert extract_verdict_from_review_task(task) is None
+
+
+def test_extract_verdict_most_recent_trail_entry_wins():
+    task = _review_task(
+        attempts=[{"attempt_id": "att-1"}],
+        trail=[
+            {"message": '[REVIEW_VERDICT] {"verdict":"request_changes"}'},
+            {"message": '[REVIEW_VERDICT] {"verdict":"approve"}'},
+        ],
+    )
+    result = extract_verdict_from_review_task(task)
+    assert result == {"verdict": "approve"}
