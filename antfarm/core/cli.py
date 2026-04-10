@@ -130,6 +130,30 @@ def version():
     help="Disable the built-in Doctor health-check daemon.",
 )
 @click.option(
+    "--no-queen",
+    is_flag=True,
+    default=False,
+    help="Disable the Queen mission controller.",
+)
+@click.option(
+    "--autoscaler/--no-autoscaler",
+    default=False,
+    show_default=True,
+    help="Enable/disable the single-host autoscaler.",
+)
+@click.option(
+    "--max-builders",
+    type=int,
+    default=None,
+    help="Maximum parallel builder workers (pass-through to AutoscalerConfig).",
+)
+@click.option(
+    "--max-reviewers",
+    type=int,
+    default=None,
+    help="Maximum parallel reviewer workers (pass-through to AutoscalerConfig).",
+)
+@click.option(
     "--backend",
     default="file",
     show_default=True,
@@ -157,6 +181,10 @@ def colony(
     backup_interval: int,
     no_soldier: bool,
     no_doctor: bool,
+    no_queen: bool,
+    autoscaler: bool,
+    max_builders: int | None,
+    max_reviewers: int | None,
     backend: str,
     github_repo: str | None,
     github_token: str | None,
@@ -175,12 +203,30 @@ def colony(
     else:
         task_backend = get_backend("file", root=data_dir)
 
+    autoscaler_cfg = None
+    if autoscaler:
+        from antfarm.core.autoscaler import AutoscalerConfig
+
+        autoscaler_cfg = AutoscalerConfig(
+            enabled=True,
+            data_dir=data_dir,
+            colony_url=f"http://127.0.0.1:{port}",
+        )
+        if max_builders is not None:
+            autoscaler_cfg.max_builders = max_builders
+        if max_reviewers is not None:
+            autoscaler_cfg.max_reviewers = max_reviewers
+        if auth_token:
+            autoscaler_cfg.token = auth_token
+
     app = get_app(
         task_backend,
         data_dir=data_dir,
         auth_secret=auth_token,
         enable_soldier=not no_soldier,
         enable_doctor=not no_doctor,
+        enable_queen=not no_queen,
+        autoscaler_config=autoscaler_cfg,
     )
     if auth_token:
         from antfarm.core.auth import generate_token
@@ -385,6 +431,8 @@ def worker_start(
               help="Task type: 'plan' for planner decomposition.")
 @click.option("--issue", "issue_number", default=None, type=int,
               help="GitHub issue number to link.")
+@click.option("--mission", "mission_id", default=None,
+              help="Attach this task to an existing mission.")
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def carry(
@@ -399,6 +447,7 @@ def carry(
     task_id: str | None,
     task_type: str | None,
     issue_number: int | None,
+    mission_id: str | None,
     colony_url: str,
     token: str | None,
 ):
@@ -430,6 +479,9 @@ def carry(
             payload["capabilities_required"].append("plan")
 
     payload["id"] = task_id
+
+    if mission_id:
+        payload["mission_id"] = mission_id
 
     # Append issue reference to spec so workers include it in commits
     if issue_number:
@@ -1035,6 +1087,163 @@ def plan(
             click.echo(f"  Created: {r}")
         except Exception as exc:
             click.echo(f"  Failed to carry task {i}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# mission
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def mission():
+    """Manage autonomous missions."""
+
+
+@mission.command("create")
+@click.option("--spec", "spec_path", required=True, type=click.Path(exists=True),
+              help="Path to spec file.")
+@click.option("--mission-id", default=None, help="Optional explicit mission id slug.")
+@click.option("--no-plan-review", is_flag=True, default=False,
+              help="Skip plan review step.")
+@click.option("--max-builders", type=int, default=None,
+              help="Max parallel builder workers.")
+@click.option("--max-attempts", type=int, default=None,
+              help="Max attempts per task.")
+@click.option("--integration-branch", default=None,
+              help="Integration branch for this mission.")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def mission_create(
+    spec_path: str,
+    mission_id: str | None,
+    no_plan_review: bool,
+    max_builders: int | None,
+    max_attempts: int | None,
+    integration_branch: str | None,
+    colony_url: str,
+    token: str | None,
+):
+    """Create an autonomous mission from a spec file."""
+    with open(spec_path) as f:
+        spec_text = f.read()
+
+    payload: dict = {"spec": spec_text, "spec_file": spec_path}
+    config: dict = {}
+    if no_plan_review:
+        config["require_plan_review"] = False
+    if max_builders is not None:
+        config["max_parallel_builders"] = max_builders
+    if max_attempts is not None:
+        config["max_attempts"] = max_attempts
+    if integration_branch is not None:
+        config["integration_branch"] = integration_branch
+    if config:
+        payload["config"] = config
+    if mission_id:
+        payload["mission_id"] = mission_id
+
+    result = _post(colony_url, "/missions", payload, token=token)
+    click.echo(f"Mission created: {result}")
+
+
+@mission.command("status")
+@click.argument("mission_id")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def mission_status(mission_id: str, colony_url: str, token: str | None):
+    """Show mission status overview."""
+    data = _get(colony_url, f"/missions/{mission_id}", token=token)
+
+    click.echo(f"Mission:    {data.get('mission_id', mission_id)}")
+    click.echo(f"Status:     {data.get('status', 'unknown')}")
+
+    config = data.get("config", {})
+    completion_mode = config.get("completion_mode", "best_effort")
+    if completion_mode == "all_or_nothing":
+        click.echo(
+            f"Completion: {completion_mode} (treated as best_effort in v0.6.0)"
+        )
+    else:
+        click.echo(f"Completion: {completion_mode}")
+
+    task_ids = data.get("task_ids", [])
+    click.echo(f"Tasks:      {len(task_ids)}")
+    click.echo(f"Created:    {data.get('created_at', 'unknown')}")
+
+    if data.get("plan_task_id"):
+        click.echo(f"Plan task:  {data['plan_task_id']}")
+    if data.get("spec_file"):
+        click.echo(f"Spec file:  {data['spec_file']}")
+
+
+@mission.command("report")
+@click.argument("mission_id")
+@click.option("--format", "fmt", type=click.Choice(["terminal", "md", "json"]),
+              default="terminal", show_default=True, help="Output format.")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def mission_report(mission_id: str, fmt: str, colony_url: str, token: str | None):
+    """Show mission report."""
+    data = _get(colony_url, f"/missions/{mission_id}/report", token=token)
+
+    if fmt == "json":
+        click.echo(json.dumps(data, indent=2))
+    elif fmt == "md":
+        click.echo(f"# Mission Report: {data.get('mission_id', mission_id)}")
+        click.echo(f"\n**Status:** {data.get('status', 'unknown')}")
+        click.echo(f"**Duration:** {data.get('duration', 'unknown')}")
+        tasks = data.get("tasks", [])
+        if tasks:
+            click.echo("\n## Tasks\n")
+            for t in tasks:
+                status = t.get("status", "unknown")
+                click.echo(f"- **{t.get('title', t.get('id', '?'))}** — {status}")
+    else:
+        click.echo(f"Mission:  {data.get('mission_id', mission_id)}")
+        click.echo(f"Status:   {data.get('status', 'unknown')}")
+        click.echo(f"Duration: {data.get('duration', 'unknown')}")
+        tasks = data.get("tasks", [])
+        if tasks:
+            click.echo(f"\n{'Task':<30} {'Status':<12}")
+            click.echo("-" * 42)
+            for t in tasks:
+                title = t.get("title", t.get("id", "?"))[:28]
+                status = t.get("status", "unknown")
+                click.echo(f"{title:<30} {status:<12}")
+
+
+@mission.command("cancel")
+@click.argument("mission_id")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def mission_cancel(mission_id: str, colony_url: str, token: str | None):
+    """Cancel a mission."""
+    _post(colony_url, f"/missions/{mission_id}/cancel", {}, token=token)
+    click.echo(f"Mission cancelled: {mission_id}")
+
+
+@mission.command("list")
+@click.option("--status", "status_filter", default=None, help="Filter by mission status.")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def mission_list(status_filter: str | None, colony_url: str, token: str | None):
+    """List all missions."""
+    path = "/missions"
+    if status_filter:
+        path += f"?status={status_filter}"
+    data = _get(colony_url, path, token=token)
+
+    if not data:
+        click.echo("No missions found.")
+        return
+
+    click.echo(f"{'Mission ID':<35} {'Status':<15} {'Tasks'}")
+    click.echo("-" * 60)
+    for m in data:
+        mid = m.get("mission_id", "?")
+        status = m.get("status", "?")
+        task_count = len(m.get("task_ids", []))
+        click.echo(f"{mid:<35} {status:<15} {task_count}")
 
 
 # ---------------------------------------------------------------------------
