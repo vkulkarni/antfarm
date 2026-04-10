@@ -416,6 +416,7 @@ class Task:
     attempts: list[Attempt] = field(default_factory=list)
     trail: list[TrailEntry] = field(default_factory=list)
     signals: list[SignalEntry] = field(default_factory=list)
+    mission_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -438,6 +439,7 @@ class Task:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "created_by": self.created_by,
+            "mission_id": self.mission_id,
         }
 
     @classmethod
@@ -462,6 +464,7 @@ class Task:
             created_at=data["created_at"],
             updated_at=data["updated_at"],
             created_by=data["created_by"],
+            mission_id=data.get("mission_id"),
         )
 
 

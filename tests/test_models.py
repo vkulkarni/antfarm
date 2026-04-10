@@ -410,3 +410,43 @@ def test_failure_record_defaults():
     )
     assert rec.verification_snapshot == {}
     assert rec.recommended_action == "kickback"
+
+
+# ---------------------------------------------------------------------------
+# Task.mission_id (v0.6)
+# ---------------------------------------------------------------------------
+
+
+def test_task_mission_id_roundtrip():
+    task = Task(
+        id="t-mission",
+        title="Mission task",
+        spec="Do stuff",
+        created_at="2026-04-09T09:00:00Z",
+        updated_at="2026-04-09T09:00:00Z",
+        created_by="user-1",
+        mission_id="mission-login-123",
+    )
+    d = task.to_dict()
+    assert d["mission_id"] == "mission-login-123"
+    restored = Task.from_dict(d)
+    assert restored.mission_id == "mission-login-123"
+    assert restored == task
+
+
+def test_task_mission_id_default_none():
+    task = Task(
+        id="t-no-mission",
+        title="No mission",
+        spec="Solo task",
+        created_at="2026-04-09T09:00:00Z",
+        updated_at="2026-04-09T09:00:00Z",
+        created_by="user-1",
+    )
+    assert task.mission_id is None
+    d = task.to_dict()
+    assert d["mission_id"] is None
+    # Backward compat: from_dict without mission_id key
+    del d["mission_id"]
+    restored = Task.from_dict(d)
+    assert restored.mission_id is None
