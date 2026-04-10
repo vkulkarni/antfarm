@@ -40,8 +40,8 @@ from .base import TaskBackend
 
 _GITHUB_API = "https://api.github.com"
 _GITHUB_BACKEND_MSG = (
-    "GitHubBackend does not support missions. "
-    "Use FileBackend for mission-based workflows."
+    "Mission mode requires FileBackend in v0.6.0. "
+    "Use --backend file or wait for v0.6.1."
 )
 _SPEC_FENCE_OPEN = "<!-- antfarm-spec\n"
 _SPEC_FENCE_CLOSE = "\n-->"

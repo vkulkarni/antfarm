@@ -181,11 +181,9 @@ def test_update_mission_atomic_under_lock(backend: FileBackend) -> None:
     errors = []
 
     def updater(i: int) -> None:
+        """Each thread updates a different field so both writes are preserved."""
         try:
-            mission = backend.get_mission("mission-login-123")
-            assert mission is not None
-            new_ids = mission["task_ids"] + [f"task-{i}"]
-            backend.update_mission("mission-login-123", {"task_ids": new_ids})
+            backend.update_mission("mission-login-123", {f"custom_field_{i}": f"value-{i}"})
         except Exception as e:
             errors.append(e)
 
@@ -198,9 +196,10 @@ def test_update_mission_atomic_under_lock(backend: FileBackend) -> None:
     assert not errors
     result = backend.get_mission("mission-login-123")
     assert result is not None
-    # Due to race conditions in read-then-update, some task_ids may be lost,
-    # but no exceptions should occur and the file should be valid JSON.
-    assert isinstance(result["task_ids"], list)
+    for i in range(5):
+        assert result[f"custom_field_{i}"] == f"value-{i}", (
+            f"custom_field_{i} missing — concurrent updates clobbered each other"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -247,11 +246,11 @@ def test_github_backend_stubs_raise() -> None:
     # We can't instantiate GitHubBackend without a real repo, so test
     # that the stubs are defined and raise correctly via the class directly.
     gb = GitHubBackend.__new__(GitHubBackend)
-    with pytest.raises(NotImplementedError, match="does not support missions"):
+    with pytest.raises(NotImplementedError, match="Mission mode requires FileBackend"):
         gb.create_mission({})
-    with pytest.raises(NotImplementedError, match="does not support missions"):
+    with pytest.raises(NotImplementedError, match="Mission mode requires FileBackend"):
         gb.get_mission("x")
-    with pytest.raises(NotImplementedError, match="does not support missions"):
+    with pytest.raises(NotImplementedError, match="Mission mode requires FileBackend"):
         gb.list_missions()
-    with pytest.raises(NotImplementedError, match="does not support missions"):
+    with pytest.raises(NotImplementedError, match="Mission mode requires FileBackend"):
         gb.update_mission("x", {})
