@@ -39,6 +39,10 @@ from antfarm.core.models import (
 from .base import TaskBackend
 
 _GITHUB_API = "https://api.github.com"
+_GITHUB_BACKEND_MSG = (
+    "Mission mode requires FileBackend in v0.6.0. "
+    "Use --backend file or wait for v0.6.1."
+)
 _SPEC_FENCE_OPEN = "<!-- antfarm-spec\n"
 _SPEC_FENCE_CLOSE = "\n-->"
 
@@ -907,3 +911,19 @@ class GitHubBackend(TaskBackend):
             "nodes": len(self._nodes),
             "guards": len(self._guards),
         }
+
+    # ------------------------------------------------------------------
+    # Missions (not supported — stubs raise)
+    # ------------------------------------------------------------------
+
+    def create_mission(self, mission: dict) -> str:
+        raise NotImplementedError(_GITHUB_BACKEND_MSG)
+
+    def get_mission(self, mission_id: str) -> dict | None:
+        raise NotImplementedError(_GITHUB_BACKEND_MSG)
+
+    def list_missions(self, status: str | None = None) -> list[dict]:
+        raise NotImplementedError(_GITHUB_BACKEND_MSG)
+
+    def update_mission(self, mission_id: str, updates: dict) -> None:
+        raise NotImplementedError(_GITHUB_BACKEND_MSG)

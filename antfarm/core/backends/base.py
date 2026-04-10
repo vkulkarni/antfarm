@@ -387,3 +387,25 @@ class TaskBackend(ABC):
             registered worker count).
         """
         ...
+
+    # --- Missions ---
+
+    @abstractmethod
+    def create_mission(self, mission: dict) -> str:
+        """Create a mission. Raises ValueError if mission_id already exists."""
+        ...
+
+    @abstractmethod
+    def get_mission(self, mission_id: str) -> dict | None:
+        """Get a mission by ID. Returns None if not found."""
+        ...
+
+    @abstractmethod
+    def list_missions(self, status: str | None = None) -> list[dict]:
+        """List missions, optionally filtered by status."""
+        ...
+
+    @abstractmethod
+    def update_mission(self, mission_id: str, updates: dict) -> None:
+        """Shallow-merge ``updates`` into the mission JSON. Atomic write."""
+        ...

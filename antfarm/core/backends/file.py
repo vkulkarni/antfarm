@@ -75,6 +75,7 @@ class FileBackend(TaskBackend):
             "workers",
             "nodes",
             "guards",
+            "missions",
         ]:
             (self._root / subdir).mkdir(parents=True, exist_ok=True)
 
@@ -843,3 +844,58 @@ class FileBackend(TaskBackend):
             "nodes": nodes,
             "guards": guards,
         }
+
+    # ------------------------------------------------------------------
+    # Missions
+    # ------------------------------------------------------------------
+
+    def _missions_dir(self) -> Path:
+        return self._root / "missions"
+
+    def _mission_path(self, mission_id: str) -> Path:
+        return self._missions_dir() / f"{mission_id}.json"
+
+    def create_mission(self, mission: dict) -> str:
+        with self._lock:
+            self._missions_dir().mkdir(parents=True, exist_ok=True)
+            path = self._mission_path(mission["mission_id"])
+            if path.exists():
+                raise ValueError(f"mission '{mission['mission_id']}' already exists")
+            self._write_json(path, mission)
+            return mission["mission_id"]
+
+    def get_mission(self, mission_id: str) -> dict | None:
+        path = self._mission_path(mission_id)
+        if not path.exists():
+            return None
+        try:
+            return self._read_json(path)
+        except (json.JSONDecodeError, KeyError):
+            return None
+
+    def list_missions(self, status: str | None = None) -> list[dict]:
+        missions_dir = self._missions_dir()
+        if not missions_dir.exists():
+            return []
+        results = []
+        for p in missions_dir.iterdir():
+            if p.suffix != ".json":
+                continue
+            try:
+                data = self._read_json(p)
+                if status is not None and data.get("status") != status:
+                    continue
+                results.append(data)
+            except (json.JSONDecodeError, KeyError):
+                continue
+        return results
+
+    def update_mission(self, mission_id: str, updates: dict) -> None:
+        with self._lock:
+            path = self._mission_path(mission_id)
+            if not path.exists():
+                raise FileNotFoundError(f"mission '{mission_id}' not found")
+            data = self._read_json(path)
+            data.update(updates)
+            data["updated_at"] = _now_iso()
+            self._write_json(path, data)
