@@ -591,3 +591,114 @@ def test_get_worker_type_reviewer_by_capability():
     tui = _make_tui()
     assert tui._get_worker_type({"agent_type": "claude-code",
                                   "capabilities": ["review"]}) == "reviewer"
+
+
+# ---------------------------------------------------------------------------
+# Mission panel
+# ---------------------------------------------------------------------------
+
+
+def _mission(
+    mission_id: str = "mission-auth",
+    status: str = "building",
+    task_ids: list | None = None,
+    blocked_task_ids: list | None = None,
+    last_progress_at: str = "2026-04-05T00:00:00+00:00",
+    report: dict | None = None,
+) -> dict:
+    return {
+        "mission_id": mission_id,
+        "status": status,
+        "task_ids": task_ids or [],
+        "blocked_task_ids": blocked_task_ids or [],
+        "last_progress_at": last_progress_at,
+        "report": report,
+    }
+
+
+def test_tui_mission_panel_renders_empty():
+    """Empty missions list shows 'No active missions.' placeholder."""
+    tui = _make_tui()
+    result = tui._render_missions([])
+    assert isinstance(result, Table)
+    assert result.row_count == 1
+
+
+def test_tui_mission_panel_renders_multi():
+    """Multiple missions render with correct row count."""
+    tui = _make_tui()
+    missions = [
+        _mission(mission_id="mission-auth", status="building",
+                 task_ids=["t1", "t2", "t3", "t4", "t5", "t6"],
+                 report={"merged_tasks": 4}),
+        _mission(mission_id="mission-api-v2", status="complete",
+                 task_ids=["t1", "t2", "t3", "t4"],
+                 report={"merged_tasks": 4}),
+        _mission(mission_id="mission-migrate", status="blocked",
+                 task_ids=["t1", "t2", "t3", "t4", "t5"],
+                 blocked_task_ids=["t3"]),
+    ]
+    result = tui._render_missions(missions)
+    assert isinstance(result, Table)
+    assert result.row_count == 3
+
+
+def test_tui_mission_panel_formats_progress_time():
+    """Progress column shows correct format per status."""
+    tui = _make_tui()
+
+    # Complete mission -> "done"
+    assert tui._format_mission_progress(
+        _mission(status="complete")
+    ) == "done"
+
+    # Failed mission -> "done"
+    assert tui._format_mission_progress(
+        _mission(status="failed")
+    ) == "done"
+
+    # Cancelled mission -> "done"
+    assert tui._format_mission_progress(
+        _mission(status="cancelled")
+    ) == "done"
+
+    # Blocked mission -> "stalled <time>"
+    result = tui._format_mission_progress(
+        _mission(status="blocked", last_progress_at="2026-04-05T00:00:00+00:00")
+    )
+    assert result.startswith("stalled ")
+
+    # Active mission -> "<time> ago"
+    result = tui._format_mission_progress(
+        _mission(status="building", last_progress_at="2026-04-05T00:00:00+00:00")
+    )
+    assert result.endswith(" ago")
+
+    # No last_progress_at -> "--"
+    assert tui._format_mission_progress(
+        _mission(status="building", last_progress_at="")
+    ) == "--"
+
+
+def test_tui_mission_panel_shows_blocked_count():
+    """Blocked task count appears in tasks column."""
+    tui = _make_tui()
+    missions = [
+        _mission(
+            task_ids=["t1", "t2", "t3"],
+            blocked_task_ids=["t2"],
+        ),
+    ]
+    result = tui._render_missions(missions)
+    assert isinstance(result, Table)
+    assert result.row_count == 1
+
+
+def test_tui_mission_panel_overflow():
+    """More than max_shown missions shows overflow hint."""
+    tui = _make_tui()
+    missions = [_mission(mission_id=f"mission-{i}") for i in range(8)]
+    result = tui._render_missions(missions, max_shown=5)
+    assert isinstance(result, Table)
+    # 5 shown + 1 overflow hint
+    assert result.row_count == 6
