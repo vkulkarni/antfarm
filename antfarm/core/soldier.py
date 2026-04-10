@@ -25,6 +25,7 @@ from enum import StrEnum
 from antfarm.core.backends.base import TaskBackend
 from antfarm.core.colony_client import ColonyClient
 from antfarm.core.models import ReviewVerdict
+from antfarm.core.review_pack import extract_verdict_from_review_task
 
 logger = logging.getLogger(__name__)
 
@@ -246,7 +247,7 @@ class Soldier:
                 continue
 
             # Review task is done — extract verdict from review task's artifact
-            review_verdict = self._extract_verdict_from_review_task(review_task)
+            review_verdict = extract_verdict_from_review_task(review_task)
             if review_verdict is None:
                 # Review done but no verdict — treat as failure
                 self.kickback_with_cascade(
@@ -733,39 +734,6 @@ class Soldier:
             return review_task_id
         except Exception:
             return None
-
-    @staticmethod
-    def _extract_verdict_from_review_task(review_task: dict) -> dict | None:
-        """Extract ReviewVerdict dict from a completed review task.
-
-        The reviewer stores the verdict in the review task's attempt artifact
-        under the "review_verdict" key, or as the artifact itself if it has
-        a "verdict" key.
-        """
-        current_attempt_id = review_task.get("current_attempt")
-        if not current_attempt_id:
-            return None
-        for attempt in review_task.get("attempts", []):
-            if attempt.get("attempt_id") == current_attempt_id:
-                # Check attempt artifact for verdict
-                artifact = attempt.get("artifact")
-                if artifact and "verdict" in artifact:
-                    return artifact
-                # Check attempt-level review_verdict
-                rv = attempt.get("review_verdict")
-                if rv:
-                    return rv
-        # Fall back to trail entries containing [REVIEW_VERDICT]
-        for entry in reversed(review_task.get("trail", [])):
-            msg = entry.get("message", "")
-            if msg.startswith("[REVIEW_VERDICT] "):
-                import json
-
-                try:
-                    return json.loads(msg[len("[REVIEW_VERDICT] "):])
-                except (json.JSONDecodeError, ValueError):
-                    continue
-        return None
 
     # ------------------------------------------------------------------
     # from_backend: in-process Soldier (no HTTP round-trips)
