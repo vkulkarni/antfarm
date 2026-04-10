@@ -764,3 +764,26 @@ def test_doctor_thread_not_started_when_disabled(tmp_path, reset_doctor_globals)
     get_app(backend=backend, enable_doctor=False)
 
     assert serve_mod._doctor_thread is None
+
+
+# ---------------------------------------------------------------------------
+# Mission-linked carry (v0.6)
+# ---------------------------------------------------------------------------
+
+
+def test_carry_accepts_mission_id(client):
+    """POST /tasks with mission_id stamps it on the task and links to mission."""
+    # Create a mission first
+    client.post("/missions", json={"mission_id": "m-1", "spec": "test"})
+
+    r = client.post(
+        "/tasks",
+        json={"id": "task-linked", "title": "Linked", "spec": "do it", "mission_id": "m-1"},
+    )
+    assert r.status_code == 201
+
+    task = client.get("/tasks/task-linked").json()
+    assert task["mission_id"] == "m-1"
+
+    mission = client.get("/missions/m-1").json()
+    assert "task-linked" in mission["task_ids"]

@@ -113,6 +113,7 @@ class ColonyClient:
         complexity: str = "M",
         capabilities_required: list[str] | None = None,
         spawned_by: dict | None = None,
+        mission_id: str | None = None,
     ) -> dict:
         """Create a task in the colony."""
         payload: dict = {
@@ -128,6 +129,8 @@ class ColonyClient:
             payload["capabilities_required"] = capabilities_required
         if spawned_by:
             payload["spawned_by"] = spawned_by
+        if mission_id is not None:
+            payload["mission_id"] = mission_id
         r = self._client.post("/tasks", json=payload)
         r.raise_for_status()
         return r.json()
@@ -196,6 +199,59 @@ class ColonyClient:
 
     def status(self) -> dict:
         r = self._client.get("/status")
+        r.raise_for_status()
+        return r.json()
+
+    # ------------------------------------------------------------------
+    # Missions
+    # ------------------------------------------------------------------
+
+    def create_mission(
+        self,
+        spec: str,
+        spec_file: str | None = None,
+        config: dict | None = None,
+    ) -> dict:
+        """Create a mission. Returns dict with mission_id."""
+        payload: dict = {"spec": spec}
+        if spec_file is not None:
+            payload["spec_file"] = spec_file
+        if config is not None:
+            payload["config"] = config
+        r = self._client.post("/missions", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def get_mission(self, mission_id: str) -> dict | None:
+        """Get a mission by ID. Returns None on 404."""
+        r = self._client.get(f"/missions/{mission_id}")
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+    def list_missions(self, status: str | None = None) -> list[dict]:
+        """List missions with optional status filter."""
+        params = {"status": status} if status else {}
+        r = self._client.get("/missions", params=params)
+        r.raise_for_status()
+        return r.json()
+
+    def update_mission(self, mission_id: str, updates: dict) -> None:
+        """Apply shallow updates to a mission."""
+        r = self._client.patch(f"/missions/{mission_id}", json={"updates": updates})
+        r.raise_for_status()
+
+    def cancel_mission(self, mission_id: str) -> None:
+        """Cancel a mission."""
+        r = self._client.post(f"/missions/{mission_id}/cancel")
+        r.raise_for_status()
+
+    def get_mission_report(self, mission_id: str) -> dict | None:
+        """Get mission report. Returns None on 404."""
+        r = self._client.get(f"/missions/{mission_id}/report")
+        if r.status_code == 404:
+            return None
         r.raise_for_status()
         return r.json()
 

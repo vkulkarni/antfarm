@@ -148,6 +148,7 @@ class CarryRequest(BaseModel):
     capabilities_required: list[str] = []
     created_by: str = "api"
     spawned_by: dict | None = None
+    mission_id: str | None = None
 
 
 class NodeRequest(BaseModel):
@@ -226,6 +227,17 @@ class GuardRequest(BaseModel):
 
 class OverrideOrderRequest(BaseModel):
     position: int
+
+
+class MissionCreateRequest(BaseModel):
+    mission_id: str | None = None
+    spec: str
+    spec_file: str | None = None
+    config: dict | None = None
+
+
+class MissionUpdateRequest(BaseModel):
+    updates: dict
 
 
 # ---------------------------------------------------------------------------
@@ -376,10 +388,22 @@ def get_app(
         }
         if req.spawned_by:
             task["spawned_by"] = req.spawned_by
-        try:
-            task_id = _backend.carry(task)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if req.mission_id:
+            from antfarm.core.missions import link_task_to_mission
+
+            task["mission_id"] = req.mission_id
+            try:
+                task_id = link_task_to_mission(_backend, task, req.mission_id)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        else:
+            try:
+                task_id = _backend.carry(task)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         # Check for overlap warnings with active tasks
         warnings: list[str] = []
@@ -596,9 +620,15 @@ def get_app(
         return _backend.status()["tasks"]
 
     @app.get("/tasks", status_code=200)
-    def list_tasks(status: str | None = Query(default=None)):
-        """List tasks with optional ?status= filter."""
-        return _backend.list_tasks(status=status)
+    def list_tasks(
+        status: str | None = Query(default=None),
+        mission_id: str | None = Query(default=None),
+    ):
+        """List tasks with optional ?status= and ?mission_id= filters."""
+        tasks = _backend.list_tasks(status=status)
+        if mission_id is not None:
+            tasks = [t for t in tasks if t.get("mission_id") == mission_id]
+        return tasks
 
     @app.get("/tasks/{task_id}", status_code=200)
     def get_task(task_id: str):
@@ -629,6 +659,114 @@ def get_app(
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # Missions
+    # ------------------------------------------------------------------
+
+    @app.post("/missions", status_code=201)
+    def create_mission(req: MissionCreateRequest):
+        """Create a mission. Returns 201 with mission_id. 409 on duplicate."""
+        from antfarm.core.backends.github import GitHubBackend
+        from antfarm.core.missions import MissionConfig, MissionStatus
+
+        if isinstance(_backend, GitHubBackend):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Mission mode requires FileBackend in v0.6.0. "
+                    "Use --backend file or wait for v0.6.1."
+                ),
+            )
+
+        mission_id = req.mission_id or f"mission-{int(time.time() * 1000)}"
+        now = _now_iso()
+
+        cfg = MissionConfig.from_dict(req.config or {})
+        if cfg.completion_mode == "all_or_nothing":
+            logger.warning(
+                "mission %s requested completion_mode='all_or_nothing'; "
+                "treated as best_effort for v0.6.0 (real semantics land in v0.6.1+)",
+                mission_id,
+            )
+
+        mission = {
+            "mission_id": mission_id,
+            "spec": req.spec,
+            "spec_file": req.spec_file,
+            "status": MissionStatus.PLANNING.value,
+            "plan_task_id": None,
+            "plan_artifact": None,
+            "task_ids": [],
+            "blocked_task_ids": [],
+            "config": cfg.to_dict(),
+            "created_at": now,
+            "updated_at": now,
+            "completed_at": None,
+            "report": None,
+            "last_progress_at": now,
+            "re_plan_count": 0,
+        }
+
+        try:
+            _backend.create_mission(mission)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        return {"mission_id": mission_id}
+
+    @app.get("/missions", status_code=200)
+    def list_missions(status: str | None = Query(default=None)):
+        """List missions with optional ?status= filter."""
+        return _backend.list_missions(status=status)
+
+    @app.get("/missions/{mission_id}", status_code=200)
+    def get_mission(mission_id: str):
+        """Get a mission by ID. Returns 404 if not found."""
+        mission = _backend.get_mission(mission_id)
+        if mission is None:
+            raise HTTPException(
+                status_code=404, detail=f"Mission '{mission_id}' not found"
+            )
+        return mission
+
+    @app.patch("/missions/{mission_id}", status_code=200)
+    def update_mission(mission_id: str, req: MissionUpdateRequest):
+        """Apply shallow updates to a mission. 404 if missing."""
+        try:
+            _backend.update_mission(mission_id, req.updates)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/missions/{mission_id}/cancel", status_code=200)
+    def cancel_mission(mission_id: str):
+        """Cancel a mission. Idempotent for terminal states."""
+        mission = _backend.get_mission(mission_id)
+        if mission is None:
+            raise HTTPException(
+                status_code=404, detail=f"Mission '{mission_id}' not found"
+            )
+        terminal = {"complete", "failed", "cancelled"}
+        if mission["status"] in terminal:
+            return {"ok": True}
+        _backend.update_mission(mission_id, {"status": "cancelled"})
+        return {"ok": True}
+
+    @app.get("/missions/{mission_id}/report", status_code=200)
+    def get_mission_report(mission_id: str):
+        """Return mission report or 404 if not yet generated."""
+        mission = _backend.get_mission(mission_id)
+        if mission is None:
+            raise HTTPException(
+                status_code=404, detail=f"Mission '{mission_id}' not found"
+            )
+        report = mission.get("report")
+        if report is None:
+            raise HTTPException(
+                status_code=404, detail=f"No report for mission '{mission_id}'"
+            )
+        return report
 
     # ------------------------------------------------------------------
     # Scent (SSE trail streaming)
