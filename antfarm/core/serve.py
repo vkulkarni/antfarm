@@ -32,6 +32,8 @@ _backend: TaskBackend | None = None
 _max_attempts: int = 3
 _soldier_status: str = "not started"
 _soldier_thread: threading.Thread | None = None
+_queen_thread: threading.Thread | None = None
+_queen_status: str = "not started"
 
 # SSE event bus
 _event_queue: collections.deque = collections.deque(maxlen=1000)
@@ -130,6 +132,32 @@ def _start_doctor_thread(
         target=_doctor_loop, daemon=True, name="doctor"
     )
     _doctor_thread.start()
+
+
+def _start_queen_thread(backend: TaskBackend) -> None:
+    """Start the Queen as a daemon thread (singleton guard)."""
+    global _queen_thread, _queen_status
+
+    if _queen_thread is not None and _queen_thread.is_alive():
+        return
+
+    from antfarm.core.queen import Queen
+
+    queen = Queen(backend)
+
+    def _queen_loop():
+        global _queen_status
+        _queen_status = "running"
+        try:
+            queen.run()
+        except Exception as e:
+            _queen_status = f"error: {e}"
+            logger.error("queen thread crashed: %s", e)
+
+    _queen_thread = threading.Thread(
+        target=_queen_loop, daemon=True, name="queen"
+    )
+    _queen_thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +279,7 @@ def get_app(
     auth_secret: str | None = None,
     enable_soldier: bool = False,
     enable_doctor: bool = False,
+    enable_queen: bool = True,
 ) -> FastAPI:
     """Create and return the FastAPI application.
 
@@ -263,6 +292,8 @@ def get_app(
         enable_soldier: If True (default), start the Soldier merge engine as a
                         daemon thread.
         enable_doctor: If True, start the Doctor health-check daemon thread.
+        enable_queen: If True (default), start the Queen mission controller as
+                      a daemon thread. Requires FileBackend — skips for GitHubBackend.
 
     Returns:
         Configured FastAPI application.
@@ -298,6 +329,14 @@ def get_app(
 
     if enable_doctor:
         _start_doctor_thread(_backend, data_dir)
+
+    if enable_queen:
+        from antfarm.core.backends.github import GitHubBackend
+
+        if isinstance(_backend, GitHubBackend):
+            logger.info("queen: skipping — GitHubBackend not supported in v0.6.0")
+        else:
+            _start_queen_thread(_backend)
 
     # ------------------------------------------------------------------
     # Nodes
@@ -847,6 +886,7 @@ def get_app(
         result = _backend.status()
         result["soldier"] = _soldier_status
         result["doctor"] = _doctor_status
+        result["queen"] = _queen_status
         return result
 
     @app.get("/status/full", status_code=200)
@@ -864,6 +904,7 @@ def get_app(
             "workers": _backend.list_workers(),
             "soldier": _soldier_status,
             "doctor": _doctor_status,
+            "queen": _queen_status,
         }
 
     # ------------------------------------------------------------------
