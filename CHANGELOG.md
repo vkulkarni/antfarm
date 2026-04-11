@@ -6,6 +6,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-11
+
+### Added
+- **Autonomous Runs (Missions):** end-to-end orchestration from spec to morning digest
+- Mission model: `Mission`, `MissionConfig`, `PlanArtifact`, `MissionReport` dataclasses
+- Queen controller daemon thread — advances missions through planning → review → building → complete
+- Plan-review flow with re-plan budget (max 1 re-plan per mission)
+- Single-host Autoscaler daemon thread — subprocess-based, scope-aware worker spawning (opt-in via `--autoscaler`)
+- Mission report generator with JSON, terminal, and markdown renderers (dependency-free, no `rich` required)
+- Colony API: `/missions` CRUD endpoints, `mission_id` on `POST /tasks`, `?mission_id=` filter on `GET /tasks`
+- CLI: `antfarm mission create|status|report|cancel|list`, `antfarm carry --mission`
+- CLI: `antfarm colony --autoscaler|--no-queen` flags
+- TUI: mission panel showing status, task counts, and progress
+- `link_task_to_mission()` shared atomicity helper for carry + mission linkage
+- `is_infra_task()` canonical filter for plan/review vs implementation tasks
+- Planner mission-mode: stores plan as `PlanArtifact` on attempt (does not carry children)
+- Soldier `mission_id` propagation: review tasks inherit parent's mission, suppressed for cancelled missions
+- Failure-reason prefix convention (`system:` vs `review:`) for mission diagnostics
+- `completion_mode="all_or_nothing"` accepted and persisted (treated as `best_effort` in v0.6.0)
+- GitHubBackend mission stubs with actionable error messages and preflight guard
+- API stability commitment: `/missions` schema frozen for v0.6.x
+- 4 end-to-end mission test scenarios (full loop, cancel, blocked task, plan review re-plan)
+
+### Changed
+- `extract_verdict_from_review_task` moved from Soldier staticmethod to `review_pack.py` (public, shared)
+- `Task` dataclass gains `mission_id: str | None` field
+- `TaskArtifact` gains `plan_artifact: dict | None` field
+- `TaskBackend` ABC gains `create_mission/get_mission/list_missions/update_mission` abstract methods
+- `FileBackend` gains `.antfarm/missions/` directory for mission persistence
+- Colony `/status` and `/status/full` endpoints include `queen` and `autoscaler` status
+
 ## [0.5.0] - 2026-04-05
 
 ### Added
