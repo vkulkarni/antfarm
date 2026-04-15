@@ -642,10 +642,34 @@ class WorkerRuntime:
                 "1. Read the PR diff for the branch above\n"
                 "2. Check for bugs, security issues, and design problems\n"
                 "3. Run tests to verify correctness\n"
-                "4. Output your verdict between tags:\n"
-                '   [REVIEW_VERDICT]{"provider":"<agent>","verdict":"pass",'
-                '"summary":"...","findings":[],'
-                '"reviewed_commit_sha":"..."}[/REVIEW_VERDICT]\n'
+                "4. Produce a ReviewVerdict (see output format below)\n\n"
+                "## MANDATORY OUTPUT FORMAT — READ THIS TWICE\n"
+                "Your verdict MUST be wrapped in [REVIEW_VERDICT] ... "
+                "[/REVIEW_VERDICT] tags.\n"
+                "The content between the tags MUST be a single valid JSON "
+                "object.\n"
+                "If you forget the tags, the colony cannot parse your verdict "
+                "and the review will be retried or failed.\n\n"
+                "### Worked example 1 — pass\n"
+                "[REVIEW_VERDICT]\n"
+                '{"provider":"<agent>","verdict":"pass",'
+                '"summary":"Change is clean, tests cover the regression.",'
+                '"findings":[],'
+                '"reviewed_commit_sha":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"}\n'
+                "[/REVIEW_VERDICT]\n\n"
+                "### Worked example 2 — needs_changes\n"
+                "[REVIEW_VERDICT]\n"
+                '{"provider":"<agent>","verdict":"needs_changes",'
+                '"summary":"Missing owner validation on release path.",'
+                '"findings":["release_guard drops owner check",'
+                '"no test for mismatch"],'
+                '"reviewed_commit_sha":"1122334455667788990011223344556677889900"}\n'
+                "[/REVIEW_VERDICT]\n\n"
+                'Verdict values: "pass", "needs_changes", "blocked".\n\n'
+                "### Final checklist — do NOT skip\n"
+                "Before you finish: did you wrap your JSON in [REVIEW_VERDICT]"
+                " ... [/REVIEW_VERDICT]? If not, STOP and redo. A reply "
+                "without the tags is treated as a failed review.\n"
             )
         else:
             prompt = (
