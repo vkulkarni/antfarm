@@ -50,6 +50,19 @@ class _StarletteTransport(httpx.BaseTransport):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_sleep_between_polls(monkeypatch):
+    """Skip the 30s idle-poll sleep so worker tests run fast.
+
+    Builders/reviewers poll on an empty queue before exiting (#144). Tests
+    that exercise `.run()` against an empty queue would otherwise block on
+    `time.sleep(30)`.
+    """
+    import antfarm.core.worker as worker_mod
+
+    monkeypatch.setattr(worker_mod.time, "sleep", lambda _s: None)
+
+
 @pytest.fixture
 def backend(tmp_path):
     return FileBackend(root=str(tmp_path / ".antfarm"))
@@ -1243,3 +1256,75 @@ def test_task_artifact_plan_artifact_none_by_default():
 
     restored = TaskArtifact.from_dict(d)
     assert restored.plan_artifact is None
+
+
+# ---------------------------------------------------------------------------
+# Idle polling by role (#144)
+# ---------------------------------------------------------------------------
+
+
+def _make_runtime_with_caps(tmp_path, http_client, name, capabilities):
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name=name,
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        capabilities=capabilities,
+        client=http_client,
+    )
+    rt.workspace_mgr.create = MagicMock(return_value=str(tmp_path / "ws"))
+    return rt
+
+
+def test_builder_polls_on_empty_queue(tmp_path, http_client):
+    """Builder workers poll 5 times (2.5min) before exiting on empty queue."""
+    rt = _make_runtime_with_caps(tmp_path, http_client, "builder-1", capabilities=[])
+
+    call_count = [0]
+
+    def fake_forage(worker_id):
+        call_count[0] += 1
+        return None
+
+    rt.colony.forage = fake_forage
+    rt.run()
+
+    # max_idle_polls=5 → one initial attempt + 5 retries = 6 forage calls
+    assert call_count[0] == 6
+
+
+def test_planner_exits_immediately_on_empty_queue(tmp_path, http_client):
+    """Planner workers exit after a single empty forage (max_idle_polls=0)."""
+    rt = _make_runtime_with_caps(tmp_path, http_client, "planner-1", capabilities=["plan"])
+
+    call_count = [0]
+
+    def fake_forage(worker_id):
+        call_count[0] += 1
+        return None
+
+    rt.colony.forage = fake_forage
+    rt.run()
+
+    assert call_count[0] == 1
+
+
+def test_reviewer_polls_unchanged(tmp_path, http_client):
+    """Reviewer polling (10 * 30s = 5min) is unchanged by the tiered logic."""
+    rt = _make_runtime_with_caps(tmp_path, http_client, "reviewer-1", capabilities=["review"])
+
+    call_count = [0]
+
+    def fake_forage(worker_id):
+        call_count[0] += 1
+        return None
+
+    rt.colony.forage = fake_forage
+    rt.run()
+
+    # max_idle_polls=10 → one initial attempt + 10 retries = 11 forage calls
+    assert call_count[0] == 11

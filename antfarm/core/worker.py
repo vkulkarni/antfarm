@@ -233,9 +233,22 @@ class WorkerRuntime:
         self.capabilities = capabilities or []
         self._token = token
         self._last_task_id: str | None = None
-        # Reviewer workers poll longer before exiting (wait for review tasks)
-        is_reviewer = "review" in (capabilities or [])
-        self._max_idle_polls = 10 if is_reviewer else 0  # 10 * 30s = 5min
+        # Polling is tiered by worker role so short-lived roles exit promptly
+        # while roles that wait on upstream tasks keep polling (#144).
+        caps = capabilities or []
+        if "review" in caps:
+            # Reviewers wait up to 5min for builders to harvest review tasks.
+            self._role = "reviewer"
+            self._max_idle_polls = 10  # 10 * 30s = 5min
+        elif "plan" in caps:
+            # Planners produce one batch of child tasks and exit promptly.
+            self._role = "planner"
+            self._max_idle_polls = 0
+        else:
+            # Builders wait up to 2.5min so they outlast a typical planner run
+            # and don't race the planner when started together (#144).
+            self._role = "builder"
+            self._max_idle_polls = 5  # 5 * 30s = 2.5min
 
         self.colony = ColonyClient(colony_url, client=client, token=token)
         self.workspace_mgr = WorkspaceManager(workspace_root, repo_path, integration_branch)
@@ -276,8 +289,8 @@ class WorkerRuntime:
                         logger.info("queue empty, worker exiting worker_id=%s", self.worker_id)
                         break
                     idle_polls += 1
-                    logger.debug("queue empty, polling (%d/%d) worker_id=%s",
-                                 idle_polls, max_idle_polls, self.worker_id)
+                    logger.debug("queue empty, polling (%d/%d) worker_id=%s role=%s",
+                                 idle_polls, max_idle_polls, self.worker_id, self._role)
                     time.sleep(30)
                 else:
                     idle_polls = 0  # reset on successful forage
