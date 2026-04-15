@@ -16,7 +16,12 @@ from antfarm.core.colony_client import ColonyClient
 from antfarm.core.models import Attempt, AttemptStatus, ReviewVerdict
 from antfarm.core.serve import get_app
 from antfarm.core.soldier import MergeResult, Soldier
-from antfarm.core.worker import _extract_branch_from_spec, _parse_review_verdict
+from antfarm.core.worker import (
+    AgentResult,
+    WorkerRuntime,
+    _extract_branch_from_spec,
+    _parse_review_verdict,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -487,6 +492,271 @@ class TestWorkerReviewParsing:
 
     def test_extract_branch_from_spec_missing(self):
         assert _extract_branch_from_spec("no branch here") is None
+
+
+# ===========================================================================
+# Missing [REVIEW_VERDICT] retry path (issue #143)
+# ===========================================================================
+
+
+class _FakeColony:
+    """Records every call made against a ColonyClient-like interface."""
+
+    def __init__(self, task: dict):
+        self.task = task
+        self.trail_calls: list[tuple[str, str, str]] = []
+        self.kickback_calls: list[dict] = []
+        self.harvest_calls: list[dict] = []
+        self.mark_harvest_pending_calls: list[tuple[str, str]] = []
+        self.store_review_verdict_calls: list[dict] = []
+        self.base_url = "http://fake"
+
+    def forage(self, worker_id):  # pragma: no cover - unused path
+        return self.task
+
+    def trail(self, task_id, worker_id, message):
+        self.trail_calls.append((task_id, worker_id, message))
+
+    def mark_harvest_pending(self, task_id, attempt_id):
+        self.mark_harvest_pending_calls.append((task_id, attempt_id))
+
+    def harvest(self, task_id, attempt_id, pr, branch, artifact=None):
+        self.harvest_calls.append({
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "pr": pr,
+            "branch": branch,
+            "artifact": artifact,
+        })
+
+    def kickback(self, task_id, reason, max_attempts=None):
+        self.kickback_calls.append({
+            "task_id": task_id,
+            "reason": reason,
+            "max_attempts": max_attempts,
+        })
+
+    def get_task(self, task_id):
+        return None
+
+    def store_review_verdict(self, task_id, attempt_id, verdict):
+        self.store_review_verdict_calls.append({
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "verdict": verdict,
+        })
+
+
+def _make_review_task(task_id: str, attempts: int) -> dict:
+    """Build a review task dict as it would look after forage."""
+    return {
+        "id": task_id,
+        "title": f"Review {task_id}",
+        "spec": "Review task\n\nBranch: feat/task-001\n",
+        "status": "active",
+        "current_attempt": f"att-{attempts:03d}",
+        "attempts": [
+            {"attempt_id": f"att-{i + 1:03d}", "status": "active"}
+            for i in range(attempts)
+        ],
+        "capabilities_required": ["review"],
+        "depends_on": [],
+        "priority": 10,
+    }
+
+
+def _make_worker_with_fake_colony(fake: _FakeColony) -> WorkerRuntime:
+    """Construct a WorkerRuntime and swap in a fake colony + stubs."""
+    runtime = WorkerRuntime.__new__(WorkerRuntime)
+    runtime.worker_id = "node-1/reviewer-1"
+    runtime.node_id = "node-1"
+    runtime.agent_type = "claude-code"
+    runtime.workspace_root = "/tmp/ws"
+    runtime.heartbeat_interval = 30.0
+    runtime.capabilities = ["review"]
+    runtime._token = None
+    runtime._last_task_id = None
+    runtime._max_idle_polls = 0
+    runtime.colony = fake
+    runtime._heartbeat_event = None
+    runtime._heartbeat_thread = None
+
+    class _WS:
+        def create(self, task_id, attempt_id):
+            return "/tmp/ws/fake"
+
+    runtime.workspace_mgr = _WS()
+    runtime._start_heartbeat_loop = lambda: None
+    runtime._stop_heartbeat_loop = lambda: None
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+    return runtime
+
+
+class TestMissingVerdictKickback:
+    def test_missing_verdict_triggers_kickback(self):
+        task = _make_review_task("review-task-001", attempts=1)
+        fake = _FakeColony(task)
+        worker = _make_worker_with_fake_colony(fake)
+        worker._launch_agent = lambda t, ws: AgentResult(
+            returncode=0,
+            stdout="I finished reviewing. Looks fine.",
+            stderr="",
+            branch="feat/task-001",
+        )
+        worker.colony.forage = lambda worker_id: task
+
+        assert worker._process_one_task() is True
+
+        assert any(
+            "no [REVIEW_VERDICT] tags" in msg
+            for _, _, msg in fake.trail_calls
+        ), f"expected missing-tag trail warning, got {fake.trail_calls}"
+
+        assert len(fake.kickback_calls) == 1
+        call = fake.kickback_calls[0]
+        assert call["task_id"] == "review-task-001"
+        assert "REVIEW_VERDICT" in call["reason"]
+        assert call["max_attempts"] == 2
+
+        assert fake.store_review_verdict_calls == []
+
+    def test_missing_verdict_second_attempt_marks_failed(self, soldier_env):
+        """When the review task exhausts its retry budget and becomes blocked,
+        Soldier.run_once_with_review kicks back the *original* task with the
+        'review task completed without a ReviewVerdict' reason."""
+        cc = soldier_env["cc"]
+        soldier = soldier_env["soldier"]
+        repo = soldier_env["repo"]
+        backend = soldier_env["backend"]
+
+        original = _carry_and_harvest_git(cc, repo, "task-r2", "feat/task-r2")
+        attempt_id = original["current_attempt"]
+
+        soldier.process_done_tasks()
+        review_id = "review-task-r2"
+        assert cc.get_task(review_id) is not None
+
+        reviewer_id = "reviewer-r2"
+        cc.register_worker(
+            worker_id=reviewer_id, node_id="n1",
+            agent_type="generic", workspace_root="/tmp/ws",
+            capabilities=["review"],
+        )
+
+        # First failed review attempt
+        rt = cc.forage(reviewer_id)
+        assert rt is not None and rt["id"] == review_id
+        cc.harvest(
+            task_id=review_id,
+            attempt_id=rt["current_attempt"],
+            pr="", branch="review-branch",
+        )
+        backend.kickback(
+            review_id,
+            "reviewer produced no [REVIEW_VERDICT] tags",
+            max_attempts=2,
+        )
+
+        review_after_1 = cc.get_task(review_id)
+        assert review_after_1["status"] == "ready"
+
+        # Second failed review attempt — exhausts budget
+        rt2 = cc.forage(reviewer_id)
+        assert rt2 is not None and rt2["id"] == review_id
+        cc.harvest(
+            task_id=review_id,
+            attempt_id=rt2["current_attempt"],
+            pr="", branch="review-branch",
+        )
+        backend.kickback(
+            review_id,
+            "reviewer produced no [REVIEW_VERDICT] tags",
+            max_attempts=2,
+        )
+
+        review_after_2 = cc.get_task(review_id)
+        assert review_after_2["status"] == "blocked", (
+            f"expected review task BLOCKED after budget, got "
+            f"{review_after_2['status']}"
+        )
+
+        # Soldier now sees the blocked review task and kicks back the original
+        results = soldier.run_once_with_review()
+        assert ("task-r2", MergeResult.FAILED) in results
+
+        original_after = cc.get_task("task-r2")
+        assert original_after["status"] == "ready"
+        assert original_after["current_attempt"] is None
+        trail_messages = [
+            e.get("message", "") for e in original_after.get("trail", [])
+        ]
+        assert any(
+            "review task completed without a ReviewVerdict" in m
+            for m in trail_messages
+        ), f"expected kickback reason in trail, got {trail_messages}"
+        for a in original_after["attempts"]:
+            if a["attempt_id"] == attempt_id:
+                assert a["status"] == "superseded"
+
+    def test_valid_verdict_unchanged(self):
+        """Regression: a well-formed verdict still harvests and does NOT
+        trigger the retry kickback path."""
+        task = _make_review_task("review-task-ok", attempts=1)
+        fake = _FakeColony(task)
+        fake.get_task = lambda tid: {  # type: ignore[assignment]
+            "id": "task-ok",
+            "current_attempt": "att-original",
+        }
+        worker = _make_worker_with_fake_colony(fake)
+        output = (
+            '[REVIEW_VERDICT]{"provider":"test","verdict":"pass",'
+            '"summary":"looks good","findings":[],'
+            '"reviewed_commit_sha":"abc123"}[/REVIEW_VERDICT]'
+        )
+        worker._launch_agent = lambda t, ws: AgentResult(
+            returncode=0, stdout=output, stderr="", branch="feat/task-ok",
+        )
+        worker.colony.forage = lambda worker_id: task
+
+        assert worker._process_one_task() is True
+
+        assert len(fake.harvest_calls) == 1
+        assert fake.kickback_calls == []
+        assert len(fake.store_review_verdict_calls) == 1
+
+    def test_reviewer_prompt_contains_mandatory_format(self):
+        """Snapshot test: the inline reviewer prompt builder output contains
+        the MANDATORY header and the [REVIEW_VERDICT] markers."""
+        task = _make_review_task("review-task-sn", attempts=1)
+        fake = _FakeColony(task)
+        worker = _make_worker_with_fake_colony(fake)
+
+        captured: dict = {}
+
+        def _fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+
+            class _P:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return _P()
+
+        import subprocess as _sp
+
+        orig = _sp.run
+        _sp.run = _fake_run  # type: ignore[assignment]
+        try:
+            worker._launch_agent(task, "/tmp/ws/fake")
+        finally:
+            _sp.run = orig
+
+        prompt = captured["cmd"][-1]
+        assert "MANDATORY" in prompt
+        assert "[REVIEW_VERDICT]" in prompt
+        assert "[/REVIEW_VERDICT]" in prompt
 
 
 # ===========================================================================

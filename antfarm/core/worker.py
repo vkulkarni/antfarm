@@ -482,7 +482,13 @@ class WorkerRuntime:
                         exc,
                     )
             else:
-                # Agent didn't produce parseable [REVIEW_VERDICT] tags
+                # Agent didn't produce parseable [REVIEW_VERDICT] tags.
+                # Trail a warning, then kickback the review task itself so
+                # another reviewer attempt runs. The kickback budget (2 total
+                # attempts) is enforced by FileBackend.kickback via
+                # max_attempts — once exhausted, the review task moves to
+                # blocked and Soldier.run_once_with_review kicks back the
+                # *original* task with a clear reason.
                 logger.warning(
                     "reviewer produced no verdict for %s", original_task_id
                 )
@@ -491,6 +497,27 @@ class WorkerRuntime:
                         task_id,
                         self.worker_id,
                         f"WARNING: no [REVIEW_VERDICT] tags in output for {original_task_id}",
+                    )
+                review_attempt_count = len(task.get("attempts", []))
+                retry_budget = 2
+                if review_attempt_count < retry_budget:
+                    logger.info(
+                        "retrying review task %s (attempt %d/%d)",
+                        task_id,
+                        review_attempt_count,
+                        retry_budget,
+                    )
+                else:
+                    logger.warning(
+                        "review task %s exhausted retry budget (%d attempts)",
+                        task_id,
+                        review_attempt_count,
+                    )
+                with contextlib.suppress(Exception):
+                    self.colony.kickback(
+                        task_id,
+                        reason="reviewer produced no [REVIEW_VERDICT] tags",
+                        max_attempts=retry_budget,
                     )
 
         return True
@@ -642,10 +669,34 @@ class WorkerRuntime:
                 "1. Read the PR diff for the branch above\n"
                 "2. Check for bugs, security issues, and design problems\n"
                 "3. Run tests to verify correctness\n"
-                "4. Output your verdict between tags:\n"
-                '   [REVIEW_VERDICT]{"provider":"<agent>","verdict":"pass",'
-                '"summary":"...","findings":[],'
-                '"reviewed_commit_sha":"..."}[/REVIEW_VERDICT]\n'
+                "4. Produce a ReviewVerdict (see output format below)\n\n"
+                "## MANDATORY OUTPUT FORMAT — READ THIS TWICE\n"
+                "Your verdict MUST be wrapped in [REVIEW_VERDICT] ... "
+                "[/REVIEW_VERDICT] tags.\n"
+                "The content between the tags MUST be a single valid JSON "
+                "object.\n"
+                "If you forget the tags, the colony cannot parse your verdict "
+                "and the review will be retried or failed.\n\n"
+                "### Worked example 1 — pass\n"
+                "[REVIEW_VERDICT]\n"
+                '{"provider":"<agent>","verdict":"pass",'
+                '"summary":"Change is clean, tests cover the regression.",'
+                '"findings":[],'
+                '"reviewed_commit_sha":"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"}\n'
+                "[/REVIEW_VERDICT]\n\n"
+                "### Worked example 2 — needs_changes\n"
+                "[REVIEW_VERDICT]\n"
+                '{"provider":"<agent>","verdict":"needs_changes",'
+                '"summary":"Missing owner validation on release path.",'
+                '"findings":["release_guard drops owner check",'
+                '"no test for mismatch"],'
+                '"reviewed_commit_sha":"1122334455667788990011223344556677889900"}\n'
+                "[/REVIEW_VERDICT]\n\n"
+                'Verdict values: "pass", "needs_changes", "blocked".\n\n'
+                "### Final checklist — do NOT skip\n"
+                "Before you finish: did you wrap your JSON in [REVIEW_VERDICT]"
+                " ... [/REVIEW_VERDICT]? If not, STOP and redo. A reply "
+                "without the tags is treated as a failed review.\n"
             )
         else:
             prompt = (

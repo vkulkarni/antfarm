@@ -239,10 +239,19 @@ class Soldier:
                 results.append((task_id, MergeResult.NEEDS_REVIEW))
                 continue
 
-            # Review task exists — check if it's done with a verdict
+            # Review task exists — check its status.
             review_status = review_task.get("status", "")
+            if review_status == "blocked":
+                # Review task exhausted its retry budget without producing a
+                # parseable verdict. Kick back the *original* task with a
+                # clear reason so the build can be reattempted.
+                self.kickback_with_cascade(
+                    task_id, "review task completed without a ReviewVerdict"
+                )
+                results.append((task_id, MergeResult.FAILED))
+                continue
             if review_status != "done":
-                # Still in progress
+                # Still in progress (ready/active/kicked-back awaiting retry)
                 results.append((task_id, MergeResult.NEEDS_REVIEW))
                 continue
 
