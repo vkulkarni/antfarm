@@ -482,7 +482,13 @@ class WorkerRuntime:
                         exc,
                     )
             else:
-                # Agent didn't produce parseable [REVIEW_VERDICT] tags
+                # Agent didn't produce parseable [REVIEW_VERDICT] tags.
+                # Trail a warning, then kickback the review task itself so
+                # another reviewer attempt runs. The kickback budget (2 total
+                # attempts) is enforced by FileBackend.kickback via
+                # max_attempts — once exhausted, the review task moves to
+                # blocked and Soldier.run_once_with_review kicks back the
+                # *original* task with a clear reason.
                 logger.warning(
                     "reviewer produced no verdict for %s", original_task_id
                 )
@@ -491,6 +497,27 @@ class WorkerRuntime:
                         task_id,
                         self.worker_id,
                         f"WARNING: no [REVIEW_VERDICT] tags in output for {original_task_id}",
+                    )
+                review_attempt_count = len(task.get("attempts", []))
+                retry_budget = 2
+                if review_attempt_count < retry_budget:
+                    logger.info(
+                        "retrying review task %s (attempt %d/%d)",
+                        task_id,
+                        review_attempt_count,
+                        retry_budget,
+                    )
+                else:
+                    logger.warning(
+                        "review task %s exhausted retry budget (%d attempts)",
+                        task_id,
+                        review_attempt_count,
+                    )
+                with contextlib.suppress(Exception):
+                    self.colony.kickback(
+                        task_id,
+                        reason="reviewer produced no [REVIEW_VERDICT] tags",
+                        max_attempts=retry_budget,
                     )
 
         return True
