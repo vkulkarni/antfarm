@@ -6,6 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- `register_worker` tolerates stale prior registrations — re-registering a `worker_id` whose heartbeat has expired replaces the stale entry instead of returning 409 (#194)
+
 ## [0.6.2] - 2026-04-16
 
 ### Added
