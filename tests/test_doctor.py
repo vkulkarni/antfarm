@@ -71,9 +71,18 @@ def test_healthy_colony_no_findings(setup):
     findings = run_doctor(backend, config)
     # Exclude tmux_available: it fires in CI/minimal environments where tmux
     # is not installed — this is expected and not a colony health issue.
+    #
+    # orphan_tmux_session is also tolerated here (defense in depth): it is an
+    # ``info``-severity finding so the severity filter below already skips it,
+    # but we list it explicitly so the intent is code, not just comment. This
+    # matters when the test host has live tmux sessions owned by a peer colony
+    # (different data_dir on the same machine) — those are not failures of the
+    # colony under test.
     errors_warnings = [
-        f for f in findings
-        if f.severity in ("error", "warning") and f.check != "tmux_available"
+        f
+        for f in findings
+        if f.severity in ("error", "warning")
+        and f.check not in ("tmux_available", "orphan_tmux_session")
     ]
     assert errors_warnings == [], f"Expected no errors/warnings, got: {errors_warnings}"
 
@@ -348,6 +357,7 @@ def test_filesystem_check_creates_dirs(setup):
 
     # Delete a required subdir
     import shutil
+
     shutil.rmtree(str(data_dir / "guards"))
     assert not (data_dir / "guards").exists()
 
@@ -389,35 +399,36 @@ def test_orphan_worktree_clean_deleted_on_fix(setup, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True
-    )
+    subprocess.run(["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True)
     (repo / "file.txt").write_text("init")
     subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True
-    )
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True)
 
     # Create a bare remote so worktree has an upstream
     bare = tmp_path / "bare.git"
     subprocess.run(
         ["git", "clone", "--bare", str(repo), str(bare)],
-        capture_output=True, check=True,
+        capture_output=True,
+        check=True,
     )
     subprocess.run(
         ["git", "remote", "add", "origin", str(bare)],
-        cwd=str(repo), capture_output=True, check=True,
+        cwd=str(repo),
+        capture_output=True,
+        check=True,
     )
     subprocess.run(
         ["git", "push", "-u", "origin", "main"],
-        cwd=str(repo), capture_output=True, check=False,
+        cwd=str(repo),
+        capture_output=True,
+        check=False,
     )
     subprocess.run(
         ["git", "push", "-u", "origin", "master"],
-        cwd=str(repo), capture_output=True, check=False,
+        cwd=str(repo),
+        capture_output=True,
+        check=False,
     )
 
     # Create a worktree with upstream tracking
@@ -426,12 +437,16 @@ def test_orphan_worktree_clean_deleted_on_fix(setup, tmp_path):
     wt_path = ws_root / "task-orphan-att-001"
     subprocess.run(
         ["git", "worktree", "add", "-b", "feat/orphan", str(wt_path)],
-        cwd=str(repo), capture_output=True, check=True,
+        cwd=str(repo),
+        capture_output=True,
+        check=True,
     )
     # Push the branch so it has an upstream
     subprocess.run(
         ["git", "push", "-u", "origin", "feat/orphan"],
-        cwd=str(wt_path), capture_output=True, check=True,
+        cwd=str(wt_path),
+        capture_output=True,
+        check=True,
     )
     assert wt_path.exists()
 
@@ -457,23 +472,19 @@ def test_worktree_is_clean_no_upstream_returns_false(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True
-    )
+    subprocess.run(["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True)
     (repo / "file.txt").write_text("init")
     subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True
-    )
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True)
 
     # Create a worktree (no remote/upstream)
     wt_path = tmp_path / "workspaces" / "task-orphan-att-001"
     subprocess.run(
         ["git", "worktree", "add", "-b", "feat/orphan", str(wt_path)],
-        cwd=str(repo), capture_output=True, check=True,
+        cwd=str(repo),
+        capture_output=True,
+        check=True,
     )
     assert wt_path.exists()
 
@@ -490,22 +501,18 @@ def test_worktree_is_clean_dirty_returns_false(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True
-    )
+    subprocess.run(["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True)
     (repo / "file.txt").write_text("init")
     subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True
-    )
+    subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True)
 
     wt_path = tmp_path / "workspaces" / "task-dirty"
     subprocess.run(
         ["git", "worktree", "add", "-b", "feat/dirty", str(wt_path)],
-        cwd=str(repo), capture_output=True, check=True,
+        cwd=str(repo),
+        capture_output=True,
+        check=True,
     )
 
     # Create uncommitted changes
@@ -638,7 +645,7 @@ def test_check_orphan_tmux_sessions_no_tmux():
 
 
 def test_check_orphan_tmux_sessions_detects_orphans(tmp_path):
-    """Antfarm-prefixed session without metadata emits warning; one WITH metadata does not."""
+    """Antfarm-prefixed session without metadata emits info finding; one WITH metadata does not."""
     from unittest.mock import MagicMock, patch
 
     from antfarm.core.doctor import check_orphan_tmux_sessions
@@ -670,7 +677,7 @@ def test_check_orphan_tmux_sessions_detects_orphans(tmp_path):
     orphan_checks = [f for f in findings if f.check == "orphan_tmux_session"]
     assert len(orphan_checks) == 1
     assert "auto-planner-2" in orphan_checks[0].message
-    assert orphan_checks[0].severity == "warning"
+    assert orphan_checks[0].severity == "info"
     assert orphan_checks[0].auto_fixable is False
 
 
@@ -691,3 +698,60 @@ def test_check_orphan_tmux_sessions_no_server():
         findings = check_orphan_tmux_sessions({})
 
     assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: peer-colony tmux sessions must not trip the Soldier merge gate
+# ---------------------------------------------------------------------------
+
+
+def test_run_doctor_on_colony_with_peer_auto_tmux_sessions_produces_no_warnings(setup, monkeypatch):
+    """Peer-colony tmux sessions must not raise error/warning findings.
+
+    Scenario: another antfarm colony (different data_dir, same host) owns live
+    ``auto-*`` tmux sessions. From this colony's point of view those sessions
+    have no matching metadata in its own ``processes/`` directory, so
+    ``check_orphan_tmux_sessions`` will flag them. The finding must be
+    ``info`` severity so that the Soldier merge gate — which treats any
+    error/warning as blocking — does not kick back every PR during dogfooding.
+    """
+    import subprocess as real_subprocess
+    from unittest.mock import MagicMock
+
+    import antfarm.core.doctor as doctor_mod
+
+    backend, config = setup
+
+    # Simulate a peer colony's sessions appearing in `tmux ls` output.
+    tmux_result = MagicMock()
+    tmux_result.returncode = 0
+    tmux_result.stdout = "auto-reviewer-99\nauto-builder-42\n"
+
+    real_run = real_subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        # Only intercept the tmux list-sessions call — delegate everything else
+        # (e.g., git rev-parse for git_config) to the real subprocess.run so
+        # unrelated checks behave normally.
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "tmux":
+            return tmux_result
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(doctor_mod.shutil, "which", lambda _name: "/usr/bin/tmux")
+    monkeypatch.setattr(doctor_mod.subprocess, "run", fake_run)
+
+    findings = run_doctor(backend, config, fix=False)
+
+    orphan_findings = [f for f in findings if f.check == "orphan_tmux_session"]
+    assert len(orphan_findings) == 2, (
+        f"expected both peer sessions to be flagged, got: {orphan_findings}"
+    )
+    assert all(f.severity == "info" for f in orphan_findings), (
+        f"peer-session findings must be info-severity, got: {orphan_findings}"
+    )
+
+    # The real regression guard: Soldier's gate asserts no errors/warnings.
+    blocking = [f for f in findings if f.severity in ("error", "warning")]
+    assert blocking == [], (
+        f"peer-colony tmux sessions must not produce error/warning findings: {blocking}"
+    )

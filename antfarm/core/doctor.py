@@ -22,8 +22,8 @@ from pathlib import Path
 
 @dataclass
 class Finding:
-    severity: str       # "error", "warning", "info"
-    check: str          # e.g., "stale_worker", "stale_task"
+    severity: str  # "error", "warning", "info"
+    check: str  # e.g., "stale_worker", "stale_task"
     message: str
     auto_fixable: bool
     fixed: bool = False
@@ -111,12 +111,14 @@ def check_filesystem(config: dict, fix: bool = False) -> list[Finding]:
 
     # Check writability
     if not os.access(str(data_dir), os.W_OK):
-        findings.append(Finding(
-            severity="error",
-            check="filesystem",
-            message=f"data_dir is not writable: {data_dir}",
-            auto_fixable=False,
-        ))
+        findings.append(
+            Finding(
+                severity="error",
+                check="filesystem",
+                message=f"data_dir is not writable: {data_dir}",
+                auto_fixable=False,
+            )
+        )
 
     # Check subdirs
     for subdir in _REQUIRED_SUBDIRS:
@@ -133,12 +135,14 @@ def check_filesystem(config: dict, fix: bool = False) -> list[Finding]:
                 f.fixed = True
             findings.append(f)
         elif not os.access(str(subpath), os.W_OK):
-            findings.append(Finding(
-                severity="error",
-                check="filesystem",
-                message=f"Required subdirectory not writable: {subpath}",
-                auto_fixable=False,
-            ))
+            findings.append(
+                Finding(
+                    severity="error",
+                    check="filesystem",
+                    message=f"Required subdirectory not writable: {subpath}",
+                    auto_fixable=False,
+                )
+            )
 
     return findings
 
@@ -146,6 +150,7 @@ def check_filesystem(config: dict, fix: bool = False) -> list[Finding]:
 # ---------------------------------------------------------------------------
 # Check 2: Colony reachability
 # ---------------------------------------------------------------------------
+
 
 def check_colony_reachable(config: dict) -> list[Finding]:
     """If colony_url is configured, attempt GET /status.
@@ -158,42 +163,52 @@ def check_colony_reachable(config: dict) -> list[Finding]:
     """
     colony_url = config.get("colony_url")
     if not colony_url:
-        return [Finding(
-            severity="info",
-            check="colony_reachable",
-            message="colony_url not configured — skipping reachability check",
-            auto_fixable=False,
-        )]
+        return [
+            Finding(
+                severity="info",
+                check="colony_reachable",
+                message="colony_url not configured — skipping reachability check",
+                auto_fixable=False,
+            )
+        ]
 
     try:
         import urllib.request
+
         url = colony_url.rstrip("/") + "/status"
         with urllib.request.urlopen(url, timeout=5) as resp:  # noqa: S310
             if resp.status == 200:
-                return [Finding(
-                    severity="info",
+                return [
+                    Finding(
+                        severity="info",
+                        check="colony_reachable",
+                        message=f"Colony reachable at {colony_url}",
+                        auto_fixable=False,
+                    )
+                ]
+            return [
+                Finding(
+                    severity="warning",
                     check="colony_reachable",
-                    message=f"Colony reachable at {colony_url}",
+                    message=f"Colony returned HTTP {resp.status} from {url}",
                     auto_fixable=False,
-                )]
-            return [Finding(
+                )
+            ]
+    except Exception as exc:
+        return [
+            Finding(
                 severity="warning",
                 check="colony_reachable",
-                message=f"Colony returned HTTP {resp.status} from {url}",
+                message=f"Colony unreachable at {colony_url}: {exc}",
                 auto_fixable=False,
-            )]
-    except Exception as exc:
-        return [Finding(
-            severity="warning",
-            check="colony_reachable",
-            message=f"Colony unreachable at {colony_url}: {exc}",
-            auto_fixable=False,
-        )]
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
 # Check 3: Git config
 # ---------------------------------------------------------------------------
+
 
 def check_git_config() -> list[Finding]:
     """Verify we are inside a git work tree.
@@ -212,24 +227,29 @@ def check_git_config() -> list[Finding]:
         )
         if result.stdout.strip() == "true":
             return []
-        return [Finding(
-            severity="warning",
-            check="git_config",
-            message="Not inside a git work tree",
-            auto_fixable=False,
-        )]
+        return [
+            Finding(
+                severity="warning",
+                check="git_config",
+                message="Not inside a git work tree",
+                auto_fixable=False,
+            )
+        ]
     except subprocess.CalledProcessError as exc:
-        return [Finding(
-            severity="warning",
-            check="git_config",
-            message=f"git rev-parse failed: {exc}",
-            auto_fixable=False,
-        )]
+        return [
+            Finding(
+                severity="warning",
+                check="git_config",
+                message=f"git rev-parse failed: {exc}",
+                auto_fixable=False,
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
 # Check 4: Stale workers
 # ---------------------------------------------------------------------------
+
 
 def check_stale_workers(backend, config: dict, fix: bool = False) -> list[Finding]:
     """List worker files in data_dir/workers/. Check mtime vs worker_ttl.
@@ -282,6 +302,7 @@ def check_stale_workers(backend, config: dict, fix: bool = False) -> list[Findin
 # ---------------------------------------------------------------------------
 # Check 5: Stale tasks
 # ---------------------------------------------------------------------------
+
 
 def check_stale_tasks(backend, config: dict, fix: bool = False) -> list[Finding]:
     """List tasks in active/. Check if current_attempt's worker is live.
@@ -341,9 +362,7 @@ def check_stale_tasks(backend, config: dict, fix: bool = False) -> list[Finding]
             f = Finding(
                 severity="warning",
                 check="stale_task",
-                message=(
-                    f"Task '{task_id}' is active but worker '{worker_id}' is dead/missing"
-                ),
+                message=(f"Task '{task_id}' is active but worker '{worker_id}' is dead/missing"),
                 auto_fixable=True,
             )
             if fix:
@@ -387,11 +406,13 @@ def _recover_stale_task(
 
     # Add trail entry
     data.setdefault("trail", [])
-    data["trail"].append({
-        "ts": now,
-        "worker_id": "doctor",
-        "message": "recovered by doctor",
-    })
+    data["trail"].append(
+        {
+            "ts": now,
+            "worker_id": "doctor",
+            "message": "recovered by doctor",
+        }
+    )
 
     # Write to ready/ atomically, then delete from active/
     ready_path = data_dir / "tasks" / "ready" / task_file.name
@@ -404,6 +425,7 @@ def _recover_stale_task(
 # ---------------------------------------------------------------------------
 # Check 6: Stale guards
 # ---------------------------------------------------------------------------
+
 
 def check_stale_guards(backend, config: dict, fix: bool = False) -> list[Finding]:
     """List guard files in data_dir/guards/. Check mtime vs guard_ttl AND owner liveness.
@@ -473,6 +495,7 @@ def check_stale_guards(backend, config: dict, fix: bool = False) -> list[Finding
 # Check 7: Workspace conflicts
 # ---------------------------------------------------------------------------
 
+
 def check_workspace_conflicts(backend) -> list[Finding]:
     """Check if any active workers share the same workspace_root.
 
@@ -507,14 +530,14 @@ def check_workspace_conflicts(backend) -> list[Finding]:
 
     for ws_root, worker_ids in workspace_to_workers.items():
         if len(worker_ids) > 1:
-            findings.append(Finding(
-                severity="warning",
-                check="workspace_conflict",
-                message=(
-                    f"Workers {worker_ids} share workspace_root '{ws_root}'"
-                ),
-                auto_fixable=False,
-            ))
+            findings.append(
+                Finding(
+                    severity="warning",
+                    check="workspace_conflict",
+                    message=(f"Workers {worker_ids} share workspace_root '{ws_root}'"),
+                    auto_fixable=False,
+                )
+            )
 
     return findings
 
@@ -522,6 +545,7 @@ def check_workspace_conflicts(backend) -> list[Finding]:
 # ---------------------------------------------------------------------------
 # Check 8: Orphan workspaces
 # ---------------------------------------------------------------------------
+
 
 def _worktree_is_clean(path: str) -> bool:
     """Check if a worktree is provably clean (safe to delete).
@@ -533,7 +557,9 @@ def _worktree_is_clean(path: str) -> bool:
         # Check for uncommitted changes
         status = subprocess.run(
             ["git", "-C", path, "status", "--porcelain"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
         if status.stdout.strip():
             return False  # has uncommitted changes
@@ -541,7 +567,9 @@ def _worktree_is_clean(path: str) -> bool:
         # Check for unpushed commits — requires upstream to be configured
         log = subprocess.run(
             ["git", "-C", path, "log", "@{u}..", "--oneline"],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if log.returncode != 0:
             return False  # no upstream configured or git error — keep it
@@ -586,46 +614,56 @@ def check_orphan_workspaces(config: dict, fix: bool = False) -> list[Finding]:
                 try:
                     subprocess.run(
                         ["git", "worktree", "remove", str(entry)],
-                        capture_output=True, text=True, check=True,
+                        capture_output=True,
+                        text=True,
+                        check=True,
                         cwd=repo_path,
                     )
-                    findings.append(Finding(
-                        severity="info",
-                        check="orphan_workspace",
-                        message=f"Orphan worktree auto-deleted (clean): {entry}",
-                        auto_fixable=True,
-                        fixed=True,
-                    ))
+                    findings.append(
+                        Finding(
+                            severity="info",
+                            check="orphan_workspace",
+                            message=f"Orphan worktree auto-deleted (clean): {entry}",
+                            auto_fixable=True,
+                            fixed=True,
+                        )
+                    )
                 except subprocess.CalledProcessError:
-                    findings.append(Finding(
+                    findings.append(
+                        Finding(
+                            severity="info",
+                            check="orphan_workspace",
+                            message=(
+                                f"Worktree directory found with no associated active task: "
+                                f"{entry} (removal failed)"
+                            ),
+                            auto_fixable=False,
+                        )
+                    )
+            elif fix:
+                findings.append(
+                    Finding(
                         severity="info",
                         check="orphan_workspace",
                         message=(
-                            f"Worktree directory found with no associated active task: "
-                            f"{entry} (removal failed)"
+                            f"Orphan worktree kept: has changes or could not verify "
+                            f"clean state: {entry}"
                         ),
-                        auto_fixable=False,
-                    ))
-            elif fix:
-                findings.append(Finding(
-                    severity="info",
-                    check="orphan_workspace",
-                    message=(
-                        f"Orphan worktree kept: has changes or could not verify "
-                        f"clean state: {entry}"
-                    ),
-                    auto_fixable=True,
-                    fixed=False,
-                ))
+                        auto_fixable=True,
+                        fixed=False,
+                    )
+                )
             else:
-                findings.append(Finding(
-                    severity="info",
-                    check="orphan_workspace",
-                    message=(
-                        f"Worktree directory found with no associated active task: {entry}"
-                    ),
-                    auto_fixable=True,
-                ))
+                findings.append(
+                    Finding(
+                        severity="info",
+                        check="orphan_workspace",
+                        message=(
+                            f"Worktree directory found with no associated active task: {entry}"
+                        ),
+                        auto_fixable=True,
+                    )
+                )
 
     return findings
 
@@ -633,6 +671,7 @@ def check_orphan_workspaces(config: dict, fix: bool = False) -> list[Finding]:
 # ---------------------------------------------------------------------------
 # Check 9: State consistency
 # ---------------------------------------------------------------------------
+
 
 def check_state_consistency(backend) -> list[Finding]:
     """Read task files directly and check for state inconsistencies.
@@ -671,83 +710,87 @@ def check_state_consistency(backend) -> list[Finding]:
             try:
                 data = json.loads(task_file.read_text())
             except (json.JSONDecodeError, OSError) as exc:
-                findings.append(Finding(
-                    severity="error",
-                    check="state_consistency",
-                    message=f"Malformed JSON in {task_file.name}: {exc}",
-                    auto_fixable=False,
-                ))
+                findings.append(
+                    Finding(
+                        severity="error",
+                        check="state_consistency",
+                        message=f"Malformed JSON in {task_file.name}: {exc}",
+                        auto_fixable=False,
+                    )
+                )
                 continue
 
             status = data.get("status", "")
 
             # (a) status field doesn't match folder
             if status != folder_name:
-                findings.append(Finding(
-                    severity="error",
-                    check="state_consistency",
-                    message=(
-                        f"Task '{task_id}' is in {folder_name}/ but status='{status}'"
-                    ),
-                    auto_fixable=False,
-                ))
+                findings.append(
+                    Finding(
+                        severity="error",
+                        check="state_consistency",
+                        message=(f"Task '{task_id}' is in {folder_name}/ but status='{status}'"),
+                        auto_fixable=False,
+                    )
+                )
 
             # (b) task in active/ with no current_attempt
             if folder_name == "active" and not data.get("current_attempt"):
-                findings.append(Finding(
-                    severity="error",
-                    check="state_consistency",
-                    message=f"Task '{task_id}' is in active/ but has no current_attempt",
-                    auto_fixable=False,
-                ))
+                findings.append(
+                    Finding(
+                        severity="error",
+                        check="state_consistency",
+                        message=f"Task '{task_id}' is in active/ but has no current_attempt",
+                        auto_fixable=False,
+                    )
+                )
 
             # (c) more than one ACTIVE attempt
-            active_attempts = [
-                a for a in data.get("attempts", [])
-                if a.get("status") == "active"
-            ]
+            active_attempts = [a for a in data.get("attempts", []) if a.get("status") == "active"]
             if len(active_attempts) > 1:
-                findings.append(Finding(
-                    severity="error",
-                    check="state_consistency",
-                    message=(
-                        f"Task '{task_id}' has {len(active_attempts)} active attempts "
-                        f"(should be at most 1)"
-                    ),
-                    auto_fixable=False,
-                ))
+                findings.append(
+                    Finding(
+                        severity="error",
+                        check="state_consistency",
+                        message=(
+                            f"Task '{task_id}' has {len(active_attempts)} active attempts "
+                            f"(should be at most 1)"
+                        ),
+                        auto_fixable=False,
+                    )
+                )
 
             # (e) done task with current_attempt pointing to non-existent attempt
             current = data.get("current_attempt")
             if current and folder_name == "done":
                 attempt_ids = {a.get("attempt_id") for a in data.get("attempts", [])}
                 if current not in attempt_ids:
-                    findings.append(Finding(
-                        severity="error",
-                        check="state_consistency",
-                        message=(
-                            f"Task '{task_id}' in done/ has current_attempt='{current}' "
-                            f"but no matching attempt exists"
-                        ),
-                        auto_fixable=False,
-                    ))
+                    findings.append(
+                        Finding(
+                            severity="error",
+                            check="state_consistency",
+                            message=(
+                                f"Task '{task_id}' in done/ has current_attempt='{current}' "
+                                f"but no matching attempt exists"
+                            ),
+                            auto_fixable=False,
+                        )
+                    )
 
             # (f) merged attempt is current_attempt while task status is ready
             if current and folder_name == "ready":
                 for attempt in data.get("attempts", []):
-                    if (
-                        attempt.get("attempt_id") == current
-                        and attempt.get("status") == "merged"
-                    ):
-                        findings.append(Finding(
-                            severity="error",
-                            check="state_consistency",
-                            message=(
-                                f"Task '{task_id}' in ready/ has a merged attempt "
-                                f"as current_attempt — invalid state"
-                            ),
-                            auto_fixable=False,
-                        ))
+                    if attempt.get("attempt_id") == current and attempt.get("status") == "merged":
+                        findings.append(
+                            Finding(
+                                severity="error",
+                                check="state_consistency",
+                                message=(
+                                    f"Task '{task_id}' in ready/ has a merged attempt "
+                                    f"as current_attempt — invalid state"
+                                ),
+                                auto_fixable=False,
+                            )
+                        )
 
     return findings
 
@@ -755,6 +798,7 @@ def check_state_consistency(backend) -> list[Finding]:
 # ---------------------------------------------------------------------------
 # Check 10: Dependency cycles
 # ---------------------------------------------------------------------------
+
 
 def check_dependency_cycles(backend) -> list[Finding]:
     """Load all tasks, build dependency graph, detect cycles and dangling refs.
@@ -772,12 +816,14 @@ def check_dependency_cycles(backend) -> list[Finding]:
     try:
         all_tasks = backend.list_tasks()
     except Exception as exc:
-        findings.append(Finding(
-            severity="error",
-            check="dependency_cycles",
-            message=f"Could not load tasks for dependency check: {exc}",
-            auto_fixable=False,
-        ))
+        findings.append(
+            Finding(
+                severity="error",
+                check="dependency_cycles",
+                message=f"Could not load tasks for dependency check: {exc}",
+                auto_fixable=False,
+            )
+        )
         return findings
 
     task_ids = {t["id"] for t in all_tasks}
@@ -787,12 +833,14 @@ def check_dependency_cycles(backend) -> list[Finding]:
     for task_id, task_deps in deps.items():
         for dep in task_deps:
             if dep not in task_ids:
-                findings.append(Finding(
-                    severity="warning",
-                    check="dangling_dependency",
-                    message=f"Task '{task_id}' depends on non-existent task '{dep}'",
-                    auto_fixable=False,
-                ))
+                findings.append(
+                    Finding(
+                        severity="warning",
+                        check="dangling_dependency",
+                        message=f"Task '{task_id}' depends on non-existent task '{dep}'",
+                        auto_fixable=False,
+                    )
+                )
 
     # DFS cycle detection
     WHITE, GRAY, BLACK = 0, 1, 2
@@ -812,15 +860,17 @@ def check_dependency_cycles(backend) -> list[Finding]:
                 cycle_key = "->".join(sorted(cycle_nodes))
                 if cycle_key not in cycle_reported:
                     cycle_reported.add(cycle_key)
-                    findings.append(Finding(
-                        severity="error",
-                        check="dependency_cycles",
-                        message=(
-                            f"Dependency cycle detected: "
-                            f"{' -> '.join(cycle_nodes)} -> {neighbor}"
-                        ),
-                        auto_fixable=False,
-                    ))
+                    findings.append(
+                        Finding(
+                            severity="error",
+                            check="dependency_cycles",
+                            message=(
+                                f"Dependency cycle detected: "
+                                f"{' -> '.join(cycle_nodes)} -> {neighbor}"
+                            ),
+                            auto_fixable=False,
+                        )
+                    )
             elif color[neighbor] == WHITE:
                 dfs(neighbor, path)
         path.pop()
@@ -836,6 +886,7 @@ def check_dependency_cycles(backend) -> list[Finding]:
 # ---------------------------------------------------------------------------
 # Check 11: Runner health
 # ---------------------------------------------------------------------------
+
 
 def check_runner_health(backend, config: dict, fix: bool = False) -> list[Finding]:
     """Check reachability of all nodes with runner_url.
@@ -874,24 +925,25 @@ def check_runner_health(backend, config: dict, fix: bool = False) -> list[Findin
             with urllib.request.urlopen(url, timeout=3) as resp:  # noqa: S310
                 if resp.status == 200:
                     continue
-                findings.append(Finding(
+                findings.append(
+                    Finding(
+                        severity="warning",
+                        check="runner_health",
+                        message=(
+                            f"Runner on node '{node_id}' returned HTTP {resp.status} from {url}"
+                        ),
+                        auto_fixable=False,
+                    )
+                )
+        except Exception as exc:
+            findings.append(
+                Finding(
                     severity="warning",
                     check="runner_health",
-                    message=(
-                        f"Runner on node '{node_id}' returned HTTP {resp.status} "
-                        f"from {url}"
-                    ),
+                    message=(f"Runner on node '{node_id}' unreachable at {runner_url}: {exc}"),
                     auto_fixable=False,
-                ))
-        except Exception as exc:
-            findings.append(Finding(
-                severity="warning",
-                check="runner_health",
-                message=(
-                    f"Runner on node '{node_id}' unreachable at {runner_url}: {exc}"
-                ),
-                auto_fixable=False,
-            ))
+                )
+            )
 
     return findings
 
@@ -899,6 +951,7 @@ def check_runner_health(backend, config: dict, fix: bool = False) -> list[Findin
 # ---------------------------------------------------------------------------
 # Check 12: tmux availability
 # ---------------------------------------------------------------------------
+
 
 def check_tmux_available(config: dict) -> list[Finding]:
     """Warn if tmux is not installed — workers will fall back to unreliable subprocess mode.
@@ -911,14 +964,16 @@ def check_tmux_available(config: dict) -> list[Finding]:
     """
     if shutil.which("tmux"):
         return []
-    return [Finding(
-        severity="warning",
-        check="tmux_available",
-        message=(
-            "tmux not installed — worker spawning will use subprocess fallback (less reliable)"
-        ),
-        auto_fixable=False,
-    )]
+    return [
+        Finding(
+            severity="warning",
+            check="tmux_available",
+            message=(
+                "tmux not installed — worker spawning will use subprocess fallback (less reliable)"
+            ),
+            auto_fixable=False,
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -935,6 +990,13 @@ def check_orphan_tmux_sessions(config: dict) -> list[Finding]:
     (``auto-`` or ``runner-``) but whose ProcessMetadata file is absent from
     ``{state_dir}/processes/{name}.json``.  This can happen when the colony
     process crashed before writing metadata, or after a manual ``tmux kill-server``.
+
+    Severity is ``info``, not ``warning``, because we cannot reliably distinguish
+    our own orphan from a live session owned by a peer colony (different
+    ``data_dir`` on the same host) from tmux alone. Users running ``antfarm
+    doctor`` still see the finding, but automated gates (e.g. the Soldier merge
+    gate's "no errors/warnings" assertion) do not fire spuriously on hosts that
+    run multiple colonies or host long-lived dogfood sessions.
 
     Args:
         config: Doctor config dict. Uses ``data_dir`` to locate process metadata.
@@ -978,11 +1040,13 @@ def check_orphan_tmux_sessions(config: dict) -> list[Finding]:
             if metadata_file.exists():
                 continue
 
-        findings.append(Finding(
-            severity="warning",
-            check="orphan_tmux_session",
-            message=f"orphan tmux session: {name} (no matching metadata)",
-            auto_fixable=False,
-        ))
+        findings.append(
+            Finding(
+                severity="info",
+                check="orphan_tmux_session",
+                message=f"orphan tmux session: {name} (no matching metadata)",
+                auto_fixable=False,
+            )
+        )
 
     return findings
