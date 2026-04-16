@@ -757,13 +757,18 @@ class FileBackend(TaskBackend):
     # ------------------------------------------------------------------
 
     def register_node(self, node: dict) -> None:
-        """Register a node. Idempotent — updates last_seen if already exists."""
+        """Register a node. Idempotent — merges all fields on re-registration."""
         with self._lock:
             node_id = node["node_id"]
             node_path = self._node_path(node_id)
             if node_path.exists():
                 existing = self._read_json(node_path)
-                existing["last_seen"] = node.get("last_seen", _now_iso())
+                for key, value in node.items():
+                    if key == "node_id":
+                        continue
+                    existing[key] = value
+                if "last_seen" not in node:
+                    existing["last_seen"] = _now_iso()
                 self._write_json(node_path, existing)
             else:
                 self._write_json(node_path, node)
