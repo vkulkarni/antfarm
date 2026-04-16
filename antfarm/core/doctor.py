@@ -324,9 +324,12 @@ def check_stale_tasks(backend, config: dict, fix: bool = False) -> list[Finding]
                 break
 
         # Check if worker file exists (live)
+        # Worker IDs contain "/" (e.g. "local/auto-planner-1") which the
+        # FileBackend encodes as "%2F" in filenames. Match that encoding.
         worker_alive = False
         if worker_id:
-            worker_file = workers_dir / f"{worker_id}.json"
+            safe_id = worker_id.replace("/", "%2F")
+            worker_file = workers_dir / f"{safe_id}.json"
             worker_alive = worker_file.exists()
 
         if not worker_alive:
@@ -438,7 +441,8 @@ def check_stale_guards(backend, config: dict, fix: bool = False) -> list[Finding
         except (json.JSONDecodeError, OSError):
             owner = ""
 
-        owner_alive = (workers_dir / f"{owner}.json").exists() if owner else False
+        safe_owner = owner.replace("/", "%2F") if owner else ""
+        owner_alive = (workers_dir / f"{safe_owner}.json").exists() if owner else False
         if owner_alive:
             # Guard mtime is old but owner is still live — not stale
             continue
