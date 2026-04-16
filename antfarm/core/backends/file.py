@@ -476,6 +476,62 @@ class FileBackend(TaskBackend):
             data["updated_at"] = _now_iso()
             self._write_json(done_path, data)
 
+    def rereview(
+        self,
+        review_task_id: str,
+        new_spec: str,
+        touches: list[str],
+    ) -> None:
+        """Re-ready an existing review task with an updated spec.
+
+        Finds the review task wherever it currently sits (done/, active/,
+        ready/, paused/, blocked/), supersedes its current attempt if any,
+        updates spec + touches, appends a trail entry, and moves the file
+        back into ready/ (unless it is already there).
+        """
+        with self._lock:
+            path = self._find_task_path(review_task_id)
+            if path is None:
+                raise FileNotFoundError(
+                    f"Review task '{review_task_id}' not found"
+                )
+
+            data = self._read_json(path)
+            now = _now_iso()
+
+            current_attempt_id = data.get("current_attempt")
+            if current_attempt_id:
+                for a in data.get("attempts", []):
+                    if a.get("attempt_id") == current_attempt_id:
+                        if a.get("status") != AttemptStatus.SUPERSEDED.value:
+                            a["status"] = AttemptStatus.SUPERSEDED.value
+                            a["completed_at"] = now
+                        break
+                data["current_attempt"] = None
+
+            # Normalize touches: trim + dedupe (preserve case)
+            data["touches"] = list(
+                dict.fromkeys(t.strip() for t in (touches or []))
+            )
+            data["spec"] = new_spec
+
+            trail_entry = TrailEntry(
+                ts=now,
+                worker_id="system",
+                message="Re-review triggered: parent task has a new attempt",
+                action_type="rereview",
+            )
+            data.setdefault("trail", [])
+            data["trail"].append(trail_entry.to_dict())
+
+            data["status"] = TaskStatus.READY.value
+            data["updated_at"] = now
+
+            ready_path = self._ready_path(review_task_id)
+            self._write_json(path, data)
+            if path != ready_path:
+                os.rename(path, ready_path)
+
     def override_merge_order(self, task_id: str, position: int) -> None:
         """Set merge_override on a task in done/."""
         with self._lock:

@@ -806,3 +806,274 @@ def test_soldier_suppresses_review_for_cancelled_mission(tmp_path):
     # Confirm no review task was created
     review_task = backend.get_task("review-task-cancelled")
     assert review_task is None
+
+
+# ---------------------------------------------------------------------------
+# Re-review on SHA mismatch tests (#226)
+# ---------------------------------------------------------------------------
+
+
+def _set_attempt_artifact_sha(backend, task_id, sha: str) -> None:
+    """Inject a minimal artifact with ``head_commit_sha`` onto the current attempt."""
+    import json
+    from pathlib import Path
+
+    # Task is in done/ after harvest.
+    done_path = Path(backend._root) / "tasks" / "done" / f"{task_id}.json"
+    data = json.loads(done_path.read_text())
+    attempt_id = data["current_attempt"]
+    artifact = {
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "worker_id": "w-test",
+        "branch": f"feat/{task_id}",
+        "pr_url": None,
+        "base_commit_sha": "0" * 40,
+        "head_commit_sha": sha,
+        "target_branch": "main",
+        "target_branch_sha_at_harvest": "0" * 40,
+    }
+    for a in data["attempts"]:
+        if a["attempt_id"] == attempt_id:
+            a["artifact"] = artifact
+            break
+    done_path.write_text(json.dumps(data, indent=2))
+
+
+def test_create_review_task_creates_when_no_prior_review(tmp_path):
+    """Baseline: with no prior review, create_review_task creates a new one."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-rr-new", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-rr-new", "a" * 40)
+    task = backend.get_task("task-rr-new")
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    review_id = soldier.create_review_task(task)
+
+    assert review_id == "review-task-rr-new"
+    review = backend.get_task(review_id)
+    assert review is not None
+    assert review["status"] == "ready"
+    assert "Attempt-SHA:" in review["spec"]
+    assert "a" * 40 in review["spec"]
+
+
+def test_create_review_task_noops_when_sha_matches(tmp_path):
+    """Same SHA on the existing review spec → no-op (returns None)."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-rr-same", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-rr-same", "b" * 40)
+    task = backend.get_task("task-rr-same")
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    first = soldier.create_review_task(task)
+    assert first == "review-task-rr-same"
+
+    review_before = backend.get_task("review-task-rr-same")
+    updated_at_before = review_before["updated_at"]
+    trail_len_before = len(review_before.get("trail", []))
+
+    # Second call with same SHA should no-op
+    second = soldier.create_review_task(task)
+    assert second is None
+
+    review_after = backend.get_task("review-task-rr-same")
+    assert review_after["updated_at"] == updated_at_before
+    assert len(review_after.get("trail", [])) == trail_len_before
+
+
+def test_create_review_task_noops_when_review_in_progress(tmp_path):
+    """Review task currently in active/ with matching SHA → no-op."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-rr-active", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-rr-active", "c" * 40)
+    task = backend.get_task("task-rr-active")
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    review_id = soldier.create_review_task(task)
+    assert review_id == "review-task-rr-active"
+
+    # Simulate a reviewer picking up the review task
+    backend.register_worker(
+        {
+            "worker_id": "reviewer-1",
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp/ws",
+            "status": "idle",
+            "capabilities": ["review"],
+        }
+    )
+    pulled = backend.pull("reviewer-1")
+    assert pulled is not None and pulled["id"] == "review-task-rr-active"
+
+    # SHA still matches → no-op, review stays active
+    again = soldier.create_review_task(task)
+    assert again is None
+    review = backend.get_task("review-task-rr-active")
+    assert review["status"] == "active"
+
+
+def test_create_review_task_rereadies_on_sha_mismatch(tmp_path):
+    """Different SHA on re-attempt → re-ready review task, supersede old attempt."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-rr-mm", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-rr-mm", "a" * 40)
+    task = backend.get_task("task-rr-mm")
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    soldier.create_review_task(task)
+
+    # Simulate reviewer claim — review task is now in active/
+    backend.register_worker(
+        {
+            "worker_id": "reviewer-1",
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp/ws",
+            "status": "idle",
+            "capabilities": ["review"],
+        }
+    )
+    backend.pull("reviewer-1")
+    review_before = backend.get_task("review-task-rr-mm")
+    old_attempt_id = review_before["current_attempt"]
+    assert review_before["status"] == "active"
+
+    # Parent task gets re-attempted with a new SHA (kickback + re-pull + re-harvest)
+    backend.kickback("task-rr-mm", "reattempt for test")
+    backend.heartbeat("w-task-rr-mm", {"status": "idle"})
+    backend.pull("w-task-rr-mm")
+    pulled = backend.get_task("task-rr-mm")
+    new_attempt_id = pulled["current_attempt"]
+    backend.mark_harvested(
+        "task-rr-mm", new_attempt_id, pr="PR-v2", branch="feat/task-rr-mm"
+    )
+    _set_attempt_artifact_sha(backend, "task-rr-mm", "b" * 40)
+    task = backend.get_task("task-rr-mm")
+
+    review_id = soldier.create_review_task(task)
+    assert review_id == "review-task-rr-mm"
+
+    review_after = backend.get_task("review-task-rr-mm")
+    assert review_after["status"] == "ready"
+    assert review_after["current_attempt"] is None
+    # Old attempt is superseded
+    for a in review_after["attempts"]:
+        if a["attempt_id"] == old_attempt_id:
+            assert a["status"] == "superseded"
+    # New SHA is embedded in the spec
+    assert "b" * 40 in review_after["spec"]
+    # Trail has a re-review entry
+    messages = [e["message"] for e in review_after.get("trail", [])]
+    assert any("Re-review" in m for m in messages)
+
+
+def test_rereview_is_idempotent(tmp_path):
+    """Calling rereview twice doesn't double-supersede the same attempt."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-rr-idem", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-rr-idem", "a" * 40)
+    task = backend.get_task("task-rr-idem")
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    soldier.create_review_task(task)
+
+    # Reviewer picks it up, then parent is re-attempted (different SHA)
+    backend.register_worker(
+        {
+            "worker_id": "reviewer-1",
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp/ws",
+            "status": "idle",
+            "capabilities": ["review"],
+        }
+    )
+    backend.pull("reviewer-1")
+
+    new_spec = "updated spec body\nAttempt-SHA: " + ("b" * 40) + "\n"
+    backend.rereview("review-task-rr-idem", new_spec, touches=["x"])
+
+    first = backend.get_task("review-task-rr-idem")
+    assert first["status"] == "ready"
+    assert first["current_attempt"] is None
+    superseded_count_1 = sum(
+        1 for a in first["attempts"] if a["status"] == "superseded"
+    )
+
+    # Second rereview: already ready, no current_attempt → no new supersession
+    backend.rereview("review-task-rr-idem", new_spec, touches=["x"])
+    second = backend.get_task("review-task-rr-idem")
+    assert second["status"] == "ready"
+    assert second["current_attempt"] is None
+    superseded_count_2 = sum(
+        1 for a in second["attempts"] if a["status"] == "superseded"
+    )
+    assert superseded_count_2 == superseded_count_1
+
+
+def test_reattempt_end_to_end_flow(tmp_path):
+    """End-to-end: kickback → re-harvest re-readies review; passing verdict unblocks merge."""
+    from antfarm.core.models import ReviewVerdict
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-rr-e2e", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-rr-e2e", "a" * 40)
+    task = backend.get_task("task-rr-e2e")
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    # First review task created
+    assert soldier.create_review_task(task) == "review-task-rr-e2e"
+
+    # Reviewer picks up, parent then gets kicked back (simulating failed review)
+    backend.register_worker(
+        {
+            "worker_id": "reviewer-1",
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp/ws",
+            "status": "idle",
+            "capabilities": ["review"],
+        }
+    )
+    backend.pull("reviewer-1")
+    backend.kickback("task-rr-e2e", "review requested changes")
+
+    # Re-pull parent → new attempt, harvest again with a new SHA
+    backend.heartbeat("w-task-rr-e2e", {"status": "idle"})
+    backend.pull("w-task-rr-e2e")
+    pulled = backend.get_task("task-rr-e2e")
+    new_attempt_id = pulled["current_attempt"]
+    backend.mark_harvested(
+        "task-rr-e2e",
+        new_attempt_id,
+        pr="PR-task-rr-e2e-v2",
+        branch="feat/task-rr-e2e",
+    )
+    _set_attempt_artifact_sha(backend, "task-rr-e2e", "b" * 40)
+    task = backend.get_task("task-rr-e2e")
+
+    # Before fix: this would no-op and deadlock. Now it re-readies the review.
+    assert soldier.create_review_task(task) == "review-task-rr-e2e"
+    review = backend.get_task("review-task-rr-e2e")
+    assert review["status"] == "ready"
+    assert "b" * 40 in review["spec"]
+
+    # Simulate a passing verdict on the *new* parent attempt
+    task = backend.get_task("task-rr-e2e")
+    attempt_id = task["current_attempt"]
+    verdict = ReviewVerdict(
+        provider="human",
+        verdict="pass",
+        summary="LGTM",
+        reviewed_commit_sha="b" * 40,
+    )
+    backend.store_review_verdict("task-rr-e2e", attempt_id, verdict.to_dict())
+
+    # Merge queue should now include the task (require_review + passing + fresh)
+    soldier_req = Soldier.from_backend(
+        backend, repo_path=str(tmp_path), require_review=True
+    )
+    ids = [t["id"] for t in soldier_req.get_merge_queue()]
+    assert "task-rr-e2e" in ids
