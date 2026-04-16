@@ -239,6 +239,36 @@ class Soldier:
                 results.append((task_id, MergeResult.NEEDS_REVIEW))
                 continue
 
+            # Review task exists — if its embedded Attempt-SHA differs from
+            # the parent's current attempt SHA, the review is stale
+            # (parent was re-attempted after this review was created).
+            # Re-ready the review task instead of consuming its stale
+            # verdict against the new attempt.
+            existing_sha = self._extract_attempt_sha_from_spec(
+                review_task.get("spec", "")
+            )
+            current_sha = self._current_attempt_sha(task)
+            if existing_sha and current_sha and existing_sha != current_sha:
+                try:
+                    new_spec = self._build_review_spec(task)
+                    self.colony.rereview(
+                        review_task_id, new_spec, task.get("touches", [])
+                    )
+                    logger.info(
+                        "re-readied review task %s for new attempt "
+                        "(sha %s -> %s) from run_once_with_review",
+                        review_task_id,
+                        existing_sha[:12],
+                        current_sha[:12],
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to re-review %s from run_once_with_review",
+                        review_task_id,
+                    )
+                results.append((task_id, MergeResult.NEEDS_REVIEW))
+                continue
+
             # Review task exists — check its status.
             review_status = review_task.get("status", "")
             if review_status == "blocked":
@@ -786,7 +816,21 @@ class Soldier:
                 existing.get("spec", "")
             )
             current_sha = self._current_attempt_sha(task)
-            if existing_sha and current_sha and existing_sha == current_sha:
+            if not existing_sha:
+                # Legacy review task predates the Attempt-SHA marker.
+                # Don't bounce it — leave it to complete on its own terms.
+                return None
+            if not current_sha:
+                # Pathological: parent attempt has neither head_commit_sha
+                # nor branch. Can't safely decide — leave the review alone.
+                logger.warning(
+                    "skipping re-review for %s: parent task %s has no "
+                    "head_commit_sha and no attempt branch",
+                    review_task_id,
+                    task_id,
+                )
+                return None
+            if existing_sha == current_sha:
                 # Already in flight or verdicted for this attempt
                 return None
             # SHA mismatch (re-attempt) — re-ready the existing review task
@@ -795,8 +839,8 @@ class Soldier:
                 logger.info(
                     "re-readied review task %s for new attempt (sha %s -> %s)",
                     review_task_id,
-                    (existing_sha or "?")[:12],
-                    (current_sha or "?")[:12],
+                    existing_sha[:12],
+                    current_sha[:12],
                 )
                 return review_task_id
             except Exception:

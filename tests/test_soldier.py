@@ -1077,3 +1077,182 @@ def test_reattempt_end_to_end_flow(tmp_path):
     )
     ids = [t["id"] for t in soldier_req.get_merge_queue()]
     assert "task-rr-e2e" in ids
+
+
+def test_create_review_task_noops_on_legacy_review_without_marker(tmp_path):
+    """Legacy review task without Attempt-SHA marker → no-op, leave untouched."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-rr-legacy", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-rr-legacy", "a" * 40)
+    task = backend.get_task("task-rr-legacy")
+
+    # Hand-craft a legacy review task (no Attempt-SHA marker in spec)
+    import json
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    now = datetime.now(UTC).isoformat()
+    legacy_review = {
+        "id": "review-task-rr-legacy",
+        "title": "Review: task-rr-legacy",
+        "spec": (
+            "Review task task-rr-legacy: 'Task task-rr-legacy'\n\n"
+            "Branch: feat/task-rr-legacy\n"
+            "PR: PR-task-rr-legacy\n\n"
+            "Instructions:\n"
+            "1. Read the PR diff\n"
+        ),
+        "complexity": "S",
+        "priority": 1,
+        "depends_on": [],
+        "touches": [],
+        "capabilities_required": ["review"],
+        "mission_id": None,
+        "created_by": "soldier",
+        "status": "active",
+        "current_attempt": "att-legacy",
+        "attempts": [
+            {
+                "attempt_id": "att-legacy",
+                "worker_id": "reviewer-1",
+                "status": "active",
+                "branch": None,
+                "pr": None,
+                "started_at": now,
+                "completed_at": None,
+            }
+        ],
+        "trail": [],
+        "signals": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    active_path = (
+        Path(backend._root) / "tasks" / "active" / "review-task-rr-legacy.json"
+    )
+    active_path.write_text(json.dumps(legacy_review, indent=2))
+
+    review_before = backend.get_task("review-task-rr-legacy")
+    updated_at_before = review_before["updated_at"]
+    trail_len_before = len(review_before.get("trail", []))
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    result = soldier.create_review_task(task)
+    assert result is None
+
+    # Review task untouched — still in active/, same updated_at, same trail
+    review_after = backend.get_task("review-task-rr-legacy")
+    assert review_after["status"] == "active"
+    assert review_after["current_attempt"] == "att-legacy"
+    assert review_after["updated_at"] == updated_at_before
+    assert len(review_after.get("trail", [])) == trail_len_before
+    # Must still be in active/ folder (not bounced to ready/)
+    ready_path = (
+        Path(backend._root) / "tasks" / "ready" / "review-task-rr-legacy.json"
+    )
+    assert not ready_path.exists()
+    assert active_path.exists()
+
+
+def test_run_once_with_review_rereadies_on_sha_mismatch(tmp_path):
+    """run_once_with_review re-readies a stale done review instead of consuming its verdict."""
+    from antfarm.core.models import ReviewVerdict
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+
+    # 1. Parent task done with SHA 'a' (first attempt)
+    _make_done_task_with_mission(backend, "task-rr-roc", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-rr-roc", "a" * 40)
+    task = backend.get_task("task-rr-roc")
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    assert soldier.create_review_task(task) == "review-task-rr-roc"
+
+    # 2. Reviewer claims + finishes the review with a passing verdict for SHA 'a'
+    backend.register_worker(
+        {
+            "worker_id": "reviewer-1",
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp/ws",
+            "status": "idle",
+            "capabilities": ["review"],
+        }
+    )
+    backend.pull("reviewer-1")
+    review_task = backend.get_task("review-task-rr-roc")
+    review_attempt_id = review_task["current_attempt"]
+    pass_verdict_for_a = ReviewVerdict(
+        provider="human",
+        verdict="pass",
+        summary="LGTM for a",
+        reviewed_commit_sha="a" * 40,
+    ).to_dict()
+    # Harvest the review task with a passing verdict artifact
+    import json
+    from pathlib import Path
+
+    backend.mark_harvested(
+        "review-task-rr-roc",
+        review_attempt_id,
+        pr="review-pr",
+        branch="feat/review-task-rr-roc",
+    )
+    # Inject a review verdict artifact so extract_verdict_from_review_task finds it
+    review_done_path = (
+        Path(backend._root) / "tasks" / "done" / "review-task-rr-roc.json"
+    )
+    rdata = json.loads(review_done_path.read_text())
+    for a in rdata["attempts"]:
+        if a["attempt_id"] == review_attempt_id:
+            a["artifact"] = {
+                "task_id": "review-task-rr-roc",
+                "attempt_id": review_attempt_id,
+                "worker_id": "reviewer-1",
+                "branch": "feat/review-task-rr-roc",
+                "pr_url": None,
+                "base_commit_sha": "0" * 40,
+                "head_commit_sha": "a" * 40,
+                "target_branch": "main",
+                "target_branch_sha_at_harvest": "0" * 40,
+                "review_verdict": pass_verdict_for_a,
+            }
+            break
+    review_done_path.write_text(json.dumps(rdata, indent=2))
+
+    # 3. Parent task gets kicked back + re-attempted with a NEW SHA 'b'.
+    # The old review in done/ is now STALE (refers to SHA 'a').
+    backend.kickback("task-rr-roc", "need changes")
+    backend.heartbeat("w-task-rr-roc", {"status": "idle"})
+    backend.pull("w-task-rr-roc")
+    pulled = backend.get_task("task-rr-roc")
+    new_attempt_id = pulled["current_attempt"]
+    backend.mark_harvested(
+        "task-rr-roc",
+        new_attempt_id,
+        pr="PR-task-rr-roc-v2",
+        branch="feat/task-rr-roc",
+    )
+    _set_attempt_artifact_sha(backend, "task-rr-roc", "b" * 40)
+
+    # Sanity: the new parent attempt has NO stored review verdict yet.
+    parent_before = backend.get_task("task-rr-roc")
+    for a in parent_before["attempts"]:
+        if a["attempt_id"] == new_attempt_id:
+            assert a.get("review_verdict") is None
+
+    # 4. run_once_with_review should re-ready the stale review, NOT consume
+    # its old verdict against the new attempt.
+    results = soldier.run_once_with_review()
+    assert results == [("task-rr-roc", MergeResult.NEEDS_REVIEW)]
+
+    review_after = backend.get_task("review-task-rr-roc")
+    assert review_after["status"] == "ready"
+    assert review_after["current_attempt"] is None
+    assert "b" * 40 in review_after["spec"]
+
+    # Parent attempt still has no verdict (we didn't inherit the stale one)
+    parent_after = backend.get_task("task-rr-roc")
+    for a in parent_after["attempts"]:
+        if a["attempt_id"] == new_attempt_id:
+            assert a.get("review_verdict") is None
