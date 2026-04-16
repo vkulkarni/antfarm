@@ -49,6 +49,7 @@ class QueenConfig:
     active_interval: float = 10.0
     idle_interval: float = 60.0
     max_re_plans: int = 1
+    enable_mission_context: bool = False
 
 
 class Queen:
@@ -57,11 +58,17 @@ class Queen:
         backend: TaskBackend,
         config: QueenConfig | None = None,
         clock=time.time,
+        data_dir: str = ".antfarm",
+        repo_path: str = ".",
+        integration_branch: str = "main",
     ):
         self.backend = backend
         self.config = config or QueenConfig()
         self._clock = clock
         self._stopped = False
+        self._data_dir = data_dir
+        self._repo_path = repo_path
+        self._integration_branch = integration_branch
 
     # --- main loop ---
 
@@ -176,6 +183,7 @@ class Queen:
                 MissionStatus.BUILDING,
                 extras={"plan_artifact": artifact.to_dict()},
             )
+            self._maybe_generate_context(mission, artifact)
 
     def _advance_reviewing_plan(self, mission: dict) -> None:
         """Check plan-review task state and act accordingly.
@@ -225,6 +233,7 @@ class Queen:
             artifact = PlanArtifact.from_dict(mission["plan_artifact"])
             self._spawn_child_tasks(mission, artifact)
             self._transition(mission, MissionStatus.BUILDING)
+            self._maybe_generate_context(mission)
         elif verdict["verdict"] == "needs_changes":
             if mission["re_plan_count"] >= self.config.max_re_plans:
                 summary = verdict.get("summary", "no summary")
@@ -633,6 +642,46 @@ class Queen:
             files_changed=list(set(all_files)),
             generated_at=_now_iso(),
         )
+
+    # --- mission context ---
+
+    def _maybe_generate_context(
+        self, mission: dict, artifact: PlanArtifact | None = None
+    ) -> None:
+        """Generate and store mission context blob if feature-flagged on."""
+        if not self.config.enable_mission_context:
+            return
+        try:
+            from antfarm.core.mission_context import (
+                generate_mission_context,
+                store_mission_context,
+            )
+
+            plan_dict = None
+            if artifact is not None:
+                plan_dict = artifact.to_dict()
+            elif mission.get("plan_artifact"):
+                plan_dict = mission["plan_artifact"]
+
+            context = generate_mission_context(
+                repo_path=self._repo_path,
+                integration_branch=self._integration_branch,
+                mission=mission,
+                plan_artifact=plan_dict,
+            )
+            store_mission_context(
+                self._data_dir, mission["mission_id"], context
+            )
+            logger.info(
+                "queen: stored mission context for %s (%d bytes)",
+                mission["mission_id"],
+                len(context),
+            )
+        except Exception:
+            logger.exception(
+                "queen: failed to generate mission context for %s",
+                mission["mission_id"],
+            )
 
     # --- state transition helpers ---
 

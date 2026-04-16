@@ -273,6 +273,14 @@ class ColonyClient:
         r = self._client.post(f"/missions/{mission_id}/cancel")
         r.raise_for_status()
 
+    def get_mission_context(self, mission_id: str) -> str | None:
+        """Get mission context blob. Returns None on 404."""
+        r = self._client.get(f"/missions/{mission_id}/context")
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.text
+
     def get_mission_report(self, mission_id: str) -> dict | None:
         """Get mission report. Returns None on 404."""
         r = self._client.get(f"/missions/{mission_id}/report")

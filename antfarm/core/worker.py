@@ -233,6 +233,7 @@ class WorkerRuntime:
         self.heartbeat_interval = heartbeat_interval
         self.capabilities = capabilities or []
         self._token = token
+        self._data_dir = os.environ.get("ANTFARM_DATA_DIR", ".antfarm")
         self._last_task_id: str | None = None
         # Polling is tiered by worker role so short-lived roles exit promptly
         # while roles that wait on upstream tasks keep polling (#144).
@@ -771,6 +772,17 @@ class WorkerRuntime:
                 "3. Commit all changes with a descriptive message\n"
                 "4. Push the branch: git push -u origin {branch}\n"
             )
+            # Prepend mission context for builders (prompt cache sharing)
+            if task.get("mission_id"):
+                from antfarm.core.mission_context import get_mission_context
+
+                context = get_mission_context(
+                    mission_id=task["mission_id"],
+                    data_dir=getattr(self, "_data_dir", None),
+                    colony_client=self.colony,
+                )
+                if context:
+                    prompt = context + "\n\n---\n\n" + prompt
 
         agent_role = "planner" if is_plan else ("reviewer" if is_review else "worker")
         use_stdin = False

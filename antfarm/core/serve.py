@@ -854,6 +854,17 @@ def get_app(
         _backend.update_mission(mission_id, {"status": "cancelled"})
         return {"ok": True}
 
+    @app.get("/missions/{mission_id}/context")
+    def get_mission_context_endpoint(mission_id: str):
+        """Return mission context blob for prompt cache sharing. 404 if not found."""
+        context_path = os.path.join(data_dir, "missions", f"{mission_id}_context.md")
+        if not os.path.exists(context_path):
+            raise HTTPException(
+                status_code=404, detail=f"Context not found for mission '{mission_id}'"
+            )
+        with open(context_path) as f:
+            return Response(content=f.read(), media_type="text/markdown")
+
     @app.get("/missions/{mission_id}/report", status_code=200)
     def get_mission_report(mission_id: str):
         """Return mission report or 404 if not yet generated."""
