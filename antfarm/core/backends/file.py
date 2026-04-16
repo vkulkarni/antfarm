@@ -757,16 +757,41 @@ class FileBackend(TaskBackend):
     # ------------------------------------------------------------------
 
     def register_node(self, node: dict) -> None:
-        """Register a node. Idempotent — updates last_seen if already exists."""
+        """Register a node. Idempotent — updates last_seen and merges new fields."""
         with self._lock:
             node_id = node["node_id"]
             node_path = self._node_path(node_id)
             if node_path.exists():
                 existing = self._read_json(node_path)
-                existing["last_seen"] = node.get("last_seen", _now_iso())
+                for key, value in node.items():
+                    if key == "node_id":
+                        continue
+                    existing[key] = value
+                if "last_seen" not in node:
+                    existing["last_seen"] = _now_iso()
                 self._write_json(node_path, existing)
             else:
                 self._write_json(node_path, node)
+
+    def list_nodes(self) -> list[dict]:
+        """List all registered nodes."""
+        nodes_dir = self._root / "nodes"
+        if not nodes_dir.exists():
+            return []
+        result = []
+        for path in sorted(nodes_dir.glob("*.json")):
+            try:
+                result.append(self._read_json(path))
+            except (json.JSONDecodeError, OSError):
+                continue
+        return result
+
+    def get_node(self, node_id: str) -> dict | None:
+        """Get a single node by ID. Returns None if not found."""
+        node_path = self._node_path(node_id)
+        if not node_path.exists():
+            return None
+        return self._read_json(node_path)
 
     # ------------------------------------------------------------------
     # Workers

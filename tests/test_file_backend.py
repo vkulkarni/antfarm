@@ -994,3 +994,59 @@ def test_unblock_does_not_reset_attempt_counter(
         backend.get_task("task-1")["status"] == TaskStatus.BLOCKED.value
     )
 
+
+# ---------------------------------------------------------------------------
+# Node list/get tests
+# ---------------------------------------------------------------------------
+
+
+def test_register_node_with_runner_url(backend: FileBackend) -> None:
+    now = datetime.now(UTC).isoformat()
+    node = {
+        "node_id": "node-r1",
+        "joined_at": now,
+        "last_seen": now,
+        "runner_url": "http://localhost:7433",
+        "max_workers": 4,
+        "capabilities": ["claude-code", "codex"],
+    }
+    backend.register_node(node)
+    data = backend.get_node("node-r1")
+    assert data is not None
+    assert data["runner_url"] == "http://localhost:7433"
+    assert data["max_workers"] == 4
+    assert data["capabilities"] == ["claude-code", "codex"]
+
+    # Re-register with updated fields — should merge
+    later = datetime.now(UTC).isoformat()
+    node_updated = {
+        "node_id": "node-r1",
+        "last_seen": later,
+        "runner_url": "http://newhost:8000",
+        "max_workers": 8,
+    }
+    backend.register_node(node_updated)
+    data = backend.get_node("node-r1")
+    assert data["runner_url"] == "http://newhost:8000"
+    assert data["max_workers"] == 8
+    assert data["last_seen"] == later
+    # Original fields preserved
+    assert data["joined_at"] == now
+    assert data["capabilities"] == ["claude-code", "codex"]
+
+
+def test_list_nodes(backend: FileBackend) -> None:
+    now = datetime.now(UTC).isoformat()
+    backend.register_node({"node_id": "node-a", "joined_at": now, "last_seen": now})
+    backend.register_node({"node_id": "node-b", "joined_at": now, "last_seen": now})
+
+    nodes = backend.list_nodes()
+    assert len(nodes) == 2
+    node_ids = {n["node_id"] for n in nodes}
+    assert node_ids == {"node-a", "node-b"}
+
+
+def test_list_nodes_empty(backend: FileBackend) -> None:
+    nodes = backend.list_nodes()
+    assert nodes == []
+

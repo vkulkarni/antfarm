@@ -334,6 +334,27 @@ class TaskBackend(ABC):
         """
         ...
 
+    @abstractmethod
+    def list_nodes(self) -> list[dict]:
+        """List all registered nodes.
+
+        Returns:
+            List of node dicts.
+        """
+        ...
+
+    @abstractmethod
+    def get_node(self, node_id: str) -> dict | None:
+        """Get a single node by ID.
+
+        Args:
+            node_id: ID of the node.
+
+        Returns:
+            Node dict, or None if not found.
+        """
+        ...
+
     # --- Workers ---
 
     @abstractmethod
