@@ -1126,3 +1126,163 @@ def test_register_worker_boundary_at_guard_ttl_rejects(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="already registered and live"):
         backend.register_worker(_make_worker("worker-1"))
 
+
+# ---------------------------------------------------------------------------
+# Superseded-PR closing (issue #222)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingPROps:
+    """PROps stub that records every close_pr invocation."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    def close_pr(self, pr: str, comment: str | None = None) -> bool:
+        self.calls.append((pr, comment))
+        return True
+
+
+def _carry_pull_harvest(
+    backend: FileBackend,
+    task_id: str = "task-1",
+    pr: str = "https://gh/pr/99",
+) -> str:
+    backend.carry(_make_task(task_id))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested(task_id, attempt_id, pr=pr, branch=f"feat/{task_id}")
+    return attempt_id
+
+
+def test_kickback_closes_superseded_pr(tmp_path: Path) -> None:
+    fake = _RecordingPROps()
+    backend = FileBackend(root=tmp_path / ".antfarm", pr_ops=fake)
+    _carry_pull_harvest(backend, pr="https://gh/pr/99")
+
+    backend.kickback("task-1", reason="tests failed")
+
+    assert len(fake.calls) == 1
+    pr, comment = fake.calls[0]
+    assert pr == "https://gh/pr/99"
+    assert comment is not None
+    assert "tests failed" in comment
+
+
+def test_kickback_skips_close_when_no_pr(tmp_path: Path) -> None:
+    """If the current attempt has no pr field, close_pr must not be invoked."""
+    fake = _RecordingPROps()
+    backend = FileBackend(root=tmp_path / ".antfarm", pr_ops=fake)
+
+    # Build a done task whose attempt has no PR (simulates direct move).
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    # Harvest with pr="" — attempt.pr ends up empty.
+    backend.mark_harvested("task-1", attempt_id, pr="", branch="feat/task-1")
+
+    backend.kickback("task-1", reason="bad")
+
+    assert fake.calls == []
+
+
+def test_rereview_closes_superseded_pr(tmp_path: Path) -> None:
+    fake = _RecordingPROps()
+    backend = FileBackend(root=tmp_path / ".antfarm", pr_ops=fake)
+
+    # Build a review task with a current attempt bearing a PR.
+    _carry_pull_harvest(backend, task_id="review-task-1", pr="https://gh/pr/77")
+
+    backend.rereview("review-task-1", new_spec="spec2", touches=["a"])
+
+    assert len(fake.calls) == 1
+    pr, comment = fake.calls[0]
+    assert pr == "https://gh/pr/77"
+    assert comment is not None
+    assert "re-review" in comment.lower()
+
+
+def test_resume_task_closes_superseded_pr(tmp_path: Path) -> None:
+    fake = _RecordingPROps()
+    backend = FileBackend(root=tmp_path / ".antfarm", pr_ops=fake)
+
+    # Task with a live attempt holding a PR: carry -> pull -> pause -> resume.
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    # Attach a PR on the active attempt (simulate worker writing it on the file).
+    active_path = backend._active_path("task-1")
+    data = json.loads(active_path.read_text())
+    for a in data["attempts"]:
+        if a["attempt_id"] == attempt_id:
+            a["pr"] = "https://gh/pr/55"
+    active_path.write_text(json.dumps(data))
+
+    backend.pause_task("task-1")
+    backend.resume_task("task-1")
+
+    assert len(fake.calls) == 1
+    pr, comment = fake.calls[0]
+    assert pr == "https://gh/pr/55"
+    assert comment is not None
+    assert "resumed" in comment.lower()
+
+
+def test_reassign_task_closes_superseded_pr(tmp_path: Path) -> None:
+    fake = _RecordingPROps()
+    backend = FileBackend(root=tmp_path / ".antfarm", pr_ops=fake)
+
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    active_path = backend._active_path("task-1")
+    data = json.loads(active_path.read_text())
+    for a in data["attempts"]:
+        if a["attempt_id"] == attempt_id:
+            a["pr"] = "https://gh/pr/42"
+    active_path.write_text(json.dumps(data))
+
+    backend.reassign_task("task-1", worker_id="worker-2")
+
+    assert len(fake.calls) == 1
+    pr, comment = fake.calls[0]
+    assert pr == "https://gh/pr/42"
+    assert comment is not None
+    assert "reassigned" in comment.lower()
+
+
+def test_kickback_does_not_hold_lock_during_pr_close(tmp_path: Path) -> None:
+    """Regression: PR close must run AFTER releasing self._lock.
+
+    If kickback held the lock during close_pr, the PROps implementation could
+    not acquire the backend's lock from within close_pr without deadlocking.
+    """
+
+    class _LockProbingPROps:
+        """Tries to (re-)acquire the backend's lock from inside close_pr."""
+
+        def __init__(self) -> None:
+            self.backend: FileBackend | None = None
+            self.acquired: bool = False
+
+        def close_pr(self, pr: str, comment: str | None = None) -> bool:
+            assert self.backend is not None
+            # Non-blocking acquire — succeeds only if lock has been released.
+            self.acquired = self.backend._lock.acquire(blocking=False)
+            if self.acquired:
+                self.backend._lock.release()
+            return True
+
+    probe = _LockProbingPROps()
+    backend = FileBackend(root=tmp_path / ".antfarm", pr_ops=probe)
+    probe.backend = backend
+
+    _carry_pull_harvest(backend, pr="https://gh/pr/1")
+    backend.kickback("task-1", reason="tests failed")
+
+    assert probe.acquired, "kickback held self._lock during PR close (deadlock risk)"
+

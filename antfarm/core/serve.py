@@ -355,15 +355,8 @@ def get_app(
     """
     global _backend, _max_attempts
 
-    if backend is not None:
-        _backend = backend
-    else:
-        from antfarm.core.backends.file import FileBackend
-
-        _backend = FileBackend(root=data_dir)
-
-    # Load max_attempts default from config
-    repo_path = "."
+    # Load config up front so backend construction can see repo_path.
+    repo_path: str | None = None
     integration_branch = "main"
     config_path = os.path.join(data_dir, "config.json")
     if os.path.exists(config_path):
@@ -371,10 +364,23 @@ def get_app(
             with open(config_path) as f:
                 cfg = json.load(f)
             _max_attempts = cfg.get("max_attempts", 3)
-            repo_path = cfg.get("repo_path", repo_path)
+            repo_path = cfg.get("repo_path") or None
             integration_branch = cfg.get("integration_branch", integration_branch)
         except (json.JSONDecodeError, OSError):
             pass
+
+    if backend is not None:
+        _backend = backend
+    else:
+        from antfarm.core.backends.file import FileBackend
+        from antfarm.core.pr_ops import GhPROps, NullPROps
+
+        pr_ops = GhPROps(cwd=repo_path) if repo_path else NullPROps()
+        _backend = FileBackend(root=data_dir, pr_ops=pr_ops)
+
+    # Fallback so downstream uses (Queen, etc.) still see a repo_path string.
+    if repo_path is None:
+        repo_path = "."
 
     app = FastAPI(title="Antfarm Colony")
 
