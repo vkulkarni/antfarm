@@ -372,7 +372,21 @@ class TaskBackend(ABC):
 
     @abstractmethod
     def register_worker(self, worker: dict) -> None:
-        """Register a worker.
+        """Register a worker (stale-tolerant).
+
+        Contract:
+        - If no worker record with this ID exists, registration succeeds.
+        - If a record exists but the worker's last heartbeat is older than
+          the backend's stale TTL, the prior record is overwritten and
+          registration succeeds. This lets a name be reused after a
+          colony restart when the previous worker died without
+          deregistering.
+        - If a record exists and the heartbeat is fresh (within the stale
+          TTL), registration is rejected with ValueError. This prevents
+          two concurrent workers from claiming the same ID.
+
+        Implementations must perform the staleness check and the write
+        atomically (e.g., under a lock) to avoid a TOCTOU race.
 
         Args:
             worker: Worker dict with 'worker_id', 'node_id', etc.
