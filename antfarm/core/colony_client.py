@@ -29,8 +29,31 @@ class ColonyClient:
         )
         self._owns_client = client is None  # only close if we created it
 
-    def register_node(self, node_id: str) -> dict:
-        r = self._client.post("/nodes", json={"node_id": node_id})
+    def register_node(
+        self,
+        node_id: str,
+        runner_url: str | None = None,
+        max_workers: int | None = None,
+        capabilities: list[str] | None = None,
+    ) -> dict:
+        payload: dict = {"node_id": node_id}
+        if runner_url is not None:
+            payload["runner_url"] = runner_url
+        if max_workers is not None:
+            payload["max_workers"] = max_workers
+        if capabilities is not None:
+            payload["capabilities"] = capabilities
+        r = self._client.post("/nodes", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+    def list_nodes(self) -> list[dict]:
+        r = self._client.get("/nodes")
+        r.raise_for_status()
+        return r.json()
+
+    def get_node(self, node_id: str) -> dict:
+        r = self._client.get(f"/nodes/{node_id}")
         r.raise_for_status()
         return r.json()
 
