@@ -314,6 +314,7 @@ def test_ownership_loss_continues_gracefully(tc, runtime, backend):
 def test_codex_command_uses_approval_mode_full_auto(tmp_path, http_client):
     """Codex agent_type builds cmd with --approval-mode full-auto --quiet flags."""
     import subprocess
+    import threading
     from unittest.mock import patch
 
     rt = WorkerRuntime(
@@ -338,8 +339,14 @@ def test_codex_command_uses_approval_mode_full_auto(tmp_path, http_client):
 
     captured_cmd = []
 
+    # Filter by thread to avoid capturing calls from the Doctor daemon thread
+    # leaked by earlier colony-creating tests (it calls `git rev-parse` on a
+    # loop and lands in this patch since subprocess.run is patched globally).
+    main_thread = threading.current_thread()
+
     def fake_run(cmd, **kwargs):
-        captured_cmd.extend(cmd)
+        if threading.current_thread() is main_thread:
+            captured_cmd.extend(cmd)
         return MagicMock(returncode=0, stdout="done", stderr="")
 
     with patch.object(subprocess, "run", side_effect=fake_run):
@@ -360,6 +367,7 @@ def test_codex_command_uses_approval_mode_full_auto(tmp_path, http_client):
 def test_aider_command_includes_yes_and_no_auto_commits(tmp_path, http_client):
     """Aider agent_type builds cmd with --yes and --no-auto-commits flags."""
     import subprocess
+    import threading
     from unittest.mock import patch
 
     rt = WorkerRuntime(
@@ -383,9 +391,11 @@ def test_aider_command_includes_yes_and_no_auto_commits(tmp_path, http_client):
     }
 
     captured_cmd = []
+    main_thread = threading.current_thread()
 
     def fake_run(cmd, **kwargs):
-        captured_cmd.extend(cmd)
+        if threading.current_thread() is main_thread:
+            captured_cmd.extend(cmd)
         return MagicMock(returncode=0, stdout="done", stderr="")
 
     with patch.object(subprocess, "run", side_effect=fake_run):
@@ -1043,6 +1053,7 @@ def test_planner_invalid_json_in_tags(tc, tmp_path, http_client):
 def test_planner_prompt_includes_plan_instructions(tmp_path, http_client):
     """Plan task prompt includes PLANNER instructions and [PLAN_RESULT] example."""
     import subprocess
+    import threading
     from unittest.mock import patch
 
     rt = _make_planner_runtime(tmp_path, http_client)
@@ -1056,9 +1067,11 @@ def test_planner_prompt_includes_plan_instructions(tmp_path, http_client):
     }
 
     captured_cmd = []
+    main_thread = threading.current_thread()
 
     def fake_run(cmd, **kwargs):
-        captured_cmd.extend(cmd)
+        if threading.current_thread() is main_thread:
+            captured_cmd.extend(cmd)
         return MagicMock(returncode=0, stdout="done", stderr="")
 
     with patch.object(subprocess, "run", side_effect=fake_run):
