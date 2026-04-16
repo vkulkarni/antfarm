@@ -41,12 +41,8 @@ def _auth_headers(token: str | None) -> dict:
     return {}
 
 
-def _post(
-    colony_url: str, path: str, payload: dict, token: str | None = None
-) -> dict | None:
-    r = httpx.post(
-        f"{colony_url.rstrip('/')}{path}", json=payload, headers=_auth_headers(token)
-    )
+def _post(colony_url: str, path: str, payload: dict, token: str | None = None) -> dict | None:
+    r = httpx.post(f"{colony_url.rstrip('/')}{path}", json=payload, headers=_auth_headers(token))
     r.raise_for_status()
     if r.status_code == 204:
         return None
@@ -178,6 +174,18 @@ def version():
     envvar="ANTFARM_GITHUB_TOKEN",
     help="GitHub personal access token (for --backend=github).",
 )
+@click.option(
+    "--repo-path",
+    default=".",
+    show_default=True,
+    help="Path to the git repo. Used by Queen to generate mission context.",
+)
+@click.option(
+    "--integration-branch",
+    default="main",
+    show_default=True,
+    help="Integration branch used by Queen when generating mission context.",
+)
 def colony(
     port: int,
     host: str,
@@ -195,8 +203,12 @@ def colony(
     backend: str,
     github_repo: str | None,
     github_token: str | None,
+    repo_path: str,
+    integration_branch: str,
 ):
     """Start the colony server."""
+    import os
+
     import uvicorn
 
     from antfarm.core.backends import get_backend
@@ -212,6 +224,22 @@ def colony(
         click.echo(f"Using GitHub Issues backend: {github_repo}")
     else:
         task_backend = get_backend("file", root=data_dir)
+
+    # Persist repo_path and integration_branch into config.json so Queen (and
+    # other daemons that read config.json) can pick them up.
+    os.makedirs(data_dir, exist_ok=True)
+    _config_path = os.path.join(data_dir, "config.json")
+    _existing: dict = {}
+    if os.path.exists(_config_path):
+        try:
+            with open(_config_path) as _f:
+                _existing = json.load(_f)
+        except (json.JSONDecodeError, OSError):
+            _existing = {}
+    _existing["repo_path"] = repo_path
+    _existing["integration_branch"] = integration_branch
+    with open(_config_path, "w") as _f:
+        json.dump(_existing, _f, indent=2)
 
     autoscaler_cfg = None
     if autoscaler:
@@ -254,9 +282,7 @@ def colony(
 
             config = FailoverConfig(backup_dest=backup_dest, interval_seconds=backup_interval)
             start_failover_daemon(data_dir, config)
-            click.echo(
-                f"Failover enabled: backing up to {backup_dest} every {backup_interval}s"
-            )
+            click.echo(f"Failover enabled: backing up to {backup_dest} every {backup_interval}s")
 
     uvicorn.run(app, host=host, port=port)
 
@@ -379,7 +405,9 @@ def worker():
 @click.option("--node", required=True, help="Node ID this worker belongs to.")
 @click.option("--repo-path", default=".", show_default=True, help="Path to git repo.")
 @click.option("--integration-branch", default="main", show_default=True, help="Integration branch.")
-@click.option("--capabilities", default=None, help="Comma-separated worker capabilities (e.g. gpu,docker).")  # noqa: E501
+@click.option(
+    "--capabilities", default=None, help="Comma-separated worker capabilities (e.g. gpu,docker)."
+)  # noqa: E501
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def worker_start(
@@ -432,8 +460,12 @@ def worker_start(
 @click.option("--spec", default=None, help="Task specification.")
 @click.option("--depends-on", multiple=True, help="Task IDs this task depends on.")
 @click.option("--touches", default=None, help="Comma-separated scope tags (e.g. api,db).")
-@click.option("--capabilities", default=None, help="Comma-separated capabilities required (e.g. gpu,docker).")  # noqa: E501
-@click.option("--priority", type=int, default=10, show_default=True, help="Priority (lower=higher).")  # noqa: E501
+@click.option(
+    "--capabilities", default=None, help="Comma-separated capabilities required (e.g. gpu,docker)."
+)  # noqa: E501
+@click.option(
+    "--priority", type=int, default=10, show_default=True, help="Priority (lower=higher)."
+)  # noqa: E501
 @click.option(
     "--complexity",
     default="M",
@@ -443,12 +475,19 @@ def worker_start(
 )
 @click.option("--file", "file_path", default=None, help="JSON file with task payload.")
 @click.option("--id", "task_id", default=None, help="Task ID (auto-generated if omitted).")
-@click.option("--type", "task_type", default=None, type=click.Choice(["plan"]),
-              help="Task type: 'plan' for planner decomposition.")
-@click.option("--issue", "issue_number", default=None, type=int,
-              help="GitHub issue number to link.")
-@click.option("--mission", "mission_id", default=None,
-              help="Attach this task to an existing mission.")
+@click.option(
+    "--type",
+    "task_type",
+    default=None,
+    type=click.Choice(["plan"]),
+    help="Task type: 'plan' for planner decomposition.",
+)
+@click.option(
+    "--issue", "issue_number", default=None, type=int, help="GitHub issue number to link."
+)
+@click.option(
+    "--mission", "mission_id", default=None, help="Attach this task to an existing mission."
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def carry(
@@ -479,7 +518,9 @@ def carry(
             "spec": spec,
             "depends_on": list(depends_on),
             "touches": [t.strip() for t in touches.split(",")] if touches else [],
-            "capabilities_required": [c.strip() for c in capabilities.split(",")] if capabilities else [],  # noqa: E501
+            "capabilities_required": [c.strip() for c in capabilities.split(",")]
+            if capabilities
+            else [],  # noqa: E501
             "priority": priority,
             "complexity": complexity,
         }
@@ -638,7 +679,7 @@ def scent(task_id: str, poll_interval: float, colony_url: str, token: str | None
             r.raise_for_status()
             for line in r.iter_lines():
                 if line.startswith("data: "):
-                    raw = line[len("data: "):]
+                    raw = line[len("data: ") :]
                     try:
                         entry = json.loads(raw)
                         ts = entry.get("ts", "")
@@ -687,7 +728,9 @@ def doctor(fix: bool, data_dir: str):
 @click.option("--node", required=True, help="Node ID.")
 @click.option("--agent", required=True, help="Agent type.")
 @click.option("--workspace-root", default=None, help="Workspace root directory.")
-@click.option("--capabilities", default=None, help="Comma-separated worker capabilities (e.g. gpu,docker).")  # noqa: E501
+@click.option(
+    "--capabilities", default=None, help="Comma-separated worker capabilities (e.g. gpu,docker)."
+)  # noqa: E501
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def hatch(
@@ -704,13 +747,18 @@ def hatch(
     ws_root = workspace_root or f".antfarm/workspaces/{worker_name}"
     worker_id = f"{node}/{worker_name}"
     caps = [c.strip() for c in capabilities.split(",")] if capabilities else []
-    result = _post(colony_url, "/workers/register", {
-        "worker_id": worker_id,
-        "node_id": node,
-        "agent_type": agent,
-        "workspace_root": ws_root,
-        "capabilities": caps,
-    }, token=token)
+    result = _post(
+        colony_url,
+        "/workers/register",
+        {
+            "worker_id": worker_id,
+            "node_id": node,
+            "agent_type": agent,
+            "workspace_root": ws_root,
+            "capabilities": caps,
+        },
+        token=token,
+    )
     click.echo(f"Worker registered: {result}")
 
 
@@ -735,10 +783,15 @@ def forage(worker_id: str, colony_url: str, token: str | None):
 @TOKEN_OPTION
 def trail(task_id: str, message: str, worker_id: str, colony_url: str, token: str | None):
     """Append a trail entry to a task (low-level)."""
-    result = _post(colony_url, f"/tasks/{task_id}/trail", {
-        "worker_id": worker_id,
-        "message": message,
-    }, token=token)
+    result = _post(
+        colony_url,
+        f"/tasks/{task_id}/trail",
+        {
+            "worker_id": worker_id,
+            "message": message,
+        },
+        token=token,
+    )
     click.echo(f"Trail appended: {result}")
 
 
@@ -750,7 +803,11 @@ def trail(task_id: str, message: str, worker_id: str, colony_url: str, token: st
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def harvest(
-    task_id: str, pr: str, attempt: str | None, branch: str | None, colony_url: str,
+    task_id: str,
+    pr: str,
+    attempt: str | None,
+    branch: str | None,
+    colony_url: str,
     token: str | None,
 ):
     """Mark a task as harvested (completed) with a PR (low-level)."""
@@ -793,10 +850,15 @@ def release(resource: str, owner: str, colony_url: str, token: str | None):
 @TOKEN_OPTION
 def signal(task_id: str, message: str, worker_id: str, colony_url: str, token: str | None):
     """Send a signal message to a task (low-level)."""
-    result = _post(colony_url, f"/tasks/{task_id}/signal", {
-        "worker_id": worker_id,
-        "message": message,
-    }, token=token)
+    result = _post(
+        colony_url,
+        f"/tasks/{task_id}/signal",
+        {
+            "worker_id": worker_id,
+            "message": message,
+        },
+        token=token,
+    )
     click.echo(f"Signal sent: {result}")
 
 
@@ -1116,17 +1178,14 @@ def mission():
 
 
 @mission.command("create")
-@click.option("--spec", "spec_path", required=True, type=click.Path(exists=True),
-              help="Path to spec file.")
+@click.option(
+    "--spec", "spec_path", required=True, type=click.Path(exists=True), help="Path to spec file."
+)
 @click.option("--mission-id", default=None, help="Optional explicit mission id slug.")
-@click.option("--no-plan-review", is_flag=True, default=False,
-              help="Skip plan review step.")
-@click.option("--max-builders", type=int, default=None,
-              help="Max parallel builder workers.")
-@click.option("--max-attempts", type=int, default=None,
-              help="Max attempts per task.")
-@click.option("--integration-branch", default=None,
-              help="Integration branch for this mission.")
+@click.option("--no-plan-review", is_flag=True, default=False, help="Skip plan review step.")
+@click.option("--max-builders", type=int, default=None, help="Max parallel builder workers.")
+@click.option("--max-attempts", type=int, default=None, help="Max attempts per task.")
+@click.option("--integration-branch", default=None, help="Integration branch for this mission.")
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def mission_create(
@@ -1176,9 +1235,7 @@ def mission_status(mission_id: str, colony_url: str, token: str | None):
     config = data.get("config", {})
     completion_mode = config.get("completion_mode", "best_effort")
     if completion_mode == "all_or_nothing":
-        click.echo(
-            f"Completion: {completion_mode} (treated as best_effort in v0.6.0)"
-        )
+        click.echo(f"Completion: {completion_mode} (treated as best_effort in v0.6.0)")
     else:
         click.echo(f"Completion: {completion_mode}")
 
@@ -1194,8 +1251,14 @@ def mission_status(mission_id: str, colony_url: str, token: str | None):
 
 @mission.command("report")
 @click.argument("mission_id")
-@click.option("--format", "fmt", type=click.Choice(["terminal", "md", "json"]),
-              default="terminal", show_default=True, help="Output format.")
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["terminal", "md", "json"]),
+    default="terminal",
+    show_default=True,
+    help="Output format.",
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def mission_report(mission_id: str, fmt: str, colony_url: str, token: str | None):
@@ -1373,13 +1436,9 @@ def memory_recompute(data_dir: str):
 @click.option("--port", default=7434, type=int, show_default=True, help="Port to listen on.")
 @click.option("--max-workers", default=4, type=int, show_default=True, help="Max worker processes.")
 @click.option("--agent", default="claude-code", show_default=True, help="Agent type.")
-@click.option(
-    "--integration-branch", default="main", show_default=True, help="Integration branch."
-)
+@click.option("--integration-branch", default="main", show_default=True, help="Integration branch.")
 @click.option("--capabilities", default="", help="Comma-separated: gpu,docker")
-@click.option(
-    "--token", default=None, envvar="ANTFARM_TOKEN", help="Bearer token for colony auth."
-)
+@click.option("--token", default=None, envvar="ANTFARM_TOKEN", help="Bearer token for colony auth.")
 def runner(
     colony_url: str,
     repo_path: str,

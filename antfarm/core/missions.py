@@ -55,13 +55,10 @@ class MissionConfig:
 
     def __post_init__(self) -> None:
         if self.completion_mode not in VALID_COMPLETION_MODES:
-            raise ValueError(
-                f"completion_mode must be one of {VALID_COMPLETION_MODES}"
-            )
+            raise ValueError(f"completion_mode must be one of {VALID_COMPLETION_MODES}")
         if self.blocked_timeout_action not in VALID_BLOCKED_TIMEOUT_ACTIONS:
             raise ValueError(
-                f"blocked_timeout_action must be one of "
-                f"{VALID_BLOCKED_TIMEOUT_ACTIONS}"
+                f"blocked_timeout_action must be one of {VALID_BLOCKED_TIMEOUT_ACTIONS}"
             )
 
     def to_dict(self) -> dict:
@@ -293,6 +290,7 @@ class Mission:
     report: MissionReport | None
     last_progress_at: str
     re_plan_count: int = 0
+    mission_context_path: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -311,6 +309,7 @@ class Mission:
             "report": self.report.to_dict() if self.report else None,
             "last_progress_at": self.last_progress_at,
             "re_plan_count": self.re_plan_count,
+            "mission_context_path": self.mission_context_path,
         }
 
     @classmethod
@@ -322,9 +321,7 @@ class Mission:
             status=MissionStatus(data["status"]),
             plan_task_id=data.get("plan_task_id"),
             plan_artifact=(
-                PlanArtifact.from_dict(data["plan_artifact"])
-                if data.get("plan_artifact")
-                else None
+                PlanArtifact.from_dict(data["plan_artifact"]) if data.get("plan_artifact") else None
             ),
             task_ids=list(data.get("task_ids", [])),
             blocked_task_ids=list(data.get("blocked_task_ids", [])),
@@ -332,13 +329,10 @@ class Mission:
             created_at=data["created_at"],
             updated_at=data["updated_at"],
             completed_at=data.get("completed_at"),
-            report=(
-                MissionReport.from_dict(data["report"])
-                if data.get("report")
-                else None
-            ),
+            report=(MissionReport.from_dict(data["report"]) if data.get("report") else None),
             last_progress_at=data.get("last_progress_at", ""),
             re_plan_count=data.get("re_plan_count", 0),
+            mission_context_path=data.get("mission_context_path"),
         )
 
 
@@ -356,11 +350,7 @@ def is_infra_task(task: dict) -> bool:
     MUST use this function — do not reimplement the filter.
     """
     caps = task.get("capabilities_required", [])
-    return (
-        "plan" in caps
-        or "review" in caps
-        or task.get("id", "").startswith("review-")
-    )
+    return "plan" in caps or "review" in caps or task.get("id", "").startswith("review-")
 
 
 # ---------------------------------------------------------------------------
@@ -396,11 +386,13 @@ def link_task_to_mission(
         raise FileNotFoundError(f"mission '{mission_id}' not found")
     if mission["status"] in ("complete", "failed", "cancelled"):
         raise ValueError(
-            f"cannot add tasks to mission '{mission_id}' "
-            f"in terminal state '{mission['status']}'"
+            f"cannot add tasks to mission '{mission_id}' in terminal state '{mission['status']}'"
         )
     task_id = backend.carry(task_dict)
-    backend.update_mission(mission_id, {
-        "task_ids": mission["task_ids"] + [task_id],
-    })
+    backend.update_mission(
+        mission_id,
+        {
+            "task_ids": mission["task_ids"] + [task_id],
+        },
+    )
     return task_id
