@@ -1050,3 +1050,79 @@ def test_list_nodes_empty(backend: FileBackend) -> None:
     nodes = backend.list_nodes()
     assert nodes == []
 
+
+# ---------------------------------------------------------------------------
+# Stale-tolerant register_worker (issue #194)
+# ---------------------------------------------------------------------------
+
+
+def _iso_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _make_worker(worker_id: str = "worker-1") -> dict:
+    now = _iso_now()
+    return {
+        "worker_id": worker_id,
+        "node_id": "node-1",
+        "agent_type": "claude-code",
+        "workspace_root": "/tmp/ws",
+        "registered_at": now,
+        "last_heartbeat": now,
+    }
+
+
+def test_register_worker_rejects_fresh_duplicate(tmp_path: Path) -> None:
+    """Re-registering a worker with a fresh heartbeat raises ValueError."""
+    backend = FileBackend(root=tmp_path / ".antfarm", guard_ttl=5)
+    backend.register_worker(_make_worker("worker-1"))
+
+    with pytest.raises(ValueError, match="already registered and live"):
+        backend.register_worker(_make_worker("worker-1"))
+
+
+def test_register_worker_accepts_stale_duplicate(tmp_path: Path) -> None:
+    """Re-registering over a stale (mtime > guard_ttl) worker file succeeds and overwrites it."""
+    backend = FileBackend(root=tmp_path / ".antfarm", guard_ttl=5)
+    first = _make_worker("worker-1")
+    first["workspace_root"] = "/tmp/old"
+    backend.register_worker(first)
+
+    worker_path = backend._worker_path("worker-1")
+    old_time = time.time() - (backend._guard_ttl + 60)
+    os.utime(str(worker_path), (old_time, old_time))
+
+    new_worker = _make_worker("worker-1")
+    new_worker["workspace_root"] = "/tmp/new"
+    backend.register_worker(new_worker)
+
+    data = json.loads(worker_path.read_text())
+    assert data["workspace_root"] == "/tmp/new"
+
+
+def test_register_worker_new_id_succeeds(tmp_path: Path) -> None:
+    """Registering a never-seen worker_id writes the file."""
+    backend = FileBackend(root=tmp_path / ".antfarm", guard_ttl=5)
+    backend.register_worker(_make_worker("worker-new"))
+
+    assert backend._worker_path("worker-new").exists()
+
+
+def test_register_worker_boundary_at_guard_ttl_rejects(tmp_path: Path) -> None:
+    """Boundary direction: `age <= _guard_ttl` rejects.
+
+    We cannot set mtime to *exactly* guard_ttl ago (clock drift between utime() and
+    register_worker() pushes age > guard_ttl). Instead, we pick a large guard_ttl
+    and an age just inside the boundary — any age <= guard_ttl must reject.
+    """
+    backend = FileBackend(root=tmp_path / ".antfarm", guard_ttl=3600)
+    backend.register_worker(_make_worker("worker-1"))
+
+    worker_path = backend._worker_path("worker-1")
+    # Age = guard_ttl - 1s: well inside the rejection window, robust to drift.
+    inside_boundary = time.time() - (backend._guard_ttl - 1)
+    os.utime(str(worker_path), (inside_boundary, inside_boundary))
+
+    with pytest.raises(ValueError, match="already registered and live"):
+        backend.register_worker(_make_worker("worker-1"))
+
