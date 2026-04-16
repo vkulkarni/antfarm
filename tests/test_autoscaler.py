@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 from antfarm.core.autoscaler import Autoscaler, AutoscalerConfig, ManagedWorker
@@ -34,6 +35,7 @@ def _worker(
     status: str = "idle",
     capabilities: list[str] | None = None,
     cooldown_until: str | None = None,
+    last_heartbeat: str | None = None,
 ) -> dict:
     w: dict = {
         "worker_id": worker_id,
@@ -42,7 +44,14 @@ def _worker(
     }
     if cooldown_until is not None:
         w["cooldown_until"] = cooldown_until
+    if last_heartbeat is not None:
+        w["last_heartbeat"] = last_heartbeat
     return w
+
+
+def _aged_hb(seconds_ago: float = 60.0) -> str:
+    """Return an ISO-8601 UTC timestamp `seconds_ago` seconds in the past."""
+    return (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
 
 
 def _make_autoscaler(_pm=None, **kwargs) -> Autoscaler:
@@ -268,9 +277,10 @@ class TestReconciliation:
         assert stopped is False
         pm.stop.assert_not_called()
 
-        # Colony says this worker is idle -> should stop
+        # Colony says this worker is idle with an aged heartbeat -> should stop.
+        # last_heartbeat must be older than poll_interval (default 30s); use 60s ago.
         a.backend.list_workers.return_value = [
-            _worker("local/auto-builder-1", status="idle"),
+            _worker("local/auto-builder-1", status="idle", last_heartbeat=_aged_hb(60)),
         ]
         stopped = a._stop_idle_worker("builder")
         assert stopped is True
@@ -290,6 +300,76 @@ class TestReconciliation:
         assert "dead" not in a.managed
         assert "alive" in a.managed
         pm.cleanup.assert_called_once_with("dead")
+
+    def test_stop_idle_worker_respects_fresh_claim_grace(self):
+        """Worker with status=idle but fresh last_heartbeat must NOT be reaped.
+
+        This guards against the race where pull() claims a task but the
+        worker's colony-side status hasn't been flipped yet (heartbeat fires
+        ~30s later). The autoscaler's own 30s poll must not kill the worker
+        during that window.
+        """
+        pm = _mock_pm()
+        pm.is_alive.return_value = True
+
+        a = _make_autoscaler(_pm=pm, poll_interval=30.0)
+        a.managed["auto-builder-1"] = ManagedWorker(
+            name="auto-builder-1",
+            role="builder",
+            worker_id="local/auto-builder-1",
+        )
+
+        # last_heartbeat is "now" — worker just registered or just claimed a task
+        a.backend.list_workers.return_value = [
+            _worker("local/auto-builder-1", status="idle", last_heartbeat=_aged_hb(0)),
+        ]
+        stopped = a._stop_idle_worker("builder")
+        assert stopped is False
+        pm.stop.assert_not_called()
+
+    def test_stop_idle_worker_reaps_truly_idle_worker(self):
+        """Worker with status=idle AND heartbeat older than poll_interval IS reaped."""
+        pm = _mock_pm()
+        pm.is_alive.return_value = True
+
+        a = _make_autoscaler(_pm=pm, poll_interval=30.0)
+        a.managed["auto-builder-1"] = ManagedWorker(
+            name="auto-builder-1",
+            role="builder",
+            worker_id="local/auto-builder-1",
+        )
+
+        # last_heartbeat is poll_interval + 5s ago — clearly idle
+        a.backend.list_workers.return_value = [
+            _worker(
+                "local/auto-builder-1",
+                status="idle",
+                last_heartbeat=_aged_hb(30.0 + 5),
+            ),
+        ]
+        stopped = a._stop_idle_worker("builder")
+        assert stopped is True
+        pm.stop.assert_called_once_with("auto-builder-1")
+
+    def test_stop_idle_worker_skips_worker_missing_last_heartbeat(self):
+        """Worker dict missing last_heartbeat must NOT be reaped (fail-safe)."""
+        pm = _mock_pm()
+        pm.is_alive.return_value = True
+
+        a = _make_autoscaler(_pm=pm)
+        a.managed["auto-builder-1"] = ManagedWorker(
+            name="auto-builder-1",
+            role="builder",
+            worker_id="local/auto-builder-1",
+        )
+
+        # No last_heartbeat key at all
+        a.backend.list_workers.return_value = [
+            _worker("local/auto-builder-1", status="idle"),
+        ]
+        stopped = a._stop_idle_worker("builder")
+        assert stopped is False
+        pm.stop.assert_not_called()
 
     def test_run_once_is_idempotent_when_at_desired(self):
         pm = _mock_pm()
