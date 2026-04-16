@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+from antfarm.core.process_manager import parse_session_name
 
 
 @dataclass
@@ -56,6 +59,8 @@ def run_doctor(backend, config: dict, fix: bool = False) -> list[Finding]:
     findings.extend(check_state_consistency(backend))
     findings.extend(check_dependency_cycles(backend))
     findings.extend(check_runner_health(backend, config))
+    findings.extend(check_tmux_available(config))
+    findings.extend(check_orphan_tmux_sessions(config))
 
     return findings
 
@@ -889,5 +894,97 @@ def check_runner_health(backend, config: dict, fix: bool = False) -> list[Findin
                 ),
                 auto_fixable=False,
             ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 12: tmux availability
+# ---------------------------------------------------------------------------
+
+
+def check_tmux_available(config: dict) -> list[Finding]:
+    """Warn when tmux is not installed.
+
+    Without tmux, workers fall back to subprocess.Popen — no real TTY,
+    no restart adoption. This is a degraded mode; users should know.
+    """
+    if shutil.which("tmux"):
+        return []
+    return [Finding(
+        severity="warning",
+        check="tmux_available",
+        message=(
+            "tmux not installed — worker spawning will use subprocess fallback "
+            "(less reliable)"
+        ),
+        auto_fixable=False,
+    )]
+
+
+# ---------------------------------------------------------------------------
+# Check 13: Orphan tmux sessions
+# ---------------------------------------------------------------------------
+
+_ANTFARM_TMUX_PREFIXES = ("auto-", "runner-")
+
+
+def check_orphan_tmux_sessions(config: dict) -> list[Finding]:
+    """Report tmux sessions with antfarm prefix that have no matching metadata.
+
+    A tmux session named "auto-builder-3" or "runner-planner-1" that has no
+    corresponding `{state_dir}/processes/{name}.json` file is an orphan —
+    typically the result of a crash that left the session but lost metadata,
+    or a metadata file that was removed while the session survived. Either
+    way, the autoscaler/runner will not adopt these on restart, so they'll
+    linger until killed manually.
+    """
+    if not shutil.which("tmux"):
+        return []
+
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    # No tmux server running is not an error — just no sessions to check
+    if result.returncode != 0:
+        return []
+
+    data_dir = config.get("data_dir", ".antfarm")
+    processes_dir = os.path.join(data_dir, "processes")
+
+    findings: list[Finding] = []
+    for session_name in result.stdout.splitlines():
+        session_name = session_name.strip()
+        if not session_name:
+            continue
+
+        # Is this session one of ours?
+        matched_prefix = None
+        for prefix in _ANTFARM_TMUX_PREFIXES:
+            if parse_session_name(session_name, prefix) is not None:
+                matched_prefix = prefix
+                break
+        if matched_prefix is None:
+            continue
+
+        metadata_path = os.path.join(processes_dir, f"{session_name}.json")
+        if os.path.isfile(metadata_path):
+            continue
+
+        findings.append(Finding(
+            severity="warning",
+            check="orphan_tmux_session",
+            message=(
+                f"orphan tmux session: {session_name} "
+                f"(no matching metadata in {processes_dir})"
+            ),
+            auto_fixable=False,
+        ))
 
     return findings
