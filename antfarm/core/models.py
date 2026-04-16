@@ -528,12 +528,18 @@ class Node:
     node_id: str
     joined_at: str
     last_seen: str
+    runner_url: str | None = None
+    max_workers: int = 4
+    capabilities: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
             "node_id": self.node_id,
             "joined_at": self.joined_at,
             "last_seen": self.last_seen,
+            "runner_url": self.runner_url,
+            "max_workers": self.max_workers,
+            "capabilities": list(self.capabilities),
         }
 
     @classmethod
@@ -542,4 +548,7 @@ class Node:
             node_id=data["node_id"],
             joined_at=data["joined_at"],
             last_seen=data["last_seen"],
+            runner_url=data.get("runner_url"),
+            max_workers=data.get("max_workers", 4),
+            capabilities=list(data.get("capabilities", [])),
         )
