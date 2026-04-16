@@ -55,6 +55,7 @@ def run_doctor(backend, config: dict, fix: bool = False) -> list[Finding]:
     findings.extend(check_orphan_workspaces(config, fix))
     findings.extend(check_state_consistency(backend))
     findings.extend(check_dependency_cycles(backend))
+    findings.extend(check_runner_health(backend, config))
 
     return findings
 
@@ -825,5 +826,68 @@ def check_dependency_cycles(backend) -> list[Finding]:
     for tid in task_ids:
         if color[tid] == WHITE:
             dfs(tid, [])
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 11: Runner health
+# ---------------------------------------------------------------------------
+
+def check_runner_health(backend, config: dict, fix: bool = False) -> list[Finding]:
+    """Check reachability of all nodes with runner_url.
+
+    For each node with a runner_url, GET {runner_url}/health with 3s timeout.
+    Report unreachable runners as warnings.
+
+    Args:
+        backend: TaskBackend instance.
+        config: Doctor config dict.
+        fix: Unused (runner health is not auto-fixable).
+
+    Returns:
+        List of findings.
+    """
+    findings: list[Finding] = []
+
+    if not hasattr(backend, "list_nodes"):
+        return findings
+
+    try:
+        nodes = backend.list_nodes()
+    except Exception:
+        return findings
+
+    for node in nodes:
+        runner_url = node.get("runner_url")
+        if not runner_url:
+            continue
+
+        node_id = node.get("node_id", "unknown")
+        try:
+            import urllib.request
+
+            url = runner_url.rstrip("/") + "/health"
+            with urllib.request.urlopen(url, timeout=3) as resp:  # noqa: S310
+                if resp.status == 200:
+                    continue
+                findings.append(Finding(
+                    severity="warning",
+                    check="runner_health",
+                    message=(
+                        f"Runner on node '{node_id}' returned HTTP {resp.status} "
+                        f"from {url}"
+                    ),
+                    auto_fixable=False,
+                ))
+        except Exception as exc:
+            findings.append(Finding(
+                severity="warning",
+                check="runner_health",
+                message=(
+                    f"Runner on node '{node_id}' unreachable at {runner_url}: {exc}"
+                ),
+                auto_fixable=False,
+            ))
 
     return findings

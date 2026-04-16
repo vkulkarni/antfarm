@@ -516,3 +516,57 @@ def test_worktree_is_clean_nonexistent_returns_false():
     from antfarm.core.doctor import _worktree_is_clean
 
     assert _worktree_is_clean("/nonexistent/path") is False
+
+
+# ---------------------------------------------------------------------------
+# 16. test_doctor_runner_unreachable
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_runner_unreachable(setup):
+    """Runner health check reports unreachable runners."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_runner_health
+
+    backend = MagicMock()
+    backend.list_nodes.return_value = [
+        {"node_id": "node-1", "runner_url": "http://unreachable-host:7434"},
+    ]
+
+    # Mock urllib to raise connection error
+    with patch("urllib.request.urlopen", side_effect=OSError("Connection refused")):
+        findings = check_runner_health(backend, {})
+
+    assert len(findings) == 1
+    assert findings[0].check == "runner_health"
+    assert findings[0].severity == "warning"
+    assert "node-1" in findings[0].message
+    assert "unreachable" in findings[0].message.lower()
+
+
+# ---------------------------------------------------------------------------
+# 17. test_doctor_runner_reachable
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_runner_reachable(setup):
+    """Runner health check reports nothing when runners are reachable."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_runner_health
+
+    backend = MagicMock()
+    backend.list_nodes.return_value = [
+        {"node_id": "node-1", "runner_url": "http://healthy-host:7434"},
+    ]
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+    mock_resp.__exit__ = MagicMock(return_value=False)
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        findings = check_runner_health(backend, {})
+
+    assert len(findings) == 0

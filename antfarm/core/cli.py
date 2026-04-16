@@ -154,6 +154,12 @@ def version():
     help="Maximum parallel reviewer workers (pass-through to AutoscalerConfig).",
 )
 @click.option(
+    "--multi-node",
+    is_flag=True,
+    default=False,
+    help="Enable multi-node autoscaler (requires --autoscaler and remote Runners).",
+)
+@click.option(
     "--backend",
     default="file",
     show_default=True,
@@ -185,6 +191,7 @@ def colony(
     autoscaler: bool,
     max_builders: int | None,
     max_reviewers: int | None,
+    multi_node: bool,
     backend: str,
     github_repo: str | None,
     github_token: str | None,
@@ -218,6 +225,9 @@ def colony(
             autoscaler_cfg.max_reviewers = max_reviewers
         if auth_token:
             autoscaler_cfg.token = auth_token
+
+    if multi_node and autoscaler:
+        click.echo("Multi-node autoscaler mode enabled (requires remote Runners on each node).")
 
     app = get_app(
         task_backend,
@@ -1336,6 +1346,75 @@ def memory_recompute(data_dir: str):
     hotspots = store.recompute_hotspots()
     patterns = store.recompute_failure_patterns()
     click.echo(f"Recomputed: {len(hotspots)} hotspots, {len(patterns)} failure patterns.")
+
+
+# ---------------------------------------------------------------------------
+# runner
+# ---------------------------------------------------------------------------
+
+
+@main.command()
+@click.option("--colony-url", required=True, help="Colony server URL.")
+@click.option("--repo-path", required=True, help="Path to git repository.")
+@click.option("--workspace-root", default=None, help="Root directory for worktrees.")
+@click.option("--node", default=None, help="Node ID (default: hostname).")
+@click.option(
+    "--host",
+    default="127.0.0.1",
+    show_default=True,
+    help="Bind address. Default: loopback only. WARNING: no auth.",
+)
+@click.option("--port", default=7434, type=int, show_default=True, help="Port to listen on.")
+@click.option("--max-workers", default=4, type=int, show_default=True, help="Max worker processes.")
+@click.option("--agent", default="claude-code", show_default=True, help="Agent type.")
+@click.option(
+    "--integration-branch", default="main", show_default=True, help="Integration branch."
+)
+@click.option("--capabilities", default="", help="Comma-separated: gpu,docker")
+@click.option(
+    "--token", default=None, envvar="ANTFARM_TOKEN", help="Bearer token for colony auth."
+)
+def runner(
+    colony_url: str,
+    repo_path: str,
+    workspace_root: str | None,
+    node: str | None,
+    host: str,
+    port: int,
+    max_workers: int,
+    agent: str,
+    integration_branch: str,
+    capabilities: str,
+    token: str | None,
+):
+    """Start a Runner daemon on this machine.
+
+    The Runner API has no authentication. Bind to loopback (default) or a
+    private LAN address only. Do not expose to untrusted networks.
+    """
+    import os
+    import socket
+
+    from antfarm.core.runner import Runner
+
+    node_id = node or socket.gethostname()
+    caps = [c.strip() for c in capabilities.split(",") if c.strip()] if capabilities else []
+    ws_root = workspace_root or os.path.join(repo_path, ".antfarm", "workspaces")
+
+    r = Runner(
+        node_id=node_id,
+        colony_url=colony_url,
+        repo_path=repo_path,
+        workspace_root=ws_root,
+        integration_branch=integration_branch,
+        max_workers=max_workers,
+        capabilities=caps,
+        host=host,
+        port=port,
+        agent_type=agent,
+        token=token,
+    )
+    r.run()
 
 
 if __name__ == "__main__":

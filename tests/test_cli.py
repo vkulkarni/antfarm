@@ -592,6 +592,62 @@ def test_worker_start_explicit_name_overrides():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# runner
+# ---------------------------------------------------------------------------
+
+
+def test_cli_runner_help():
+    """runner --help works and shows expected options."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["runner", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "--colony-url" in result.output
+    assert "--repo-path" in result.output
+    assert "--max-workers" in result.output
+    assert "--capabilities" in result.output
+    assert "--integration-branch" in result.output
+    assert "--host" in result.output
+    assert "--port" in result.output
+
+
+# ---------------------------------------------------------------------------
+# colony --multi-node
+# ---------------------------------------------------------------------------
+
+
+def test_cli_colony_multi_node_flag():
+    """--multi-node flag is accepted by the colony command."""
+    runner = CliRunner()
+
+    with (
+        patch("uvicorn.run") as mock_uvicorn_run,
+        patch("antfarm.core.backends.file.FileBackend"),
+        patch("antfarm.core.serve.get_app") as mock_get_app,
+    ):
+        mock_get_app.return_value = MagicMock()
+
+        result = runner.invoke(
+            main,
+            [
+                "colony",
+                "--autoscaler",
+                "--multi-node",
+                "--port", "9001",
+                "--host", "127.0.0.1",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Multi-node autoscaler mode enabled" in result.output
+        mock_uvicorn_run.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# plan --carry dependency resolution (#93)
+# ---------------------------------------------------------------------------
+
+
 def test_plan_carry_resolves_index_deps():
     """plan --carry resolves 1-based index deps to generated task IDs."""
     runner = CliRunner()
