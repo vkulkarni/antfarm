@@ -29,10 +29,23 @@ Autoscaler                    Runner
     │                    │
 TmuxProcessManager  SubprocessProcessManager
 (real TTY, attach,   (existing Popen behavior,
- survive restarts)    fallback only)
+ survive restarts,    fallback only — NO restart
+ full adoption)       adoption)
 ```
 
 **Key principle:** Autoscaler and runner never know which implementation they're using. They call `self._pm.start(name, cmd, log_path)` and that's it.
+
+**Asymmetry between implementations (be honest, not symmetric):**
+
+| Capability | TmuxProcessManager | SubprocessProcessManager |
+|---|---|---|
+| Real TTY | Yes | No |
+| Restart adoption | Yes — discovers tmux sessions | **No** — in-memory dict lost on restart |
+| Debug attach | `tmux attach -t name` | Not possible |
+| Process survival | Workers outlive colony | Workers die with colony |
+| Metadata persistence | Metadata files + tmux sessions | Metadata files only (best-effort) |
+
+SubprocessProcessManager is explicitly a **degraded fallback** that preserves current v0.6.1 behavior. It does not provide restart adoption. This is documented, not hidden.
 
 ---
 
@@ -98,22 +111,96 @@ def parse_session_name(name: str) -> tuple[str, str, int] | None:
 
 
 @dataclass
-class ManagedProcess:
-    """A worker process managed by the ProcessManager."""
+class ProcessMetadata:
+    """Persistent metadata about a managed worker process.
+
+    Replaces raw PID files. Stored as JSON at {state_dir}/processes/{name}.json.
+    Supports both tmux and subprocess backends — adoption reads manager_type
+    to know how to validate liveness.
+    """
     name: str
     role: str
-    alive: bool
+    manager_type: str  # "tmux" | "subprocess"
+    pid: int | None = None  # subprocess only
+    session_name: str | None = None  # tmux only
+    started_at: str | None = None
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in {
+            "name": self.name, "role": self.role,
+            "manager_type": self.manager_type,
+            "pid": self.pid, "session_name": self.session_name,
+            "started_at": self.started_at,
+        }.items() if v is not None}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ProcessMetadata:
+        return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
 
 
 class ProcessManager(ABC):
-    """Interface for worker process lifecycle management."""
+    """Interface for worker process lifecycle management.
 
-    def __init__(self, prefix: str = "auto-"):
+    Each implementation persists ProcessMetadata files so that adoption
+    works correctly on restart regardless of backend type.
+    """
+
+    def __init__(self, prefix: str = "auto-", state_dir: str | None = None):
         self.prefix = prefix
+        self.state_dir = state_dir  # where to write metadata files
+
+    def _metadata_path(self, name: str) -> str | None:
+        if not self.state_dir:
+            return None
+        return os.path.join(self.state_dir, "processes", f"{name}.json")
+
+    def _write_metadata(self, meta: ProcessMetadata) -> None:
+        path = self._metadata_path(meta.name)
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        import json
+        with open(path, "w") as f:
+            json.dump(meta.to_dict(), f, indent=2)
+
+    def _read_metadata(self, name: str) -> ProcessMetadata | None:
+        path = self._metadata_path(name)
+        if not path or not os.path.exists(path):
+            return None
+        import json
+        try:
+            with open(path) as f:
+                return ProcessMetadata.from_dict(json.load(f))
+        except (json.JSONDecodeError, OSError, KeyError):
+            return None
+
+    def _remove_metadata(self, name: str) -> None:
+        path = self._metadata_path(name)
+        if path and os.path.exists(path):
+            os.unlink(path)
+
+    def _list_metadata(self) -> list[ProcessMetadata]:
+        if not self.state_dir:
+            return []
+        meta_dir = os.path.join(self.state_dir, "processes")
+        if not os.path.isdir(meta_dir):
+            return []
+        import json
+        results = []
+        for fname in os.listdir(meta_dir):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(meta_dir, fname)) as f:
+                    results.append(ProcessMetadata.from_dict(json.load(f)))
+            except (json.JSONDecodeError, OSError, KeyError):
+                continue
+        return results
 
     @abstractmethod
-    def start(self, name: str, cmd: list[str], log_path: str | None = None) -> bool:
-        """Start a worker process. Returns True on success."""
+    def start(self, name: str, cmd: list[str], log_path: str | None = None,
+              role: str = "") -> bool:
+        """Start a worker process. Writes ProcessMetadata. Returns True on success."""
         ...
 
     @abstractmethod
@@ -134,39 +221,91 @@ class ProcessManager(ABC):
     def adopt_existing(self) -> dict[str, str]:
         """Discover and return existing processes from a previous run.
 
+        Uses TWO sources for discovery:
+        1. Metadata files in {state_dir}/processes/ — portable across backends
+        2. Live session scan (tmux only) — catches sessions without metadata
+
+        For each candidate, validates liveness:
+        - tmux metadata → tmux has-session
+        - subprocess metadata → os.kill(pid, 0)
+
         Returns: {name: role} for each adopted process.
         """
         adopted = {}
+        seen = set()
+
+        # 1. Metadata file adoption (works for both backends)
+        for meta in self._list_metadata():
+            if not meta.name.startswith(self.prefix):
+                continue
+            seen.add(meta.name)
+            if self._validate_from_metadata(meta):
+                adopted[meta.name] = meta.role
+            else:
+                self._remove_metadata(meta.name)  # stale
+
+        # 2. Live session scan (tmux only — catches sessions without metadata)
         for name in self.list_managed():
+            if name in seen:
+                continue
             if not self.is_alive(name):
                 self.cleanup(name)
                 continue
             parsed = parse_session_name(name)
             if parsed and parsed[0] == self.prefix:
-                adopted[name] = parsed[1]  # role
+                adopted[name] = parsed[1]
+                # Write metadata retroactively so next adoption finds it
+                self._write_metadata(ProcessMetadata(
+                    name=name, role=parsed[1], manager_type=self._manager_type(),
+                    session_name=name if self._manager_type() == "tmux" else None,
+                ))
         return adopted
+
+    def _validate_from_metadata(self, meta: ProcessMetadata) -> bool:
+        """Check if a process described by metadata is still alive."""
+        if meta.manager_type == "tmux":
+            return self.is_alive(meta.session_name or meta.name)
+        elif meta.manager_type == "subprocess" and meta.pid:
+            try:
+                os.kill(meta.pid, 0)
+                return True
+            except OSError:
+                return False
+        return False
+
+    @abstractmethod
+    def _manager_type(self) -> str:
+        """Return 'tmux' or 'subprocess'."""
+        ...
 
     def max_counter(self) -> int:
         """Return the highest counter value among managed processes.
 
-        Used to set _counter on startup to avoid name collisions.
+        Checks both live sessions and metadata files.
         """
         max_n = 0
-        for name in self.list_managed():
+        all_names = set(self.list_managed())
+        for meta in self._list_metadata():
+            all_names.add(meta.name)
+        for name in all_names:
             parsed = parse_session_name(name)
             if parsed:
                 max_n = max(max_n, parsed[2])
         return max_n
 
     def cleanup(self, name: str) -> None:
-        """Clean up a dead process (remove PID files, stale state)."""
-        pass  # default no-op, implementations override if needed
+        """Clean up a dead process (remove metadata files)."""
+        self._remove_metadata(name)
 
 
 class TmuxProcessManager(ProcessManager):
     """Spawns workers as tmux sessions — real TTY, attach/debug, survive restarts."""
 
-    def start(self, name: str, cmd: list[str], log_path: str | None = None) -> bool:
+    def _manager_type(self) -> str:
+        return "tmux"
+
+    def start(self, name: str, cmd: list[str], log_path: str | None = None,
+              role: str = "") -> bool:
         tmux = shutil.which("tmux")
         if not tmux:
             return False
@@ -184,6 +323,14 @@ class TmuxProcessManager(ProcessManager):
         if result.returncode != 0:
             logger.warning("tmux start failed for %s: %s", name, result.stderr.strip())
             return False
+
+        # Persist metadata for adoption on restart
+        from datetime import UTC, datetime
+        self._write_metadata(ProcessMetadata(
+            name=name, role=role, manager_type="tmux",
+            session_name=name, started_at=datetime.now(UTC).isoformat(),
+        ))
+
         logger.info("started tmux session: %s", name)
         return True
 
@@ -220,14 +367,23 @@ class TmuxProcessManager(ProcessManager):
 
 
 class SubprocessProcessManager(ProcessManager):
-    """Spawns workers via subprocess.Popen — fallback when tmux unavailable."""
+    """Spawns workers via subprocess.Popen — fallback when tmux unavailable.
 
-    def __init__(self, prefix: str = "auto-"):
-        super().__init__(prefix)
+    IMPORTANT: This is a degraded fallback. It does NOT support restart
+    adoption — the in-memory _processes dict is lost on restart. Workers
+    die with the colony process. Use TmuxProcessManager for production.
+    """
+
+    def __init__(self, prefix: str = "auto-", state_dir: str | None = None):
+        super().__init__(prefix, state_dir)
         self._processes: dict[str, subprocess.Popen] = {}
         self._log_files: dict[str, object] = {}
 
-    def start(self, name: str, cmd: list[str], log_path: str | None = None) -> bool:
+    def _manager_type(self) -> str:
+        return "subprocess"
+
+    def start(self, name: str, cmd: list[str], log_path: str | None = None,
+              role: str = "") -> bool:
         if log_path:
             log_file = open(log_path, "a")  # noqa: SIM115
             self._log_files[name] = log_file
@@ -235,6 +391,15 @@ class SubprocessProcessManager(ProcessManager):
             log_file = subprocess.DEVNULL
         process = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
         self._processes[name] = process
+
+        # Persist metadata — allows _validate_from_metadata on restart
+        # (best-effort: subprocess adoption checks PID liveness)
+        from datetime import UTC, datetime
+        self._write_metadata(ProcessMetadata(
+            name=name, role=role, manager_type="subprocess",
+            pid=process.pid, started_at=datetime.now(UTC).isoformat(),
+        ))
+
         logger.info("started subprocess: %s pid=%d", name, process.pid)
         return True
 
@@ -315,17 +480,21 @@ class Autoscaler:
             self._counter = max_n
 
     def _start_worker(self, role: str) -> None:
-        self._counter += 1
-        name = f"auto-{role}-{self._counter}"
-        worker_id = f"{self.config.node_id}/{name}"
-        cmd = [...]  # same command list as today
-        log_path = os.path.join(self.config.data_dir, "logs", f"autoscaler-{name}.log")
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        # Retry once on name collision (stale session, counter lag, etc.)
+        for attempt in range(2):
+            self._counter += 1
+            name = f"auto-{role}-{self._counter}"
+            worker_id = f"{self.config.node_id}/{name}"
+            cmd = [...]  # same command list as today
+            log_path = os.path.join(self.config.data_dir, "logs", f"autoscaler-{name}.log")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
-        if self._pm.start(name, cmd, log_path):
-            self.managed[name] = ManagedWorker(name=name, role=role, worker_id=worker_id)
-        else:
-            logger.warning("failed to start worker %s — skipping", name)
+            if self._pm.start(name, cmd, log_path, role=role):
+                self.managed[name] = ManagedWorker(name=name, role=role, worker_id=worker_id)
+                return
+            if attempt == 0:
+                logger.info("start failed for %s, retrying with bumped counter", name)
+        logger.warning("failed to start worker after retry — skipping")
 
     def _stop_idle_worker(self, role: str) -> bool:
         ...
@@ -358,43 +527,55 @@ class Autoscaler:
 
 ### 3. Modify: `antfarm/core/runner.py`
 
-Same simplification. Runner's `ManagedWorker` drops tmux/process fields:
+Runner's `ManagedWorker` simplifies — lifecycle delegated to ProcessManager:
 
 ```python
 @dataclass
 class ManagedWorker:
     name: str
     role: str
-    pid: int  # kept for PID file compat, but lifecycle via ProcessManager
+    pid: int = 0  # informational only — ProcessManager owns lifecycle
 ```
 
-Runner uses `get_process_manager(prefix="runner-")`. Adoption combines PID files (existing) with ProcessManager adoption.
+Runner uses `get_process_manager(prefix="runner-", state_dir=self.state_dir)`. ProcessMetadata files replace raw PID files. The old `_write_pid_file` / `_read_pid_file` / `_adopt_existing_workers` PID-file logic is replaced by ProcessManager's metadata-based adoption.
 
 ```python
 class Runner:
     def __init__(self, ...):
         ...
-        self._pm = get_process_manager(prefix="runner-")
+        self._pm = get_process_manager(prefix="runner-", state_dir=self.state_dir)
 
     def _start_worker(self, role: str) -> None:
-        self._counter += 1
-        name = f"runner-{role}-{self._counter}"
-        cmd = [...]
-        log_path = os.path.join(self.state_dir, "logs", f"{name}.log")
-        if self._pm.start(name, cmd, log_path):
-            pid = 0  # tmux doesn't give us a direct PID, that's fine
-            self.managed[name] = ManagedWorker(name=name, role=role, pid=pid)
-            self._write_pid_file(name, pid)
+        # Same retry-on-collision pattern as autoscaler
+        for attempt in range(2):
+            self._counter += 1
+            name = f"runner-{role}-{self._counter}"
+            cmd = [...]
+            log_path = os.path.join(self.state_dir, "logs", f"{name}.log")
+            if self._pm.start(name, cmd, log_path, role=role):
+                self.managed[name] = ManagedWorker(name=name, role=role)
+                return
+            if attempt == 0:
+                logger.info("start failed for %s, retrying with bumped counter", name)
+        logger.warning("failed to start runner worker after retry — skipping")
 
     def _adopt_existing_workers(self) -> None:
-        # 1. PID file adoption (existing, unchanged)
-        ...
-        # 2. ProcessManager adoption (new)
+        """Unified adoption via ProcessManager metadata.
+
+        Replaces the old PID-file-only adoption. ProcessMetadata files
+        store manager_type so adoption validates correctly for both
+        tmux (has-session) and subprocess (os.kill PID check) backends.
+        """
         adopted = self._pm.adopt_existing()
+        max_n = self._pm.max_counter()
         for name, role in adopted.items():
-            if name not in self.managed:
-                self.managed[name] = ManagedWorker(name=name, role=role, pid=0)
+            self.managed[name] = ManagedWorker(name=name, role=role)
+            logger.info("adopted worker %s (role=%s)", name, role)
+        if max_n > 0:
+            self._counter = max_n
 ```
+
+**Migration note:** Old v0.6.1 PID files in `{state_dir}/pids/` are ignored after this change. ProcessManager uses `{state_dir}/processes/` for metadata. A one-time migration is not needed — old PID files are harmless, and any workers from a v0.6.1 run will have died by the time v0.6.2 starts.
 
 ### 4. Modify: `antfarm/core/doctor.py`
 
@@ -551,10 +732,12 @@ PRs 1-2 can be combined. PR 3 follows. PR 4 is trivial.
 |------|----------|
 | tmux not installed | `get_process_manager()` returns SubprocessProcessManager. Doctor warns. |
 | `ANTFARM_NO_TMUX=1` | Forces SubprocessProcessManager even if tmux installed |
-| Session name collision | `start()` returns False. Caller logs warning, skips. No fallback to Popen. |
-| Colony restarts, tmux sessions alive | `_adopt_existing()` discovers sessions, parses roles, sets counter |
-| Runner restarts | Same adoption via ProcessManager + PID file fallback |
-| Worker finishes, session ends | `is_alive()` returns False, `_cleanup_exited()` removes from managed |
-| `tmux kill-server` externally | All workers die. Doctor recovers tasks. Autoscaler respawns. |
+| Session name collision | `start()` returns False. Caller retries once with bumped counter. |
+| Colony restarts (tmux) | `adopt_existing()` reads metadata files + discovers tmux sessions. Full recovery. |
+| Colony restarts (subprocess) | Metadata files exist but PID validation may fail (processes died). **No restart adoption.** Doctor recovers stale tasks. |
+| Runner restarts | Same adoption via ProcessManager metadata files |
+| Worker finishes, session ends | `is_alive()` returns False, `_cleanup_exited()` removes from managed + metadata |
+| `tmux kill-server` externally | All workers die. Metadata files remain. Next adoption cleans stale metadata. Doctor recovers tasks. |
 | CI without tmux | tmux tests skip. SubprocessProcessManager tests run everywhere. |
 | Name format changes | `parse_session_name()` is the single parser. Update once, adoption stays in sync. |
+| Old v0.6.1 PID files | Ignored — ProcessManager uses `{state_dir}/processes/`, not `{state_dir}/pids/` |
