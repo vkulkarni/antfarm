@@ -141,8 +141,11 @@ class ProcessMetadata:
 class ProcessManager(ABC):
     """Interface for worker process lifecycle management.
 
-    Each implementation persists ProcessMetadata files so that adoption
-    works correctly on restart regardless of backend type.
+    Each implementation persists ProcessMetadata files for correct validation
+    and cleanup on restart. Reliable restart adoption (discovering and reattaching
+    to workers from a previous run) is only guaranteed for TmuxProcessManager.
+    SubprocessProcessManager writes metadata for PID-based liveness checks but
+    cannot reliably adopt after a colony restart since Popen handles are lost.
     """
 
     def __init__(self, prefix: str = "auto-", state_dir: str | None = None):
@@ -428,6 +431,7 @@ class SubprocessProcessManager(ProcessManager):
         lf = self._log_files.pop(name, None)
         if lf and hasattr(lf, "close"):
             lf.close()
+        super().cleanup(name)  # remove metadata file
 
 
 def get_process_manager(prefix: str = "auto-", state_dir: str | None = None) -> ProcessManager:
