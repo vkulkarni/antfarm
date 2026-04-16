@@ -26,16 +26,19 @@ def _make_runner(tmp_path, **kwargs) -> Runner:
     defaults.update(kwargs)
     r = Runner(**defaults)
     os.makedirs(r.state_dir, exist_ok=True)
-    os.makedirs(os.path.join(r.state_dir, "pids"), exist_ok=True)
     return r
 
 
-def _mock_popen():
-    """Create a mock Popen that looks alive."""
-    p = MagicMock()
-    p.poll.return_value = None  # alive
-    p.pid = 12345
-    return p
+def _mock_pm(alive: bool = True) -> MagicMock:
+    """Create a mock ProcessManager."""
+    pm = MagicMock()
+    pm.start.return_value = True
+    pm.is_alive.return_value = alive
+    pm.stop.return_value = True
+    pm.adopt_existing.return_value = {}
+    pm.max_counter.return_value = 0
+    pm.cleanup.return_value = None
+    return pm
 
 
 # ---------------------------------------------------------------------------
@@ -48,6 +51,11 @@ class TestRunnerDefaults:
         """Runner binds to 127.0.0.1 by default."""
         r = _make_runner(tmp_path)
         assert r.host == "127.0.0.1"
+
+    def test_pm_instantiated(self, tmp_path):
+        """Runner instantiates a ProcessManager on __init__."""
+        r = _make_runner(tmp_path)
+        assert r._pm is not None
 
 
 class TestDesiredState:
@@ -77,28 +85,23 @@ class TestDesiredState:
 
 
 class TestReconcile:
-    @patch("antfarm.core.runner.subprocess.Popen")
-    def test_reconcile_starts_missing(self, mock_popen_cls, tmp_path):
-        """Reconcile starts workers to match desired count."""
-        mock_proc = _mock_popen()
-        mock_popen_cls.return_value = mock_proc
-
+    def test_reconcile_starts_missing(self, tmp_path):
+        """Reconcile starts workers to match desired count via ProcessManager."""
         r = _make_runner(tmp_path)
+        r._pm = _mock_pm()
+
         r._desired = DesiredState(generation=1, desired={"builder": 2})
         r.reconcile()
 
-        assert mock_popen_cls.call_count == 2
+        assert r._pm.start.call_count == 2
         assert len(r.managed) == 2
         for mw in r.managed.values():
             assert mw.role == "builder"
 
-    @patch("antfarm.core.runner.subprocess.Popen")
-    def test_reconcile_stops_excess(self, mock_popen_cls, tmp_path):
+    def test_reconcile_stops_excess(self, tmp_path):
         """Reconcile stops excess idle workers when desired count decreases."""
-        mock_proc = _mock_popen()
-        mock_popen_cls.return_value = mock_proc
-
         r = _make_runner(tmp_path)
+        r._pm = _mock_pm()
 
         # Start with 3 builders
         r._desired = DesiredState(generation=1, desired={"builder": 3})
@@ -122,13 +125,10 @@ class TestReconcile:
         # Should have stopped 2 idle workers, leaving 1
         assert len(r.managed) == 1
 
-    @patch("antfarm.core.runner.subprocess.Popen")
-    def test_drain_finishes_active(self, mock_popen_cls, tmp_path):
+    def test_drain_does_not_stop_active(self, tmp_path):
         """Drain does not stop active workers."""
-        mock_proc = _mock_popen()
-        mock_popen_cls.return_value = mock_proc
-
         r = _make_runner(tmp_path)
+        r._pm = _mock_pm()
 
         # Start 2 builders
         r._desired = DesiredState(generation=1, desired={"builder": 2})
@@ -148,47 +148,40 @@ class TestReconcile:
         r._desired = DesiredState(generation=2, desired={"builder": 0}, drain=["builder"])
         r.reconcile()
 
-        # _stop_idle_worker won't stop active workers, and drain skips active too
-        # All should still be running (Colony says active)
-        alive_count = sum(1 for mw in r.managed.values() if mw.is_alive())
-        assert alive_count == 2
+        # Active workers should not be stopped — still 2 alive
+        assert len(r.managed) == 2
 
-    @patch("antfarm.core.runner.subprocess.Popen")
-    def test_restart_crashed(self, mock_popen_cls, tmp_path):
+    def test_restart_crashed(self, tmp_path):
         """Crashed workers are replaced if still desired."""
-        mock_proc = _mock_popen()
-        mock_popen_cls.return_value = mock_proc
-
         r = _make_runner(tmp_path)
+        pm = _mock_pm()
+        r._pm = pm
+
         r._desired = DesiredState(generation=1, desired={"builder": 1})
         r.reconcile()
 
         assert len(r.managed) == 1
         original_name = list(r.managed.keys())[0]
 
-        # Simulate crash: make process report as dead
-        r.managed[original_name].process.poll.return_value = 1  # exited
+        # Simulate crash: make is_alive return False for original, True for new
+        def is_alive_side_effect(name):
+            return name != original_name
 
-        # New Popen for restart
-        new_proc = _mock_popen()
-        mock_popen_cls.return_value = new_proc
+        pm.is_alive.side_effect = is_alive_side_effect
 
         r.reconcile()
 
-        # Old worker removed, new one started
-        assert len(r.managed) == 1
-        new_name = list(r.managed.keys())[0]
-        assert new_name != original_name
+        # Old worker removed, new one started (2 total starts)
+        assert pm.start.call_count == 2
+        assert original_name not in r.managed
 
 
 class TestActualState:
-    @patch("antfarm.core.runner.subprocess.Popen")
-    def test_actual_state_reports_correctly(self, mock_popen_cls, tmp_path):
+    def test_actual_state_reports_correctly(self, tmp_path):
         """get_actual_state reflects managed workers and applied generation."""
-        mock_proc = _mock_popen()
-        mock_popen_cls.return_value = mock_proc
-
         r = _make_runner(tmp_path)
+        r._pm = _mock_pm()
+
         r._desired = DesiredState(generation=3, desired={"builder": 1})
         r.reconcile()
 
@@ -215,57 +208,129 @@ class TestHealthEndpoint:
         assert data["node_id"] == "test-node"
 
 
-class TestPidFiles:
-    @patch("antfarm.core.runner.subprocess.Popen")
-    def test_pid_file_written(self, mock_popen_cls, tmp_path):
-        """_start_worker creates a PID file."""
-        mock_proc = _mock_popen()
-        mock_popen_cls.return_value = mock_proc
-
+class TestStartWorker:
+    def test_start_worker_calls_pm_start(self, tmp_path):
+        """_start_worker calls _pm.start with correct args (name, cmd, log_path, role)."""
         r = _make_runner(tmp_path)
+        r._pm = _mock_pm()
+
         with r._lock:
             r._start_worker("builder")
 
-        # Check PID file exists
+        r._pm.start.assert_called_once()
+        call_args = r._pm.start.call_args
+        name = call_args[0][0]
+        cmd = call_args[0][1]
+        log_path = call_args[0][2]
+        role = call_args[1].get("role") or call_args[0][3]
+
+        assert name.startswith("runner-builder-")
+        assert "antfarm" in cmd[0]
+        assert "--type" in cmd
+        assert "builder" in cmd
+        assert log_path.endswith(f"{name}.log")
+        assert role == "builder"
+
+    def test_start_worker_name_collision_retry(self, tmp_path):
+        """_start_worker retries with bumped counter on first failure."""
+        r = _make_runner(tmp_path)
+        pm = _mock_pm()
+        # First call fails, second succeeds
+        pm.start.side_effect = [False, True]
+        r._pm = pm
+
+        with r._lock:
+            r._start_worker("builder")
+
+        assert pm.start.call_count == 2
+        assert len(r.managed) == 1
+        # Counter should have been bumped twice
+        assert r._counter == 2
+
+    def test_start_worker_all_retries_fail(self, tmp_path):
+        """_start_worker warns and skips if all retries fail."""
+        r = _make_runner(tmp_path)
+        pm = _mock_pm()
+        pm.start.return_value = False
+        r._pm = pm
+
+        with r._lock:
+            r._start_worker("builder")
+
+        assert pm.start.call_count == 2
+        assert len(r.managed) == 0
+
+
+class TestAdoptExistingWorkers:
+    def test_adopt_reads_from_pm(self, tmp_path):
+        """_adopt_existing_workers uses _pm.adopt_existing(), not raw PID files."""
+        r = _make_runner(tmp_path)
+        pm = _mock_pm()
+        pm.adopt_existing.return_value = {
+            "runner-builder-3": "builder",
+            "runner-planner-1": "planner",
+        }
+        pm.max_counter.return_value = 3
+        r._pm = pm
+
+        r._adopt_existing_workers()
+
+        pm.adopt_existing.assert_called_once()
+        assert "runner-builder-3" in r.managed
+        assert "runner-planner-1" in r.managed
+        assert r.managed["runner-builder-3"].role == "builder"
+        assert r.managed["runner-planner-1"].role == "planner"
+        assert r._counter == 3
+
+    def test_adopt_empty(self, tmp_path):
+        """_adopt_existing_workers handles empty adoption gracefully."""
+        r = _make_runner(tmp_path)
+        r._pm = _mock_pm()
+
+        r._adopt_existing_workers()
+
+        assert len(r.managed) == 0
+        assert r._counter == 0
+
+
+class TestStalePidsDirSweep:
+    def test_stale_pids_dir_swept_on_run(self, tmp_path):
+        """run() sweeps stale v0.6.1 pids/ directory if it exists."""
+        r = _make_runner(tmp_path)
+
+        # Create a stale pids/ directory with a file in it
         pids_dir = os.path.join(r.state_dir, "pids")
-        pid_files = os.listdir(pids_dir)
-        assert len(pid_files) == 1
-        assert pid_files[0].endswith(".pid")
+        os.makedirs(pids_dir, exist_ok=True)
+        stale_file = os.path.join(pids_dir, "runner-builder-1.pid")
+        with open(stale_file, "w") as f:
+            f.write("12345")
 
-        with open(os.path.join(pids_dir, pid_files[0])) as f:
-            content = f.read().strip()
-        assert content == str(mock_proc.pid)
+        # Patch out uvicorn and the blocking parts so run() doesn't hang
+        import uvicorn
 
-    def test_adopt_existing_on_restart(self, tmp_path):
-        """Runner adopts live processes from PID files on startup."""
+        with (
+            patch("antfarm.core.runner.Runner._adopt_existing_workers"),
+            patch("antfarm.core.runner.threading.Thread"),
+            patch.object(uvicorn, "run"),
+            patch("antfarm.core.colony_client.ColonyClient"),
+        ):
+            r.run()
+
+        # pids/ directory should have been removed
+        assert not os.path.isdir(pids_dir)
+
+    def test_no_pids_dir_does_not_crash(self, tmp_path):
+        """run() does not crash if pids/ directory does not exist."""
         r = _make_runner(tmp_path)
+        pids_dir = os.path.join(r.state_dir, "pids")
+        assert not os.path.isdir(pids_dir)
 
-        # Write a PID file for our own process (guaranteed alive)
-        my_pid = os.getpid()
-        pid_path = os.path.join(r.state_dir, "pids", "runner-builder-5.pid")
-        with open(pid_path, "w") as f:
-            f.write(str(my_pid))
+        import uvicorn
 
-        r._adopt_existing_workers()
-
-        assert "runner-builder-5" in r.managed
-        mw = r.managed["runner-builder-5"]
-        assert mw.pid == my_pid
-        assert mw.role == "builder"
-        assert mw.is_alive()
-
-    def test_stale_pid_cleaned(self, tmp_path):
-        """Runner removes PID files for dead processes."""
-        r = _make_runner(tmp_path)
-
-        # Write a PID file with a very high PID unlikely to exist
-        pid_path = os.path.join(r.state_dir, "pids", "runner-builder-99.pid")
-        with open(pid_path, "w") as f:
-            f.write("999999999")
-
-        r._adopt_existing_workers()
-
-        # Worker should not be adopted
-        assert "runner-builder-99" not in r.managed
-        # PID file should be cleaned up
-        assert not os.path.exists(pid_path)
+        with (
+            patch("antfarm.core.runner.Runner._adopt_existing_workers"),
+            patch("antfarm.core.runner.threading.Thread"),
+            patch.object(uvicorn, "run"),
+            patch("antfarm.core.colony_client.ColonyClient"),
+        ):
+            r.run()  # should not raise

@@ -2,7 +2,8 @@
 
 Manages worker subprocesses on a single node via desired-state reconciliation.
 Exposes a local HTTP API for the Orchestrator to push desired state and query
-actual state. Handles PID file persistence for crash recovery (adopt-on-restart).
+actual state. Handles process metadata persistence for crash recovery
+(adopt-on-restart via ProcessManager).
 
 Unlike the Autoscaler (which computes desired state locally from queue state),
 the Runner is a pure executor: it receives desired state from the Orchestrator
@@ -13,15 +14,16 @@ from __future__ import annotations
 
 import logging
 import os
-import signal
+import shutil
 import subprocess
 import threading
 import time
-from contextlib import suppress
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+
+from antfarm.core.process_manager import get_process_manager
 
 logger = logging.getLogger(__name__)
 
@@ -42,26 +44,7 @@ class DesiredState:
 class ManagedWorker:
     name: str
     role: str
-    pid: int
-    process: subprocess.Popen | None = None
-
-    def is_alive(self) -> bool:
-        """Check if the managed worker process is still running."""
-        if self.process is not None:
-            return self.process.poll() is None
-        try:
-            os.kill(self.pid, 0)
-            return True
-        except OSError:
-            return False
-
-    def terminate(self) -> None:
-        """Terminate the managed worker process."""
-        if self.process is not None:
-            self.process.terminate()
-        else:
-            with suppress(OSError):
-                os.kill(self.pid, signal.SIGTERM)
+    pid: int = 0  # informational only — ProcessManager owns lifecycle
 
 
 # ---------------------------------------------------------------------------
@@ -142,15 +125,23 @@ class Runner:
         self._lock = threading.Lock()
         self._colony = None  # ColonyClient, set in run()
 
+        self._pm = get_process_manager(prefix="runner-", state_dir=self.state_dir)
+
     def run(self) -> None:
         """Start the Runner daemon.
 
-        Creates state directories, adopts existing workers from PID files,
-        registers with Colony (non-fatal if unreachable), starts background
-        threads for reconciliation and git fetch, then starts the HTTP API.
+        Creates state directories, sweeps stale v0.6.1 pids/ directory,
+        adopts existing workers from ProcessManager metadata, registers with
+        Colony (non-fatal if unreachable), starts background threads for
+        reconciliation and git fetch, then starts the HTTP API.
         """
         os.makedirs(self.state_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.state_dir, "pids"), exist_ok=True)
+
+        # Sweep stale v0.6.1 pids/ directory — ProcessManager uses processes/ now.
+        pids_dir = os.path.join(self.state_dir, "pids")
+        if os.path.isdir(pids_dir):
+            logger.info("runner: sweeping stale v0.6.1 pids/ directory at %s", pids_dir)
+            shutil.rmtree(pids_dir, ignore_errors=True)
 
         self._adopt_existing_workers()
 
@@ -210,11 +201,11 @@ class Runner:
             for role in self._desired.drain:
                 for name in list(self.managed):
                     mw = self.managed[name]
-                    if mw.role == role and mw.is_alive():
+                    if mw.role == role and self._pm.is_alive(name):
                         if not self._is_worker_idle(name):
                             continue  # don't stop active workers during drain
-                        mw.terminate()
-                        self._remove_pid_file(name)
+                        self._pm.stop(name)
+                        self._pm.cleanup(name)
                         del self.managed[name]
 
             self._restart_crashed()
@@ -240,10 +231,10 @@ class Runner:
                     "name": mw.name,
                     "role": mw.role,
                     "pid": mw.pid,
-                    "alive": mw.is_alive(),
+                    "alive": self._pm.is_alive(name),
                 }
             cpus = os.cpu_count() or 1
-            alive_count = sum(1 for mw in self.managed.values() if mw.is_alive())
+            alive_count = sum(1 for name in self.managed if self._pm.is_alive(name))
             return {
                 "applied_generation": self._applied_generation,
                 "workers": workers,
@@ -258,10 +249,8 @@ class Runner:
         """Stop all managed workers and clean up."""
         self._stopped = True
         with self._lock:
-            for name, mw in list(self.managed.items()):
-                if mw.is_alive():
-                    mw.terminate()
-                self._remove_pid_file(name)
+            for name in list(self.managed):
+                self._pm.stop(name)
             self.managed.clear()
 
     # ------------------------------------------------------------------
@@ -269,10 +258,10 @@ class Runner:
     # ------------------------------------------------------------------
 
     def _start_worker(self, role: str) -> None:
-        """Spawn a new worker subprocess for the given role."""
-        self._counter += 1
-        name = f"runner-{role}-{self._counter}"
+        """Spawn a new worker via ProcessManager for the given role.
 
+        Retries once on name collision (ProcessManager returns False).
+        """
         cmd = [
             "antfarm",
             "worker",
@@ -284,7 +273,7 @@ class Runner:
             "--node",
             self.node_id,
             "--name",
-            name,
+            "",  # placeholder, filled in per-attempt below
             "--repo-path",
             self.repo_path,
             "--integration-branch",
@@ -299,19 +288,24 @@ class Runner:
 
         log_dir = os.path.join(self.state_dir, "logs")
         os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, f"{name}.log")
-        log_file = open(log_path, "a")  # noqa: SIM115
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=log_file,
-        )
+        for attempt in range(2):
+            self._counter += 1
+            name = f"runner-{role}-{self._counter}"
+            log_path = os.path.join(log_dir, f"{name}.log")
 
-        mw = ManagedWorker(name=name, role=role, pid=process.pid, process=process)
-        self.managed[name] = mw
-        self._write_pid_file(name, process.pid)
-        logger.info("runner started worker name=%s role=%s pid=%d", name, role, process.pid)
+            # Inject name into cmd (--name argument)
+            name_idx = cmd.index("--name") + 1
+            cmd[name_idx] = name
+
+            if self._pm.start(name, cmd, log_path, role=role):
+                self.managed[name] = ManagedWorker(name=name, role=role)
+                logger.info("runner started worker name=%s role=%s", name, role)
+                return
+            if attempt == 0:
+                logger.info("start failed for %s, retrying with bumped counter", name)
+
+        logger.warning("failed to start runner worker after retry — skipping")
 
     def _stop_idle_worker(self, role: str) -> bool:
         """Stop one idle worker of the given role. Returns True if one was stopped.
@@ -332,13 +326,13 @@ class Runner:
         for name, mw in list(self.managed.items()):
             if mw.role != role:
                 continue
-            if not mw.is_alive():
+            if not self._pm.is_alive(name):
                 continue
             worker_id = f"{self.node_id}/{name}"
             cw = colony_status_map.get(worker_id)
             if cw and cw.get("status") == "idle":
-                mw.terminate()
-                self._remove_pid_file(name)
+                self._pm.stop(name)
+                self._pm.cleanup(name)
                 del self.managed[name]
                 logger.info("runner stopped idle worker name=%s role=%s", name, role)
                 return True
@@ -349,9 +343,9 @@ class Runner:
         desired = self._desired.desired
         for name in list(self.managed):
             mw = self.managed[name]
-            if not mw.is_alive():
+            if not self._pm.is_alive(name):
                 role = mw.role
-                self._remove_pid_file(name)
+                self._pm.cleanup(name)
                 del self.managed[name]
                 # Only restart if still desired
                 if desired.get(role, 0) > self._count_role(role):
@@ -360,15 +354,16 @@ class Runner:
     def _cleanup_exited(self) -> None:
         """Remove managed workers whose processes have exited."""
         for name in list(self.managed):
-            mw = self.managed[name]
-            if not mw.is_alive():
+            if not self._pm.is_alive(name):
                 logger.info("runner cleaned up exited worker name=%s", name)
-                self._remove_pid_file(name)
+                self._pm.cleanup(name)
                 del self.managed[name]
 
     def _count_role(self, role: str) -> int:
         """Count alive managed workers of a given role."""
-        return sum(1 for mw in self.managed.values() if mw.role == role and mw.is_alive())
+        return sum(
+            1 for name, mw in self.managed.items() if mw.role == role and self._pm.is_alive(name)
+        )
 
     def _is_worker_idle(self, name: str) -> bool:
         """Check if a worker is idle via Colony. Returns True if idle or Colony unreachable."""
@@ -384,60 +379,20 @@ class Runner:
                 return w.get("status") == "idle"
         return True  # Not found in Colony = treat as idle
 
-    # ------------------------------------------------------------------
-    # PID file management
-    # ------------------------------------------------------------------
-
-    def _write_pid_file(self, name: str, pid: int) -> None:
-        pid_path = os.path.join(self.state_dir, "pids", f"{name}.pid")
-        with open(pid_path, "w") as f:
-            f.write(str(pid))
-
-    def _remove_pid_file(self, name: str) -> None:
-        pid_path = os.path.join(self.state_dir, "pids", f"{name}.pid")
-        with suppress(FileNotFoundError):
-            os.unlink(pid_path)
-
     def _adopt_existing_workers(self) -> None:
-        """Scan PID files and adopt live processes on restart."""
-        pids_dir = os.path.join(self.state_dir, "pids")
-        if not os.path.isdir(pids_dir):
-            return
-        for filename in os.listdir(pids_dir):
-            if not filename.endswith(".pid"):
-                continue
-            name = filename[:-4]  # strip .pid
-            pid_path = os.path.join(pids_dir, filename)
-            try:
-                with open(pid_path) as f:
-                    pid = int(f.read().strip())
-            except (ValueError, OSError):
-                with suppress(FileNotFoundError):
-                    os.unlink(pid_path)
-                continue
+        """Unified adoption via ProcessManager metadata.
 
-            # Check if process is alive
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                # Process dead — clean up stale PID file
-                with suppress(FileNotFoundError):
-                    os.unlink(pid_path)
-                continue
-
-            # Infer role from name: "runner-{role}-{counter}"
-            parts = name.split("-")
-            role = parts[1] if len(parts) >= 3 else "unknown"
-
-            # Update counter to avoid name collisions
-            if len(parts) >= 3:
-                with suppress(ValueError):
-                    counter_val = int(parts[-1])
-                    if counter_val >= self._counter:
-                        self._counter = counter_val
-
-            self.managed[name] = ManagedWorker(name=name, role=role, pid=pid)
-            logger.info("runner adopted worker name=%s pid=%d", name, pid)
+        Replaces the old PID-file-only adoption. ProcessMetadata files
+        store manager_type so adoption validates correctly for both
+        tmux (has-session) and subprocess (os.kill PID check) backends.
+        """
+        adopted = self._pm.adopt_existing()
+        max_n = self._pm.max_counter()
+        for name, role in adopted.items():
+            self.managed[name] = ManagedWorker(name=name, role=role)
+            logger.info("adopted worker %s (role=%s)", name, role)
+        if max_n > 0:
+            self._counter = max_n
 
     # ------------------------------------------------------------------
     # Background loops
@@ -494,7 +449,7 @@ class Runner:
         def get_capacity():
             cpus = os.cpu_count() or 1
             with self._lock:
-                alive = sum(1 for mw in self.managed.values() if mw.is_alive())
+                alive = sum(1 for name in self.managed if self._pm.is_alive(name))
             return {
                 "cpus": cpus,
                 "max_workers": self.max_workers,
