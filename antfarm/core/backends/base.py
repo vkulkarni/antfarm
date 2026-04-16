@@ -348,7 +348,19 @@ class TaskBackend(ABC):
 
     @abstractmethod
     def register_worker(self, worker: dict) -> None:
-        """Register a worker.
+        """Register a worker. Stale-tolerant.
+
+        Contract:
+            - If no worker file exists for ``worker_id``: always succeeds.
+            - If a worker file exists and its heartbeat (file mtime) is older
+              than the backend's configured TTL: the stale file is overwritten
+              and registration succeeds.
+            - If a worker file exists and its heartbeat is within TTL (live):
+              registration is rejected with ValueError.
+
+        The check-and-write must be atomic so that two concurrent registrations
+        for the same ``worker_id`` cannot both observe "no prior worker" and
+        both succeed.
 
         Args:
             worker: Worker dict with 'worker_id', 'node_id', etc.
