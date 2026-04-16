@@ -301,6 +301,9 @@ class ProcessManager(ABC):
 class TmuxProcessManager(ProcessManager):
     """Spawns workers as tmux sessions — real TTY, attach/debug, survive restarts."""
 
+    def __init__(self, prefix: str = "auto-", state_dir: str | None = None):
+        super().__init__(prefix, state_dir)
+
     def _manager_type(self) -> str:
         return "tmux"
 
@@ -427,18 +430,23 @@ class SubprocessProcessManager(ProcessManager):
             lf.close()
 
 
-def get_process_manager(prefix: str = "auto-") -> ProcessManager:
+def get_process_manager(prefix: str = "auto-", state_dir: str | None = None) -> ProcessManager:
     """Factory: return TmuxProcessManager if tmux available, else subprocess fallback.
+
+    Args:
+        prefix: Session name prefix for this consumer (e.g. "auto-" or "runner-").
+        state_dir: Directory for process metadata files. Both callers MUST pass this
+                   for metadata-based adoption to work.
 
     Respects ANTFARM_NO_TMUX=1 environment variable to force fallback.
     """
     if os.environ.get("ANTFARM_NO_TMUX"):
         logger.info("ANTFARM_NO_TMUX set — using subprocess process manager")
-        return SubprocessProcessManager(prefix)
+        return SubprocessProcessManager(prefix, state_dir)
     if shutil.which("tmux"):
-        return TmuxProcessManager(prefix)
+        return TmuxProcessManager(prefix, state_dir)
     logger.warning("tmux not installed — falling back to subprocess process manager")
-    return SubprocessProcessManager(prefix)
+    return SubprocessProcessManager(prefix, state_dir)
 ```
 
 ### 2. Modify: `antfarm/core/autoscaler.py`
@@ -461,7 +469,7 @@ No more `process: Popen | None` or `tmux_session: str | None` — the ProcessMan
 class Autoscaler:
     def __init__(self, backend, config, clock=time.time):
         ...
-        self._pm = get_process_manager(prefix="auto-")
+        self._pm = get_process_manager(prefix="auto-", state_dir=config.data_dir)
 
     def run(self) -> None:
         self._adopt_existing()
@@ -518,6 +526,14 @@ class Autoscaler:
         return counts
 
     def stop(self) -> None:
+        """Shutdown: stop all managed workers.
+
+        Metadata cleanup policy: stop() kills sessions/processes but does NOT
+        remove metadata files. Metadata is cleaned up during the next adoption
+        pass (stale metadata with dead processes gets removed). This is
+        intentional — metadata should outlive the colony process for tmux
+        restart adoption to work. Same policy applies in runner.stop().
+        """
         self._stopped = True
         for mw in list(self.managed.values()):
             self._pm.stop(mw.name)
@@ -658,6 +674,18 @@ def test_max_counter():
     pm.stop("auto-builder-3")
     pm.stop("auto-builder-7")
 
+def test_process_metadata_roundtrip(tmp_path):
+    """Metadata files are written on start and readable for adoption."""
+    pm = SubprocessProcessManager(state_dir=str(tmp_path))
+    pm.start("auto-builder-1", ["sleep", "60"], role="builder")
+    meta = pm._read_metadata("auto-builder-1")
+    assert meta is not None
+    assert meta.name == "auto-builder-1"
+    assert meta.role == "builder"
+    assert meta.manager_type == "subprocess"
+    assert meta.pid is not None and meta.pid > 0
+    pm.stop("auto-builder-1")
+
 # --- Tests that need real tmux ---
 
 @pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not installed")
@@ -678,6 +706,20 @@ def test_tmux_pm_shell_injection_safe(tmp_path):
     name = "antfarm-test-inject"
     try:
         assert pm.start(name, ["echo", "hello; echo pwned"])
+    finally:
+        pm.stop(name)
+
+@pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not installed")
+def test_tmux_pm_writes_metadata(tmp_path):
+    pm = TmuxProcessManager(state_dir=str(tmp_path))
+    name = "auto-builder-99"
+    try:
+        pm.start(name, ["sleep", "60"], role="builder")
+        meta = pm._read_metadata(name)
+        assert meta is not None
+        assert meta.manager_type == "tmux"
+        assert meta.session_name == name
+        assert meta.role == "builder"
     finally:
         pm.stop(name)
 
