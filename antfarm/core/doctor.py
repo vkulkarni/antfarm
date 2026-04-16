@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -56,6 +57,8 @@ def run_doctor(backend, config: dict, fix: bool = False) -> list[Finding]:
     findings.extend(check_state_consistency(backend))
     findings.extend(check_dependency_cycles(backend))
     findings.extend(check_runner_health(backend, config))
+    findings.extend(check_tmux_available(config))
+    findings.extend(check_orphan_tmux_sessions(config))
 
     return findings
 
@@ -889,5 +892,95 @@ def check_runner_health(backend, config: dict, fix: bool = False) -> list[Findin
                 ),
                 auto_fixable=False,
             ))
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 12: tmux availability
+# ---------------------------------------------------------------------------
+
+def check_tmux_available(config: dict) -> list[Finding]:
+    """Warn if tmux is not installed — workers will fall back to unreliable subprocess mode.
+
+    Args:
+        config: Doctor config dict (unused, kept for consistent signature).
+
+    Returns:
+        List of findings.
+    """
+    if shutil.which("tmux"):
+        return []
+    return [Finding(
+        severity="warning",
+        check="tmux_available",
+        message=(
+            "tmux not installed — worker spawning will use subprocess fallback (less reliable)"
+        ),
+        auto_fixable=False,
+    )]
+
+
+# ---------------------------------------------------------------------------
+# Check 13: Orphan tmux sessions
+# ---------------------------------------------------------------------------
+
+_ANTFARM_PREFIXES = ("auto-", "runner-")
+
+
+def check_orphan_tmux_sessions(config: dict) -> list[Finding]:
+    """Detect tmux sessions with antfarm prefixes that have no matching metadata file.
+
+    An orphan session is one whose name starts with a known antfarm prefix
+    (``auto-`` or ``runner-``) but whose ProcessMetadata file is absent from
+    ``{state_dir}/processes/{name}.json``.  This can happen when the colony
+    process crashed before writing metadata, or after a manual ``tmux kill-server``.
+
+    Args:
+        config: Doctor config dict. Uses ``data_dir`` to locate process metadata.
+
+    Returns:
+        List of findings (report only, no fix).
+    """
+    if not shutil.which("tmux"):
+        return []
+
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # tmux server not running — no sessions to check
+        return []
+
+    from antfarm.core.process_manager import parse_session_name
+
+    data_dir = config.get("data_dir", "")
+    processes_dir = Path(data_dir) / "processes" if data_dir else None
+
+    findings: list[Finding] = []
+    for name in result.stdout.strip().splitlines():
+        name = name.strip()
+        if not name:
+            continue
+
+        # Check if this is an antfarm session (matches any known prefix)
+        is_antfarm = any(parse_session_name(name, prefix) is not None for prefix in _ANTFARM_PREFIXES)
+        if not is_antfarm:
+            continue
+
+        # Check if matching metadata file exists
+        if processes_dir is not None:
+            metadata_file = processes_dir / f"{name}.json"
+            if metadata_file.exists():
+                continue
+
+        findings.append(Finding(
+            severity="warning",
+            check="orphan_tmux_session",
+            message=f"orphan tmux session: {name} (no matching metadata)",
+            auto_fixable=False,
+        ))
 
     return findings

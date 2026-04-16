@@ -69,7 +69,12 @@ def _backdate(path: str | Path, seconds: int = 600) -> None:
 def test_healthy_colony_no_findings(setup):
     backend, config = setup
     findings = run_doctor(backend, config)
-    errors_warnings = [f for f in findings if f.severity in ("error", "warning")]
+    # Exclude tmux_available: it fires in CI/minimal environments where tmux
+    # is not installed — this is expected and not a colony health issue.
+    errors_warnings = [
+        f for f in findings
+        if f.severity in ("error", "warning") and f.check != "tmux_available"
+    ]
     assert errors_warnings == [], f"Expected no errors/warnings, got: {errors_warnings}"
 
 
@@ -570,3 +575,119 @@ def test_doctor_runner_reachable(setup):
         findings = check_runner_health(backend, {})
 
     assert len(findings) == 0
+
+
+# ---------------------------------------------------------------------------
+# 18. test_check_tmux_available — tmux installed
+# ---------------------------------------------------------------------------
+
+
+def test_check_tmux_available_when_installed():
+    """Returns [] when tmux is installed."""
+    from unittest.mock import patch
+
+    from antfarm.core.doctor import check_tmux_available
+
+    with patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"):
+        findings = check_tmux_available({})
+
+    assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# 19. test_check_tmux_available — tmux missing
+# ---------------------------------------------------------------------------
+
+
+def test_check_tmux_available_when_missing():
+    """Returns a warning finding when tmux is not installed."""
+    from unittest.mock import patch
+
+    from antfarm.core.doctor import check_tmux_available
+
+    with patch("antfarm.core.doctor.shutil.which", return_value=None):
+        findings = check_tmux_available({})
+
+    assert len(findings) == 1
+    assert findings[0].severity == "warning"
+    assert findings[0].check == "tmux_available"
+    assert "subprocess fallback" in findings[0].message
+    assert findings[0].auto_fixable is False
+
+
+# ---------------------------------------------------------------------------
+# 20. test_check_orphan_tmux_sessions — tmux not installed
+# ---------------------------------------------------------------------------
+
+
+def test_check_orphan_tmux_sessions_no_tmux():
+    """Returns [] when tmux is not installed."""
+    from unittest.mock import patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+
+    with patch("antfarm.core.doctor.shutil.which", return_value=None):
+        findings = check_orphan_tmux_sessions({})
+
+    assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# 21. test_check_orphan_tmux_sessions — orphan and non-orphan detection
+# ---------------------------------------------------------------------------
+
+
+def test_check_orphan_tmux_sessions_detects_orphans(tmp_path):
+    """Antfarm-prefixed session without metadata emits warning; one WITH metadata does not."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+
+    data_dir = tmp_path / ".antfarm"
+    processes_dir = data_dir / "processes"
+    processes_dir.mkdir(parents=True)
+
+    # Write metadata for the non-orphan session
+    (processes_dir / "auto-builder-1.json").write_text(
+        '{"name": "auto-builder-1", "role": "builder", "manager_type": "tmux"}'
+    )
+
+    config = {"data_dir": str(data_dir)}
+
+    # Two antfarm sessions: one with metadata, one orphan; plus one non-antfarm session
+    session_names = "auto-builder-1\nauto-planner-2\nsome-unrelated-session\n"
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = session_names
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", return_value=mock_result),
+    ):
+        findings = check_orphan_tmux_sessions(config)
+
+    orphan_checks = [f for f in findings if f.check == "orphan_tmux_session"]
+    assert len(orphan_checks) == 1
+    assert "auto-planner-2" in orphan_checks[0].message
+    assert orphan_checks[0].severity == "warning"
+    assert orphan_checks[0].auto_fixable is False
+
+
+def test_check_orphan_tmux_sessions_no_server():
+    """Returns [] when tmux server is not running (returncode != 0)."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+
+    mock_result = MagicMock()
+    mock_result.returncode = 1
+    mock_result.stdout = ""
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", return_value=mock_result),
+    ):
+        findings = check_orphan_tmux_sessions({})
+
+    assert findings == []
