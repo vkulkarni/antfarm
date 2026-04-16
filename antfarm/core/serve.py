@@ -174,7 +174,14 @@ def _start_autoscaler_thread(
     if _autoscaler_thread is not None and _autoscaler_thread.is_alive():
         return
 
+    import shutil
+
     from antfarm.core.autoscaler import Autoscaler
+
+    if not shutil.which("tmux"):
+        logger.warning(
+            "tmux not available — using subprocess fallback (less reliable, no restart adoption)"
+        )
 
     _autoscaler_instance = Autoscaler(backend, autoscaler_config)
 

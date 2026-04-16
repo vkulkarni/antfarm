@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from antfarm.core.autoscaler import Autoscaler, AutoscalerConfig
+from antfarm.core.autoscaler import Autoscaler, AutoscalerConfig, ManagedWorker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -45,10 +45,22 @@ def _worker(
     return w
 
 
-def _make_autoscaler(**kwargs) -> Autoscaler:
+def _make_autoscaler(_pm=None, **kwargs) -> Autoscaler:
     backend = MagicMock()
     config = AutoscalerConfig(**kwargs)
-    return Autoscaler(backend, config)
+    pm = _pm if _pm is not None else _mock_pm()
+    return Autoscaler(backend, config, _pm=pm)
+
+
+def _mock_pm() -> MagicMock:
+    """Create a mock ProcessManager with sensible defaults."""
+    pm = MagicMock()
+    pm.start.return_value = True
+    pm.is_alive.return_value = True
+    pm.stop.return_value = True
+    pm.adopt_existing.return_value = {}
+    pm.max_counter.return_value = 0
+    return pm
 
 
 # ---------------------------------------------------------------------------
@@ -219,16 +231,9 @@ class TestCountScopeGroups:
 
 
 class TestReconciliation:
-    @patch("antfarm.core.autoscaler.subprocess.Popen")
-    @patch("antfarm.core.autoscaler.os.makedirs")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_reconcile_starts_workers_to_meet_desired(self, mock_open, mock_makedirs, mock_popen):
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.pid = 12345
-        mock_popen.return_value = mock_proc
-
-        a = _make_autoscaler(max_builders=4)
+    def test_reconcile_starts_workers_to_meet_desired(self):
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm, max_builders=4)
         a.backend.list_tasks.return_value = [
             _task("t1", touches=["api"]),
             _task("t2", touches=["db"]),
@@ -239,30 +244,21 @@ class TestReconciliation:
 
         # Should have started 2 builders (2 scope groups, 2 tasks)
         builder_starts = [
-            call for call in mock_popen.call_args_list
-            if "--type" in call[0][0] and "builder" in call[0][0]
+            c for c in pm.start.call_args_list
+            if "--type" in c[0][1] and "builder" in c[0][1]
         ]
         assert len(builder_starts) == 2
 
-    @patch("antfarm.core.autoscaler.subprocess.Popen")
-    @patch("antfarm.core.autoscaler.os.makedirs")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_stop_idle_worker_respects_colony_state(self, mock_open, mock_makedirs, mock_popen):
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None  # still running
-        mock_popen.return_value = mock_proc
+    def test_stop_idle_worker_respects_colony_state(self):
+        pm = _mock_pm()
+        pm.is_alive.return_value = True
 
-        a = _make_autoscaler()
-        # Simulate a managed worker
-        from antfarm.core.autoscaler import ManagedWorker
-
-        mw = ManagedWorker(
+        a = _make_autoscaler(_pm=pm)
+        a.managed["auto-builder-1"] = ManagedWorker(
             name="auto-builder-1",
             role="builder",
             worker_id="local/auto-builder-1",
-            process=mock_proc,
         )
-        a.managed["auto-builder-1"] = mw
 
         # Colony says this worker is active (not idle) -> should NOT stop
         a.backend.list_workers.return_value = [
@@ -270,7 +266,7 @@ class TestReconciliation:
         ]
         stopped = a._stop_idle_worker("builder")
         assert stopped is False
-        mock_proc.terminate.assert_not_called()
+        pm.stop.assert_not_called()
 
         # Colony says this worker is idle -> should stop
         a.backend.list_workers.return_value = [
@@ -278,49 +274,36 @@ class TestReconciliation:
         ]
         stopped = a._stop_idle_worker("builder")
         assert stopped is True
-        mock_proc.terminate.assert_called_once()
+        pm.stop.assert_called_once_with("auto-builder-1")
 
     def test_cleanup_exited_removes_dead_workers(self):
-        a = _make_autoscaler()
-        from antfarm.core.autoscaler import ManagedWorker
+        pm = _mock_pm()
+        # "dead" is not alive, "alive" is alive
+        pm.is_alive.side_effect = lambda name: name == "alive"
 
-        dead_proc = MagicMock()
-        dead_proc.poll.return_value = 0
-        dead_proc.returncode = 0
-
-        alive_proc = MagicMock()
-        alive_proc.poll.return_value = None
-
-        a.managed["dead"] = ManagedWorker("dead", "builder", "local/dead", dead_proc)
-        a.managed["alive"] = ManagedWorker("alive", "builder", "local/alive", alive_proc)
+        a = _make_autoscaler(_pm=pm)
+        a.managed["dead"] = ManagedWorker("dead", "builder", "local/dead")
+        a.managed["alive"] = ManagedWorker("alive", "builder", "local/alive")
 
         a._cleanup_exited()
 
         assert "dead" not in a.managed
         assert "alive" in a.managed
+        pm.cleanup.assert_called_once_with("dead")
 
-    @patch("antfarm.core.autoscaler.subprocess.Popen")
-    @patch("antfarm.core.autoscaler.os.makedirs")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_run_once_is_idempotent_when_at_desired(
-        self, mock_open, mock_makedirs, mock_popen
-    ):
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.pid = 99
-        mock_popen.return_value = mock_proc
-
-        a = _make_autoscaler()
+    def test_run_once_is_idempotent_when_at_desired(self):
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm)
         a.backend.list_tasks.return_value = [_task("t1", touches=["api"])]
         a.backend.list_workers.return_value = []
 
         # First reconcile starts workers
         a._reconcile()
-        first_count = mock_popen.call_count
+        first_count = pm.start.call_count
 
         # Second reconcile should not start more (already at desired)
         a._reconcile()
-        assert mock_popen.call_count == first_count
+        assert pm.start.call_count == first_count
 
 
 # ---------------------------------------------------------------------------
@@ -376,33 +359,30 @@ class TestHelpers:
         assert Autoscaler._is_rate_limited(w) is False
 
     def test_count_actual(self):
-        a = _make_autoscaler()
-        from antfarm.core.autoscaler import ManagedWorker
+        pm = _mock_pm()
+        # b1 alive, b2 dead, r1 alive
+        pm.is_alive.side_effect = lambda name: name in ("b1", "r1")
 
-        alive = MagicMock()
-        alive.poll.return_value = None
-        dead = MagicMock()
-        dead.poll.return_value = 1
-
-        a.managed["b1"] = ManagedWorker("b1", "builder", "local/b1", alive)
-        a.managed["b2"] = ManagedWorker("b2", "builder", "local/b2", dead)
-        a.managed["r1"] = ManagedWorker("r1", "reviewer", "local/r1", alive)
+        a = _make_autoscaler(_pm=pm)
+        a.managed["b1"] = ManagedWorker("b1", "builder", "local/b1")
+        a.managed["b2"] = ManagedWorker("b2", "builder", "local/b2")
+        a.managed["r1"] = ManagedWorker("r1", "reviewer", "local/r1")
 
         counts = a._count_actual()
         assert counts["builder"] == 1
         assert counts["reviewer"] == 1
 
-    def test_stop_terminates_all_managed(self):
-        a = _make_autoscaler()
-        from antfarm.core.autoscaler import ManagedWorker
-
-        proc = MagicMock()
-        proc.poll.return_value = None
-        a.managed["w1"] = ManagedWorker("w1", "builder", "local/w1", proc)
+    def test_stop_calls_pm_stop_for_each_managed(self):
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm)
+        a.managed["w1"] = ManagedWorker("w1", "builder", "local/w1")
+        a.managed["w2"] = ManagedWorker("w2", "reviewer", "local/w2")
 
         a.stop()
         assert a._stopped is True
-        proc.terminate.assert_called_once()
+        pm.stop.assert_any_call("w1")
+        pm.stop.assert_any_call("w2")
+        assert pm.stop.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -411,26 +391,28 @@ class TestHelpers:
 
 
 class TestStartWorker:
-    @patch("antfarm.core.autoscaler.subprocess.Popen")
     @patch("antfarm.core.autoscaler.os.makedirs")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_start_worker_builds_correct_command(self, mock_open, mock_makedirs, mock_popen):
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.pid = 42
-        mock_popen.return_value = mock_proc
-
+    def test_start_worker_calls_pm_start_with_correct_args(self, mock_makedirs):
+        pm = _mock_pm()
         a = _make_autoscaler(
+            _pm=pm,
             agent_type="claude-code",
             node_id="node-1",
             repo_path="/repo",
             integration_branch="dev",
             workspace_root="/ws",
             colony_url="http://localhost:7433",
+            data_dir=".antfarm",
         )
         a._start_worker("builder")
 
-        cmd = mock_popen.call_args[0][0]
+        assert pm.start.call_count == 1
+        start_call = pm.start.call_args
+        name = start_call[0][0]
+        cmd = start_call[0][1]
+        role = start_call[1].get("role") or start_call[0][3]
+
+        assert name.startswith("auto-builder-")
         assert "antfarm" in cmd
         assert "--type" in cmd
         idx = cmd.index("--type")
@@ -439,33 +421,99 @@ class TestStartWorker:
         assert "claude-code" in cmd
         assert "--node" in cmd
         assert "node-1" in cmd
+        assert role == "builder"
 
-    @patch("antfarm.core.autoscaler.subprocess.Popen")
+        # Worker should be tracked in managed
+        assert name in a.managed
+        assert a.managed[name].role == "builder"
+
     @patch("antfarm.core.autoscaler.os.makedirs")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_start_worker_with_token(self, mock_open, mock_makedirs, mock_popen):
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.pid = 42
-        mock_popen.return_value = mock_proc
-
-        a = _make_autoscaler(token="secret123")
+    def test_start_worker_with_token(self, mock_makedirs):
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm, token="secret123")
         a._start_worker("reviewer")
 
-        cmd = mock_popen.call_args[0][0]
+        cmd = pm.start.call_args[0][1]
         assert "--token" in cmd
         assert "secret123" in cmd
 
-    @patch("antfarm.core.autoscaler.subprocess.Popen")
     @patch("antfarm.core.autoscaler.os.makedirs")
-    @patch("builtins.open", new_callable=MagicMock)
-    def test_start_worker_creates_log_dir(self, mock_open, mock_makedirs, mock_popen):
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.pid = 42
-        mock_popen.return_value = mock_proc
+    def test_start_worker_name_collision_retries_with_bumped_counter(self, mock_makedirs):
+        pm = _mock_pm()
+        # First call fails (name collision), second succeeds
+        pm.start.side_effect = [False, True]
 
-        a = _make_autoscaler(data_dir="/data")
+        a = _make_autoscaler(_pm=pm)
+        a._start_worker("builder")
+
+        assert pm.start.call_count == 2
+        # Counter bumped twice
+        assert a._counter == 2
+        # The second name was registered
+        names = list(a.managed.keys())
+        assert len(names) == 1
+        assert names[0] == "auto-builder-2"
+
+    @patch("antfarm.core.autoscaler.os.makedirs")
+    def test_start_worker_both_attempts_fail_skips_gracefully(self, mock_makedirs):
+        pm = _mock_pm()
+        pm.start.return_value = False
+
+        a = _make_autoscaler(_pm=pm)
+        a._start_worker("builder")  # should not raise
+
+        assert pm.start.call_count == 2
+        assert len(a.managed) == 0
+
+    @patch("antfarm.core.autoscaler.os.makedirs")
+    def test_start_worker_creates_log_dir(self, mock_makedirs):
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm, data_dir="/data")
         a._start_worker("planner")
 
         mock_makedirs.assert_called_with("/data/logs", exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# _adopt_existing tests
+# ---------------------------------------------------------------------------
+
+
+class TestAdoptExisting:
+    def test_adopt_existing_populates_managed(self):
+        pm = _mock_pm()
+        pm.adopt_existing.return_value = {
+            "auto-builder-3": "builder",
+            "auto-reviewer-1": "reviewer",
+        }
+        pm.max_counter.return_value = 3
+
+        a = _make_autoscaler(_pm=pm, node_id="node-x")
+        a._adopt_existing()
+
+        assert "auto-builder-3" in a.managed
+        assert a.managed["auto-builder-3"].role == "builder"
+        assert a.managed["auto-builder-3"].worker_id == "node-x/auto-builder-3"
+        assert "auto-reviewer-1" in a.managed
+        assert a._counter == 3
+
+    def test_adopt_existing_no_workers_leaves_counter_zero(self):
+        pm = _mock_pm()
+        pm.adopt_existing.return_value = {}
+        pm.max_counter.return_value = 0
+
+        a = _make_autoscaler(_pm=pm)
+        a._adopt_existing()
+
+        assert a.managed == {}
+        assert a._counter == 0
+
+    def test_adopt_existing_bumps_counter_from_max(self):
+        pm = _mock_pm()
+        pm.adopt_existing.return_value = {"auto-builder-7": "builder"}
+        pm.max_counter.return_value = 7
+
+        a = _make_autoscaler(_pm=pm)
+        a._adopt_existing()
+
+        assert a._counter == 7
