@@ -757,13 +757,15 @@ class WorkerRuntime:
             )
 
         agent_role = "planner" if is_plan else ("reviewer" if is_review else "worker")
+        use_stdin = False
         if self.agent_type == "claude-code":
             cmd = [
                 "claude", "-p",
                 "--agent", agent_role,
                 "--permission-mode", "bypassPermissions",
-                prompt,
             ]
+            # Pass prompt via stdin to avoid OS arg length limits on large specs
+            use_stdin = True
         elif self.agent_type == "codex":
             cmd = ["codex", "--approval-mode", "full-auto", "--quiet", prompt]
         elif self.agent_type == "aider":
@@ -786,6 +788,7 @@ class WorkerRuntime:
             capture_output=True,
             text=True,
             env=env,
+            input=prompt if use_stdin else None,
         )
 
         return AgentResult(
