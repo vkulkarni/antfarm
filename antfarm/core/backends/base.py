@@ -154,6 +154,30 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
+    def rereview(
+        self,
+        review_task_id: str,
+        new_spec: str,
+        touches: list[str],
+    ) -> None:
+        """Re-ready an existing review task for a re-attempted parent task.
+
+        Used when the parent task has a new current_attempt (new SHA) that
+        needs re-review. Moves the review task back to the ready queue,
+        supersedes its current attempt (if any), and updates the spec/touches
+        to reference the new parent attempt.
+
+        Args:
+            review_task_id: ID of the existing review task (e.g. 'review-task-001').
+            new_spec: Replacement spec text referencing the new parent attempt.
+            touches: Replacement touches list.
+
+        Raises:
+            FileNotFoundError: If the review task does not exist.
+        """
+        ...
+
+    @abstractmethod
     def pause_task(self, task_id: str) -> None:
         """Pause an active task. Moves task to PAUSED state.
 

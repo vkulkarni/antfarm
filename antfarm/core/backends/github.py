@@ -920,6 +920,14 @@ class GitHubBackend(TaskBackend):
             "guards": len(self._guards),
         }
 
+    def rereview(
+        self,
+        review_task_id: str,
+        new_spec: str,
+        touches: list[str],
+    ) -> None:
+        raise NotImplementedError(_GITHUB_BACKEND_MSG)
+
     # ------------------------------------------------------------------
     # Missions (not supported — stubs raise)
     # ------------------------------------------------------------------

@@ -280,6 +280,11 @@ class MergeRequest(BaseModel):
     attempt_id: str
 
 
+class RereviewRequest(BaseModel):
+    spec: str
+    touches: list[str] = []
+
+
 class ReassignRequest(BaseModel):
     worker_id: str
 
@@ -617,6 +622,16 @@ def get_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": True}
+
+    @app.post("/tasks/{task_id}/rereview", status_code=200)
+    def rereview_task(task_id: str, req: RereviewRequest):
+        """Re-ready an existing review task with an updated spec + touches."""
+        with _lock:
+            try:
+                _backend.rereview(task_id, req.spec, req.touches)
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"ok": True}
 
     @app.post("/tasks/{task_id}/merge", status_code=200)

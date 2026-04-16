@@ -239,6 +239,36 @@ class Soldier:
                 results.append((task_id, MergeResult.NEEDS_REVIEW))
                 continue
 
+            # Review task exists — if its embedded Attempt-SHA differs from
+            # the parent's current attempt SHA, the review is stale
+            # (parent was re-attempted after this review was created).
+            # Re-ready the review task instead of consuming its stale
+            # verdict against the new attempt.
+            existing_sha = self._extract_attempt_sha_from_spec(
+                review_task.get("spec", "")
+            )
+            current_sha = self._current_attempt_sha(task)
+            if existing_sha and current_sha and existing_sha != current_sha:
+                try:
+                    new_spec = self._build_review_spec(task)
+                    self.colony.rereview(
+                        review_task_id, new_spec, task.get("touches", [])
+                    )
+                    logger.info(
+                        "re-readied review task %s for new attempt "
+                        "(sha %s -> %s) from run_once_with_review",
+                        review_task_id,
+                        existing_sha[:12],
+                        current_sha[:12],
+                    )
+                except Exception:
+                    logger.exception(
+                        "failed to re-review %s from run_once_with_review",
+                        review_task_id,
+                    )
+                results.append((task_id, MergeResult.NEEDS_REVIEW))
+                continue
+
             # Review task exists — check its status.
             review_status = review_task.get("status", "")
             if review_status == "blocked":
@@ -677,15 +707,89 @@ class Soldier:
 
         return True, "review passed"
 
-    def create_review_task(self, task: dict) -> str | None:
-        """Create a review task in the queue for a done task.
+    _SHA_MARKER = "Attempt-SHA:"
 
-        Idempotent: if review-{task_id} already exists, returns None without error.
+    @classmethod
+    def _extract_attempt_sha_from_spec(cls, spec: str) -> str:
+        """Return the embedded Attempt-SHA from a review task spec, or ''."""
+        if not spec:
+            return ""
+        marker = cls._SHA_MARKER
+        for raw in spec.splitlines():
+            line = raw.strip()
+            if line.startswith(marker):
+                return line[len(marker):].strip()
+        return ""
+
+    def _current_attempt_sha(self, task: dict) -> str:
+        """Return a stable per-attempt discriminator.
+
+        Prefers the artifact's head_commit_sha; falls back to the attempt's
+        branch name (branches are per-attempt in Antfarm: feat/<task>-<attempt>).
+        """
+        artifact_dict = self._get_attempt_artifact(task)
+        if artifact_dict:
+            sha = artifact_dict.get("head_commit_sha") or ""
+            if sha:
+                return sha
+        return self._get_attempt_branch(task) or ""
+
+    def _build_review_spec(self, task: dict) -> str:
+        """Build the review task spec for ``task``'s current attempt."""
+        task_id = task["id"]
+        branch = self._get_attempt_branch(task) or ""
+        pr = ""
+        for a in task.get("attempts", []):
+            if a.get("attempt_id") == task.get("current_attempt"):
+                pr = a.get("pr", "")
+                break
+        sha = self._current_attempt_sha(task)
+
+        artifact_dict = self._get_attempt_artifact(task)
+        review_pack_text = ""
+        if artifact_dict:
+            from antfarm.core.models import TaskArtifact
+            from antfarm.core.review_pack import generate_review_pack
+
+            try:
+                artifact = TaskArtifact.from_dict(artifact_dict)
+                review_pack_text = generate_review_pack(artifact, task.get("title", ""))
+            except Exception:
+                pass
+
+        spec = (
+            f"Review task {task_id}: '{task.get('title', '')}'\n\n"
+            f"Branch: {branch}\n"
+            f"PR: {pr}\n"
+            f"{self._SHA_MARKER} {sha}\n\n"
+        )
+        if review_pack_text:
+            spec += f"{review_pack_text}\n\n"
+        spec += (
+            "Instructions:\n"
+            "1. Read the PR diff\n"
+            "2. Check for bugs, security issues, and design problems\n"
+            "3. Run tests to verify\n"
+            "4. Produce a ReviewVerdict (pass/needs_changes/blocked)\n"
+            "5. Output verdict between [REVIEW_VERDICT] and [/REVIEW_VERDICT] tags\n"
+        )
+        return spec
+
+    def create_review_task(self, task: dict) -> str | None:
+        """Create (or re-ready) a review task for a done task.
+
+        If no review task exists, create a new one.
+        If a review task exists:
+          - Same attempt SHA as current → no-op (return None).
+          - Different SHA (parent re-attempted) → re-ready the existing
+            review task via ``backend.rereview`` with a fresh spec.
+
         Includes review pack in the spec when artifact is available.
         Propagates mission_id from the parent task to the review task.
         Suppresses review-task creation when the parent mission is CANCELLED.
 
-        Returns the review task ID, or None if creation failed or already exists.
+        Returns the review task ID, or None if no action was taken or
+        creation failed.
         """
         task_id = task["id"]
         review_task_id = f"review-{task_id}"
@@ -702,46 +806,46 @@ class Soldier:
                 )
                 return None
 
-        # Idempotency: skip if review task already exists
+        spec = self._build_review_spec(task)
+        touches = task.get("touches", [])
+
         existing = self.colony.get_task(review_task_id)
         if existing is not None:
-            return None
-
-        branch = self._get_attempt_branch(task) or ""
-        pr = ""
-        for a in task.get("attempts", []):
-            if a.get("attempt_id") == task.get("current_attempt"):
-                pr = a.get("pr", "")
-                break
-
-        # Build spec with review pack if artifact available
-        artifact_dict = self._get_attempt_artifact(task)
-        review_pack_text = ""
-        if artifact_dict:
-            from antfarm.core.models import TaskArtifact
-            from antfarm.core.review_pack import generate_review_pack
-
+            # Compare embedded SHA on existing review task vs current attempt
+            existing_sha = self._extract_attempt_sha_from_spec(
+                existing.get("spec", "")
+            )
+            current_sha = self._current_attempt_sha(task)
+            if not existing_sha:
+                # Legacy review task predates the Attempt-SHA marker.
+                # Don't bounce it — leave it to complete on its own terms.
+                return None
+            if not current_sha:
+                # Pathological: parent attempt has neither head_commit_sha
+                # nor branch. Can't safely decide — leave the review alone.
+                logger.warning(
+                    "skipping re-review for %s: parent task %s has no "
+                    "head_commit_sha and no attempt branch",
+                    review_task_id,
+                    task_id,
+                )
+                return None
+            if existing_sha == current_sha:
+                # Already in flight or verdicted for this attempt
+                return None
+            # SHA mismatch (re-attempt) — re-ready the existing review task
             try:
-                artifact = TaskArtifact.from_dict(artifact_dict)
-                review_pack_text = generate_review_pack(artifact, task.get("title", ""))
+                self.colony.rereview(review_task_id, spec, touches)
+                logger.info(
+                    "re-readied review task %s for new attempt (sha %s -> %s)",
+                    review_task_id,
+                    existing_sha[:12],
+                    current_sha[:12],
+                )
+                return review_task_id
             except Exception:
-                pass
-
-        spec = (
-            f"Review task {task_id}: '{task.get('title', '')}'\n\n"
-            f"Branch: {branch}\n"
-            f"PR: {pr}\n\n"
-        )
-        if review_pack_text:
-            spec += f"{review_pack_text}\n\n"
-        spec += (
-            "Instructions:\n"
-            "1. Read the PR diff\n"
-            "2. Check for bugs, security issues, and design problems\n"
-            "3. Run tests to verify\n"
-            "4. Produce a ReviewVerdict (pass/needs_changes/blocked)\n"
-            "5. Output verdict between [REVIEW_VERDICT] and [/REVIEW_VERDICT] tags\n"
-        )
+                logger.exception("failed to re-review %s", review_task_id)
+                return None
 
         try:
             self.colony.carry(
@@ -749,7 +853,7 @@ class Soldier:
                 title=f"Review: {task.get('title', task_id)}",
                 spec=spec,
                 depends_on=[],
-                touches=task.get("touches", []),
+                touches=touches,
                 priority=1,
                 complexity="S",
                 capabilities_required=["review"],
@@ -848,3 +952,11 @@ class _BackendAdapter:
 
     def get_mission(self, mission_id: str) -> dict | None:
         return self._backend.get_mission(mission_id)
+
+    def rereview(
+        self,
+        review_task_id: str,
+        new_spec: str,
+        touches: list[str],
+    ) -> None:
+        self._backend.rereview(review_task_id, new_spec, touches)

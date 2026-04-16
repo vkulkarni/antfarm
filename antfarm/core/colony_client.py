@@ -210,6 +210,19 @@ class ColonyClient:
         r = self._client.post(f"/tasks/{task_id}/merge", json={"attempt_id": attempt_id})
         r.raise_for_status()
 
+    def rereview(
+        self,
+        review_task_id: str,
+        new_spec: str,
+        touches: list[str],
+    ) -> None:
+        """Re-ready an existing review task with an updated spec and touches."""
+        r = self._client.post(
+            f"/tasks/{review_task_id}/rereview",
+            json={"spec": new_spec, "touches": list(touches or [])},
+        )
+        r.raise_for_status()
+
     def list_tasks(self, status: str | None = None) -> list[dict]:
         params = {"status": status} if status else {}
         r = self._client.get("/tasks", params=params)
