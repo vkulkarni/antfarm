@@ -966,7 +966,9 @@ def check_orphan_tmux_sessions(config: dict) -> list[Finding]:
             continue
 
         # Check if this is an antfarm session (matches any known prefix)
-        is_antfarm = any(parse_session_name(name, prefix) is not None for prefix in _ANTFARM_PREFIXES)
+        is_antfarm = any(
+            parse_session_name(name, prefix) is not None for prefix in _ANTFARM_PREFIXES
+        )
         if not is_antfarm:
             continue
 
