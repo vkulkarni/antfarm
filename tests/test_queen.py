@@ -129,14 +129,16 @@ def _make_plan_artifact(
     """Create a PlanArtifact with N proposed tasks."""
     proposed = []
     for i in range(task_count):
-        proposed.append({
-            "title": f"Child task {i + 1}",
-            "spec": f"Implement part {i + 1}",
-            "touches": ["api"],
-            "depends_on": [],
-            "priority": 10,
-            "complexity": "M",
-        })
+        proposed.append(
+            {
+                "title": f"Child task {i + 1}",
+                "spec": f"Implement part {i + 1}",
+                "touches": ["api"],
+                "depends_on": [],
+                "priority": 10,
+                "complexity": "M",
+            }
+        )
     return PlanArtifact(
         plan_task_id=plan_task_id,
         attempt_id=attempt_id,
@@ -278,9 +280,7 @@ def test_queen_planning_harvested_no_review_spawns_children(env):
     backend = env["backend"]
     queen = env["queen"]
 
-    mission = _create_mission(
-        backend, config_overrides={"require_plan_review": False}
-    )
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
     m = backend.get_mission(mission["mission_id"])
 
     # Create and harvest plan task
@@ -347,10 +347,7 @@ def test_queen_planning_plan_task_blocked_fails_mission(env):
     # Simulate plan task being blocked (max attempts exhausted)
     plan_task = backend.get_task(m["plan_task_id"])
     plan_task["status"] = "blocked"
-    plan_task["attempts"] = [
-        {"attempt_id": f"att-{i}", "status": "superseded"}
-        for i in range(3)
-    ]
+    plan_task["attempts"] = [{"attempt_id": f"att-{i}", "status": "superseded"} for i in range(3)]
     _force_task_state(backend, m["plan_task_id"], plan_task)
 
     m = backend.get_mission(mission["mission_id"])
@@ -402,10 +399,7 @@ def test_queen_planning_invalid_artifact_defers_to_kickback(env):
 
     # Check trail entry was appended
     plan_task = backend.get_task(m["plan_task_id"])
-    assert any(
-        "awaiting kickback" in e.get("message", "")
-        for e in plan_task.get("trail", [])
-    )
+    assert any("awaiting kickback" in e.get("message", "") for e in plan_task.get("trail", []))
 
 
 # ---------------------------------------------------------------------------
@@ -465,8 +459,7 @@ def test_queen_review_task_blocked_fails_with_system_prefix(env):
     review_task = backend.get_task(review_task_id)
     review_task["status"] = "blocked"
     review_task["attempts"] = [
-        {"attempt_id": f"att-r{i}", "status": "superseded"}
-        for i in range(3)
+        {"attempt_id": f"att-r{i}", "status": "superseded"} for i in range(3)
     ]
     _force_task_state(backend, review_task_id, review_task)
 
@@ -646,9 +639,7 @@ def test_queen_building_all_merged_completes(env):
     backend = env["backend"]
     queen = env["queen"]
 
-    mission = _create_mission(
-        backend, config_overrides={"require_plan_review": False}
-    )
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
     m = backend.get_mission(mission["mission_id"])
 
     # Get to BUILDING state
@@ -707,9 +698,7 @@ def test_queen_building_mixed_merged_blocked_completes(env):
     backend = env["backend"]
     queen = env["queen"]
 
-    mission = _create_mission(
-        backend, config_overrides={"require_plan_review": False}
-    )
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
     m = backend.get_mission(mission["mission_id"])
 
     queen._advance(m)
@@ -728,8 +717,15 @@ def test_queen_building_mixed_merged_blocked_completes(env):
     child1["status"] = "done"
     child1["current_attempt"] = "att-c0"
     child1["attempts"] = [
-        {"attempt_id": "att-c0", "status": "merged", "branch": "b", "pr": "p",
-         "started_at": _now_iso(), "completed_at": _now_iso(), "worker_id": "w"}
+        {
+            "attempt_id": "att-c0",
+            "status": "merged",
+            "branch": "b",
+            "pr": "p",
+            "started_at": _now_iso(),
+            "completed_at": _now_iso(),
+            "worker_id": "w",
+        }
     ]
     _force_task_state(backend, child1_id, child1)
 
@@ -739,8 +735,13 @@ def test_queen_building_mixed_merged_blocked_completes(env):
     child2["status"] = "blocked"
     child2["blocked_reason"] = "max attempts exhausted"
     child2["attempts"] = [
-        {"attempt_id": "att-c1", "status": "superseded",
-         "started_at": _now_iso(), "completed_at": _now_iso(), "worker_id": "w"}
+        {
+            "attempt_id": "att-c1",
+            "status": "superseded",
+            "started_at": _now_iso(),
+            "completed_at": _now_iso(),
+            "worker_id": "w",
+        }
     ]
     _force_task_state(backend, child2_id, child2)
 
@@ -761,9 +762,7 @@ def test_queen_building_some_in_flight_stays_building(env):
     backend = env["backend"]
     queen = env["queen"]
 
-    mission = _create_mission(
-        backend, config_overrides={"require_plan_review": False}
-    )
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
     m = backend.get_mission(mission["mission_id"])
 
     queen._advance(m)
@@ -1027,8 +1026,15 @@ def test_queen_all_or_nothing_treated_as_best_effort(env):
     child1["status"] = "done"
     child1["current_attempt"] = "att-c0"
     child1["attempts"] = [
-        {"attempt_id": "att-c0", "status": "merged", "branch": "b", "pr": "p",
-         "started_at": _now_iso(), "completed_at": _now_iso(), "worker_id": "w"}
+        {
+            "attempt_id": "att-c0",
+            "status": "merged",
+            "branch": "b",
+            "pr": "p",
+            "started_at": _now_iso(),
+            "completed_at": _now_iso(),
+            "worker_id": "w",
+        }
     ]
     _force_task_state(backend, child1_id, child1)
 
@@ -1045,3 +1051,194 @@ def test_queen_all_or_nothing_treated_as_best_effort(env):
     m = backend.get_mission(mission["mission_id"])
     # all_or_nothing treated as best_effort in v0.6.0
     assert m["status"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Mission context blob generation (issue #219)
+# ---------------------------------------------------------------------------
+
+
+def _make_queen_with_data_dir(backend, tmp_path, subdir: str = ".antfarm"):
+    """Build a Queen wired to a specific data_dir / repo_path for context tests."""
+    data_dir = str(tmp_path / subdir)
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir(exist_ok=True)
+    queen = Queen(
+        backend,
+        config=QueenConfig(),
+        data_dir=data_dir,
+        repo_path=str(repo_dir),
+        integration_branch="main",
+    )
+    return queen, data_dir
+
+
+def test_queen_writes_context_on_transition_to_building(env, tmp_path):
+    """When Queen flips a mission to BUILDING (no plan review), context is written."""
+    backend = env["backend"]
+    queen, data_dir = _make_queen_with_data_dir(backend, tmp_path)
+
+    mission = _create_mission(
+        backend,
+        config_overrides={"require_plan_review": False},
+    )
+    m = backend.get_mission(mission["mission_id"])
+
+    queen._advance(m)  # create plan task
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # transition to BUILDING, should write context
+
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] == "building"
+
+    import os as _os
+
+    context_path = _os.path.join(data_dir, "missions", f"{mission['mission_id']}_context.md")
+    assert _os.path.isfile(context_path)
+    with open(context_path) as f:
+        body = f.read()
+    assert "Mission Context" in body
+
+
+def test_queen_writes_context_after_plan_review_pass(env, tmp_path):
+    """Review verdict=pass path writes the mission context blob."""
+    backend = env["backend"]
+    queen, data_dir = _make_queen_with_data_dir(backend, tmp_path)
+
+    mission = _create_mission(backend)
+    m = backend.get_mission(mission["mission_id"])
+
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # to REVIEWING_PLAN
+
+    review_task_id = f"review-plan-{mission['mission_id']}"
+    _set_review_verdict_on_task(backend, review_task_id, _make_review_verdict("pass"))
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # review=pass → BUILDING
+
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] == "building"
+
+    import os as _os
+
+    context_path = _os.path.join(data_dir, "missions", f"{mission['mission_id']}_context.md")
+    assert _os.path.isfile(context_path)
+
+
+def test_queen_writes_context_on_re_plan(env, tmp_path):
+    """After needs_changes → re-plan → PASS, context is (re)written."""
+    backend = env["backend"]
+    queen, data_dir = _make_queen_with_data_dir(backend, tmp_path)
+
+    mission = _create_mission(backend)
+    m = backend.get_mission(mission["mission_id"])
+
+    # Cycle 1: plan → review → needs_changes → re-plan
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact1 = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact1)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # → REVIEWING_PLAN
+
+    review_task_id = f"review-plan-{mission['mission_id']}"
+    _set_review_verdict_on_task(
+        backend, review_task_id, _make_review_verdict("needs_changes", "fix it")
+    )
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # → PLANNING (re-plan)
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] == "planning"
+    assert m["re_plan_count"] == 1
+
+    # Cycle 2: new plan completes, no-review path to BUILDING — flip
+    # require_plan_review so re-plan path has a simpler terminal transition.
+    # We harvest the re-plan task with a fresh artifact.
+    queen._advance(m)  # creates re-plan task
+    m = backend.get_mission(mission["mission_id"])
+    new_plan_task_id = m["plan_task_id"]
+    artifact2 = _make_plan_artifact(plan_task_id=new_plan_task_id, task_count=3)
+    _harvest_plan_task_with_artifact(backend, new_plan_task_id, artifact2)
+
+    # For the re-plan, require_plan_review defaults stay True, so go through
+    # reviewing again and mark pass.
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # → REVIEWING_PLAN
+    review_task_id2 = f"review-plan-{mission['mission_id']}"
+    # Reset review verdict with pass
+    _set_review_verdict_on_task(backend, review_task_id2, _make_review_verdict("pass"))
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # → BUILDING, writes context
+
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] == "building"
+
+    import os as _os
+
+    context_path = _os.path.join(data_dir, "missions", f"{mission['mission_id']}_context.md")
+    assert _os.path.isfile(context_path)
+
+
+def test_queen_populates_mission_context_path(env, tmp_path):
+    """After writing context, mission.mission_context_path points to on-disk file."""
+    backend = env["backend"]
+    queen, data_dir = _make_queen_with_data_dir(backend, tmp_path)
+
+    mission = _create_mission(
+        backend,
+        config_overrides={"require_plan_review": False},
+    )
+    m = backend.get_mission(mission["mission_id"])
+
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    m = backend.get_mission(mission["mission_id"])
+    assert m.get("mission_context_path") is not None
+
+    import os as _os
+
+    assert _os.path.isfile(m["mission_context_path"])
+    # Must be under the configured data_dir, not the cwd
+    assert m["mission_context_path"].startswith(data_dir)
+
+
+def test_queen_context_written_in_correct_data_dir(env, tmp_path):
+    """Context file lands under configured data_dir, not ./.antfarm (cwd-relative)."""
+    backend = env["backend"]
+    queen, data_dir = _make_queen_with_data_dir(backend, tmp_path, subdir=".custom")
+
+    mission = _create_mission(
+        backend,
+        mission_id="mission-dirpath-001",
+        config_overrides={"require_plan_review": False},
+    )
+    m = backend.get_mission(mission["mission_id"])
+
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    import os as _os
+
+    # The context file must exist under the custom data_dir
+    expected = _os.path.join(data_dir, "missions", f"{mission['mission_id']}_context.md")
+    assert _os.path.isfile(expected)

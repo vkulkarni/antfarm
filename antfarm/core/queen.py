@@ -49,7 +49,7 @@ class QueenConfig:
     active_interval: float = 10.0
     idle_interval: float = 60.0
     max_re_plans: int = 1
-    enable_mission_context: bool = False
+    enable_mission_context: bool = True
 
 
 class Queen:
@@ -304,9 +304,7 @@ class Queen:
         """Check for unblock (operator ran `antfarm unblock`) or timeout."""
         child_tasks = [self.backend.get_task(tid) for tid in mission["task_ids"]]
         child_tasks = [t for t in child_tasks if t is not None and not is_infra_task(t)]
-        in_flight = [
-            t for t in child_tasks if t["status"] in ("ready", "active", "done")
-        ]
+        in_flight = [t for t in child_tasks if t["status"] in ("ready", "active", "done")]
         if in_flight:
             self._transition(mission, MissionStatus.BUILDING)
             return
@@ -335,21 +333,16 @@ class Queen:
 
     # --- progress detection ---
 
-    def _had_progress_since_last_tick(
-        self, mission: dict, child_tasks: list[dict]
-    ) -> bool:
+    def _had_progress_since_last_tick(self, mission: dict, child_tasks: list[dict]) -> bool:
         """Detect if any child task changed status since last tick.
 
         Uses a hash of all child task statuses + attempt counts. Persists the
         hash on the mission so Queen is stateless between ticks.
         """
         status_snapshot = {
-            t["id"]: f"{t['status']}:{len(t.get('attempts', []))}"
-            for t in child_tasks
+            t["id"]: f"{t['status']}:{len(t.get('attempts', []))}" for t in child_tasks
         }
-        current_hash = hashlib.md5(
-            json.dumps(status_snapshot, sort_keys=True).encode()
-        ).hexdigest()
+        current_hash = hashlib.md5(json.dumps(status_snapshot, sort_keys=True).encode()).hexdigest()
 
         last_hash = mission.get("_last_task_status_hash")
         if last_hash is None or last_hash != current_hash:
@@ -397,17 +390,14 @@ class Queen:
             link_task_to_mission(self.backend, task, mission_id)
         return plan_task_id
 
-    def _create_plan_review_task(
-        self, mission: dict, artifact: PlanArtifact
-    ) -> str:
+    def _create_plan_review_task(self, mission: dict, artifact: PlanArtifact) -> str:
         """Create a review task for the plan. Returns the task ID."""
         mission_id = mission["mission_id"]
         review_task_id = f"review-plan-{mission_id}"
 
         proposed = artifact.proposed_tasks
         task_list = "\n".join(
-            f"  {i + 1}. {t.get('title', t.get('id', '?'))}"
-            for i, t in enumerate(proposed)
+            f"  {i + 1}. {t.get('title', t.get('id', '?'))}" for i, t in enumerate(proposed)
         )
 
         now = _now_iso()
@@ -486,9 +476,7 @@ class Queen:
             link_task_to_mission(self.backend, task, mission_id)
         return re_plan_task_id
 
-    def _spawn_child_tasks(
-        self, mission: dict, artifact: PlanArtifact
-    ) -> list[str]:
+    def _spawn_child_tasks(self, mission: dict, artifact: PlanArtifact) -> list[str]:
         """Create child tasks from the plan artifact. Deterministic IDs."""
         mission_id = mission["mission_id"]
         # Extract slug from mission_id: strip the numeric suffix
@@ -520,9 +508,7 @@ class Queen:
                 "priority": proposed.get("priority", 10),
                 "depends_on": resolved_deps,
                 "touches": proposed.get("touches", []),
-                "capabilities_required": proposed.get(
-                    "capabilities_required", []
-                ),
+                "capabilities_required": proposed.get("capabilities_required", []),
                 "created_by": "queen",
                 "status": "ready",
                 "current_attempt": None,
@@ -645,9 +631,7 @@ class Queen:
 
     # --- mission context ---
 
-    def _maybe_generate_context(
-        self, mission: dict, artifact: PlanArtifact | None = None
-    ) -> None:
+    def _maybe_generate_context(self, mission: dict, artifact: PlanArtifact | None = None) -> None:
         """Generate and store mission context blob if feature-flagged on."""
         if not self.config.enable_mission_context:
             return
@@ -669,9 +653,8 @@ class Queen:
                 mission=mission,
                 plan_artifact=plan_dict,
             )
-            store_mission_context(
-                self._data_dir, mission["mission_id"], context
-            )
+            path = store_mission_context(self._data_dir, mission["mission_id"], context)
+            self.backend.update_mission(mission["mission_id"], {"mission_context_path": path})
             logger.info(
                 "queen: stored mission context for %s (%d bytes)",
                 mission["mission_id"],
@@ -712,9 +695,7 @@ class Queen:
             MissionStatus.FAILED,
             extras={"completed_at": _now_iso(), "failure_reason": reason},
         )
-        logger.error(
-            "queen: mission %s FAILED: %s", mission["mission_id"], reason
-        )
+        logger.error("queen: mission %s FAILED: %s", mission["mission_id"], reason)
 
     # --- adaptive polling ---
 
@@ -736,10 +717,7 @@ class Queen:
     @staticmethod
     def _has_merged_attempt(task: dict) -> bool:
         """Return True if the task has at least one attempt with status MERGED."""
-        return any(
-            attempt.get("status") == "merged"
-            for attempt in task.get("attempts", [])
-        )
+        return any(attempt.get("status") == "merged" for attempt in task.get("attempts", []))
 
     @staticmethod
     def _get_current_artifact(task: dict) -> dict | None:

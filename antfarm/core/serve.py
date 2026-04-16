@@ -52,13 +52,15 @@ def _emit_event(event_type: str, task_id: str, detail: str = "") -> None:
     """Append an event to the SSE event bus."""
     global _event_counter
     _event_counter += 1
-    _event_queue.append({
-        "id": _event_counter,
-        "type": event_type,
-        "task_id": task_id,
-        "detail": detail,
-        "ts": _now_iso(),
-    })
+    _event_queue.append(
+        {
+            "id": _event_counter,
+            "type": event_type,
+            "task_id": task_id,
+            "detail": detail,
+            "ts": _now_iso(),
+        }
+    )
 
 
 def _start_soldier_thread(backend: TaskBackend, data_dir: str) -> None:
@@ -95,9 +97,7 @@ _doctor_thread: threading.Thread | None = None
 _doctor_status: str = "not started"
 
 
-def _start_doctor_thread(
-    backend: TaskBackend, data_dir: str, interval: float = 300.0
-) -> None:
+def _start_doctor_thread(backend: TaskBackend, data_dir: str, interval: float = 300.0) -> None:
     """Start the Doctor as a daemon thread (singleton guard)."""
     global _doctor_thread, _doctor_status
 
@@ -132,13 +132,16 @@ def _start_doctor_thread(
         except Exception as e:
             _doctor_status = f"error: {e}"
 
-    _doctor_thread = threading.Thread(
-        target=_doctor_loop, daemon=True, name="doctor"
-    )
+    _doctor_thread = threading.Thread(target=_doctor_loop, daemon=True, name="doctor")
     _doctor_thread.start()
 
 
-def _start_queen_thread(backend: TaskBackend) -> None:
+def _start_queen_thread(
+    backend: TaskBackend,
+    data_dir: str = ".antfarm",
+    repo_path: str = ".",
+    integration_branch: str = "main",
+) -> None:
     """Start the Queen as a daemon thread (singleton guard)."""
     global _queen_thread, _queen_status
 
@@ -147,7 +150,12 @@ def _start_queen_thread(backend: TaskBackend) -> None:
 
     from antfarm.core.queen import Queen
 
-    queen = Queen(backend)
+    queen = Queen(
+        backend,
+        data_dir=data_dir,
+        repo_path=repo_path,
+        integration_branch=integration_branch,
+    )
 
     def _queen_loop():
         global _queen_status
@@ -158,9 +166,7 @@ def _start_queen_thread(backend: TaskBackend) -> None:
             _queen_status = f"error: {e}"
             logger.error("queen thread crashed: %s", e)
 
-    _queen_thread = threading.Thread(
-        target=_queen_loop, daemon=True, name="queen"
-    )
+    _queen_thread = threading.Thread(target=_queen_loop, daemon=True, name="queen")
     _queen_thread.start()
 
 
@@ -194,9 +200,7 @@ def _start_autoscaler_thread(
             _autoscaler_status = f"error: {e}"
             logger.error("autoscaler thread crashed: %s", e)
 
-    _autoscaler_thread = threading.Thread(
-        target=_autoscaler_loop, daemon=True, name="autoscaler"
-    )
+    _autoscaler_thread = threading.Thread(target=_autoscaler_loop, daemon=True, name="autoscaler")
     _autoscaler_thread.start()
 
 
@@ -359,12 +363,16 @@ def get_app(
         _backend = FileBackend(root=data_dir)
 
     # Load max_attempts default from config
+    repo_path = "."
+    integration_branch = "main"
     config_path = os.path.join(data_dir, "config.json")
     if os.path.exists(config_path):
         try:
             with open(config_path) as f:
                 cfg = json.load(f)
             _max_attempts = cfg.get("max_attempts", 3)
+            repo_path = cfg.get("repo_path", repo_path)
+            integration_branch = cfg.get("integration_branch", integration_branch)
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -387,7 +395,12 @@ def get_app(
         if isinstance(_backend, GitHubBackend):
             logger.info("queen: skipping — GitHubBackend not supported in v0.6.0")
         else:
-            _start_queen_thread(_backend)
+            _start_queen_thread(
+                _backend,
+                data_dir=data_dir,
+                repo_path=repo_path,
+                integration_branch=integration_branch,
+            )
 
     if autoscaler_config is not None and autoscaler_config.enabled:
         _start_autoscaler_thread(_backend, autoscaler_config)
@@ -599,15 +612,9 @@ def get_app(
     @app.post("/tasks/{task_id}/kickback", status_code=200)
     def kickback_task(task_id: str, req: KickbackRequest):
         """Return a task to ready (or blocked if max attempts exhausted)."""
-        effective = (
-            req.max_attempts
-            if req.max_attempts is not None
-            else _max_attempts
-        )
+        effective = req.max_attempts if req.max_attempts is not None else _max_attempts
         try:
-            _backend.kickback(
-                task_id, req.reason, max_attempts=effective
-            )
+            _backend.kickback(task_id, req.reason, max_attempts=effective)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         _emit_event("kickback", task_id, req.reason)
@@ -848,9 +855,7 @@ def get_app(
         """Get a mission by ID. Returns 404 if not found."""
         mission = _backend.get_mission(mission_id)
         if mission is None:
-            raise HTTPException(
-                status_code=404, detail=f"Mission '{mission_id}' not found"
-            )
+            raise HTTPException(status_code=404, detail=f"Mission '{mission_id}' not found")
         return mission
 
     @app.patch("/missions/{mission_id}", status_code=200)
@@ -867,9 +872,7 @@ def get_app(
         """Cancel a mission. Idempotent for terminal states."""
         mission = _backend.get_mission(mission_id)
         if mission is None:
-            raise HTTPException(
-                status_code=404, detail=f"Mission '{mission_id}' not found"
-            )
+            raise HTTPException(status_code=404, detail=f"Mission '{mission_id}' not found")
         terminal = {"complete", "failed", "cancelled"}
         if mission["status"] in terminal:
             return {"ok": True}
@@ -892,14 +895,10 @@ def get_app(
         """Return mission report or 404 if not yet generated."""
         mission = _backend.get_mission(mission_id)
         if mission is None:
-            raise HTTPException(
-                status_code=404, detail=f"Mission '{mission_id}' not found"
-            )
+            raise HTTPException(status_code=404, detail=f"Mission '{mission_id}' not found")
         report = mission.get("report")
         if report is None:
-            raise HTTPException(
-                status_code=404, detail=f"No report for mission '{mission_id}'"
-            )
+            raise HTTPException(status_code=404, detail=f"No report for mission '{mission_id}'")
         return report
 
     # ------------------------------------------------------------------

@@ -186,7 +186,9 @@ def test_worker_prepends_context(tmp_path):
                 params=dict(request.url.params),
             )
             return httpx.Response(
-                resp.status_code, headers=dict(resp.headers), content=resp.content,
+                resp.status_code,
+                headers=dict(resp.headers),
+                content=resp.content,
             )
 
     http_client = httpx.Client(transport=_Transport(app), base_url="http://test")
@@ -205,16 +207,22 @@ def test_worker_prepends_context(tmp_path):
 
     # Create mission first, then carry a builder task linked to it
     tc = TestClient(app)
-    tc.post("/missions", json={
-        "mission_id": "mission-test-1",
-        "spec": "Build auth module",
-    })
-    tc.post("/tasks", json={
-        "id": "task-build-01",
-        "title": "Build auth",
-        "spec": "implement auth module",
-        "mission_id": "mission-test-1",
-    })
+    tc.post(
+        "/missions",
+        json={
+            "mission_id": "mission-test-1",
+            "spec": "Build auth module",
+        },
+    )
+    tc.post(
+        "/tasks",
+        json={
+            "id": "task-build-01",
+            "title": "Build auth",
+            "spec": "implement auth module",
+            "mission_id": "mission-test-1",
+        },
+    )
 
     captured_prompts: list[str] = []
 
@@ -236,6 +244,7 @@ def test_worker_prepends_context(tmp_path):
     rt._launch_agent = capturing_launch
 
     import antfarm.core.worker as worker_mod
+
     original_sleep = worker_mod.time.sleep
     worker_mod.time.sleep = lambda _s: None
     try:
@@ -281,7 +290,9 @@ def test_worker_skips_context_for_planner(tmp_path):
                 params=dict(request.url.params),
             )
             return httpx.Response(
-                resp.status_code, headers=dict(resp.headers), content=resp.content,
+                resp.status_code,
+                headers=dict(resp.headers),
+                content=resp.content,
             )
 
     http_client = httpx.Client(transport=_Transport(app), base_url="http://test")
@@ -301,17 +312,23 @@ def test_worker_skips_context_for_planner(tmp_path):
 
     # Create mission first, then carry a plan task
     tc = TestClient(app)
-    tc.post("/missions", json={
-        "mission_id": "mission-test-2",
-        "spec": "decompose the spec",
-    })
-    tc.post("/tasks", json={
-        "id": "plan-test-2",
-        "title": "Plan mission",
-        "spec": "decompose the spec",
-        "capabilities_required": ["plan"],
-        "mission_id": "mission-test-2",
-    })
+    tc.post(
+        "/missions",
+        json={
+            "mission_id": "mission-test-2",
+            "spec": "decompose the spec",
+        },
+    )
+    tc.post(
+        "/tasks",
+        json={
+            "id": "plan-test-2",
+            "title": "Plan mission",
+            "spec": "decompose the spec",
+            "capabilities_required": ["plan"],
+            "mission_id": "mission-test-2",
+        },
+    )
 
     context_was_fetched = []
 
@@ -329,6 +346,7 @@ def test_worker_skips_context_for_planner(tmp_path):
     rt._launch_agent = mock_launch
 
     import antfarm.core.worker as worker_mod
+
     worker_mod.time.sleep = lambda _s: None
     try:
         rt.run()
@@ -345,10 +363,10 @@ def test_worker_skips_context_for_planner(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_context_disabled_by_default():
-    """QueenConfig.enable_mission_context is False by default."""
+def test_context_enabled_by_default():
+    """QueenConfig.enable_mission_context is True by default (v0.6.1+)."""
     config = QueenConfig()
-    assert config.enable_mission_context is False
+    assert config.enable_mission_context is True
 
 
 # ---------------------------------------------------------------------------
