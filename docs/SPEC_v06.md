@@ -47,7 +47,7 @@ A mission is a complete unit of work: one spec, one plan, all implementation tas
 |---------|-------|-------|
 | **v0.5.9** | Safety hardening | Max attempts + `blocked`, doctor daemon, cascade invalidation |
 | **v0.6.0** | Autonomous runs | Mission model, Queen controller, plan review, single-host autoscaler, morning digest |
-| **v0.6.1** | Scale + integration | Node agent, multi-node autoscaler, GitHub issue sync |
+| **v0.6.1** | Scale + integration | Runner, multi-node autoscaler, prompt cache sharing |
 | **v0.6.2** | Claude Code plugin | MCP server, slash commands, hooks (full spec: SPEC_v06_plugin.md) |
 
 ---
@@ -785,33 +785,68 @@ mission_id: str | None = None  # reverse linkage to mission
 
 ## v0.6.1 — Scale + Integration
 
-**Goal:** Multi-node scaling and GitHub integration.
+**Goal:** Multi-node scaling and prompt cache optimization.
 
-### 1. Node Agent
+**Scope:** Runner, multi-node autoscaler, prompt cache sharing. GitHub Issue Sync deferred to v0.6.2+.
 
-A lightweight daemon running on each worker machine.
+### 1. Runner
+
+A lightweight daemon running on each remote worker machine. The term "Runner" follows established CI convention (GitHub Actions Runner, GitLab Runner). It replaces the earlier "Node Agent" name.
 
 ```
-antfarm node-agent --colony-url http://colony:7433 --repo-path /path/to/repo
+antfarm runner --colony-url http://colony:7433 --repo-path /path/to/repo
 ```
 
 **Responsibilities:**
 - Register node with colony on startup
-- Accept worker start/stop commands from autoscaler
-- Manage local `WorkerRuntime` processes
-- Report node capacity (CPU count, available memory, running workers)
+- Reconcile local worker processes to match colony-published desired state
+- Restart crashed worker processes locally (self-healing)
+- Report actual state, capacity, and health back to colony
 - Keep local git repo in sync (`git fetch origin` periodically)
+- Support drain mode for graceful downscaling
 
-**API (node-local, not exposed to internet):**
+**The Runner does NOT make scaling decisions.** Colony decides what should run; Runner decides how to converge locally.
+
+**Desired-state protocol:**
+
+The Colony publishes per-node desired state rather than imperative start/stop commands. This provides idempotency, network-loss recovery, and local self-healing.
+
+```json
+{
+  "generation": 17,
+  "desired": {
+    "builder": 2,
+    "reviewer": 1,
+    "planner": 0
+  },
+  "drain": []
+}
+```
+
+The Runner reconciles local processes to match:
+1. Compare desired counts vs actual running processes per role
+2. Start missing workers
+3. Stop excess workers (idle only — drain, don't kill)
+4. Report back `applied_generation` and actual state
+
+**Generation numbers** prevent stale updates from winning during reconnects. The Runner only applies state with a generation >= its last applied generation.
+
+**Process adoption:** Runner writes PID files for each managed worker. On restart, it scans PID files, validates processes are alive, and adopts them. No generic process scanning.
+
+**Security:** Runner binds to `127.0.0.1` by default. No authentication in v0.6.1 (trusted private network only). Operators must explicitly bind to a LAN address for multi-node use.
+
+**API (node-local, binds to loopback by default):**
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/workers/start` | Start a worker process |
-| POST | `/workers/stop` | Stop a worker process |
-| GET | `/workers` | List running workers |
-| GET | `/capacity` | Report node capacity |
+| PUT | `/desired-state` | Receive desired worker state from colony |
+| GET | `/actual-state` | Report running workers, capacity, applied generation |
+| GET | `/capacity` | Report CPU count, memory, max workers |
+| GET | `/health` | Runner liveness check |
 
-**Colony tracks node agent URLs:**
+**Drain behavior:** When downscaling, the Runner only stops idle workers (no active task). Workers with active tasks finish their current task before being stopped. This prevents expensive task interruption.
+
+**Colony tracks Runner URLs:**
 ```python
 # Extended Node model:
 @dataclass
@@ -819,31 +854,59 @@ class Node:
     node_id: str
     joined_at: str
     last_seen: str
-    agent_url: str | None = None     # "http://192.168.1.10:7434"
+    runner_url: str | None = None    # "http://192.168.1.10:7434"
     max_workers: int = 4
     capabilities: list[str] = field(default_factory=list)  # e.g. ["gpu", "docker"]
 ```
 
 ### 2. Multi-Node Autoscaler
 
-Extends the single-host autoscaler to distribute across nodes.
+The existing single-host autoscaler is extended with an **Actuator abstraction** to support both local and remote worker management. One autoscaler, shared scaling logic, pluggable execution.
 
-**Distribution strategy:**
+**Architecture:**
+
+```
+Autoscaler (shared scaling logic)
+  ├── compute desired worker counts (scope groups, rate-limit backoff, etc.)
+  ├── PlacementStrategy (decides which node gets what)
+  └── Actuator (executes the decision)
+       ├── LocalActuator  — subprocess.Popen (existing v0.6.0 behavior)
+       └── RemoteActuator — pushes desired state to Runner HTTP API
+```
+
+**Shared logic (MUST be extracted into standalone functions, not duplicated):**
+- Scope-group calculation (union-find by touches)
+- Rate-limit backoff (don't scale up if >50% builders rate-limited)
+- Planner/reviewer minimums
+- Desired count computation per role
+
+Both `Autoscaler` (single-host) and `MultiNodeAutoscaler` call the same extracted functions. Two copies of scaling logic is not acceptable.
+
+**PlacementStrategy:**
 - Round-robin across nodes with available capacity
 - Respect node-level `max_workers` cap
 - Prefer nodes with matching capabilities (e.g., GPU tasks to GPU nodes)
-- If a node is unreachable, skip it and try the next
+- Skip unreachable nodes and try next
+- Rebalance slowly, not aggressively
 
-**The autoscaler calls node agents instead of spawning local subprocesses:**
-
+**Actuator interface (receives runner_url from backend Node records — single source of truth):**
 ```python
-def _start_worker_on_node(self, node: dict, role: str) -> None:
-    url = node["agent_url"]
-    httpx.post(f"{url}/workers/start", json={
-        "type": role,
-        "agent": self.config.agent_type,
-    })
+class Actuator(ABC):
+    @abstractmethod
+    def apply(self, runner_url: str, desired: dict[str, int], generation: int) -> None:
+        """Push desired worker counts to a node."""
+        ...
+
+    @abstractmethod
+    def get_actual(self, runner_url: str) -> dict:
+        """Get actual worker state from a node."""
+        ...
 ```
+
+- `LocalActuator`: calls `subprocess.Popen` / `process.terminate()` directly (existing behavior, wrapped)
+- `RemoteActuator`: pushes desired state to Runner via `PUT /desired-state`, reads actual via `GET /actual-state`
+
+**The single-host autoscaler remains unchanged for v0.6.1.** The actuator abstraction is used only for the multi-node path. Unifying single-host under the same abstraction is a future cleanup.
 
 ### 3. Prompt Cache Sharing for Parallel Builders
 
@@ -857,22 +920,15 @@ Inspired by Claude Code's fork model (which shares KV cache across parallel agen
 
 This is agent-specific — only works with agents that support prompt caching (Claude, potentially others). For agents without caching support, this is a no-op.
 
-**Implementation:** The autoscaler or Queen generates a `mission_context` blob once per build phase. Worker runtime prepends it to the agent prompt. The blob is stored in `.antfarm/missions/{mission_id}_context.md`.
+**Feature-flagged:** `enable_mission_context=False` by default. Off until runner/autoscaler are stable in dogfooding. When disabled, workers proceed without context prefix.
+
+**Implementation:** The Queen generates a `mission_context` blob once per build phase. Worker runtime prepends it to the agent prompt. The blob is stored in `.antfarm/missions/{mission_id}_context.md`.
 
 **Expected savings:** For a mission with 8 builders, ~7x reduction in input token cost for shared context (cached tokens are 10% of input cost on Claude).
 
-### 4. GitHub Issue Sync
+### 4. GitHub Issue Sync (DEFERRED)
 
-**Automatic issue creation:** When a mission creates child tasks, create a GitHub issue for each.
-
-**Issue ↔ Task linkage:**
-- Task `id` stored in issue body metadata
-- Issue number stored on task as `github_issue`
-- Task status changes update issue labels (`ready`, `active`, `done`, `blocked`)
-- Kickbacks add a comment to the issue with the failure reason
-- Merge adds a comment with the PR URL
-
-**Mission-level issue:** A parent issue or project board column for the mission itself, linking to all child issues.
+Deferred to v0.6.2+. Scope: automatic issue creation for mission child tasks, bi-directional task-to-issue linkage, status label updates, kickback/merge comments.
 
 ---
 
