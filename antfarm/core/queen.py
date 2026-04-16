@@ -211,6 +211,12 @@ class Queen:
             return  # active / harvest_pending — still working
 
         verdict = extract_verdict_from_review_task(review_task)
+        # Worker stores review verdict on the *original* task (the plan task),
+        # not the review task. Fall back to checking the plan task's attempt.
+        if verdict is None:
+            plan_task = self.backend.get_task(mission.get("plan_task_id", ""))
+            if plan_task:
+                verdict = self._extract_verdict_from_plan_task(plan_task)
         # (3) Harvested but verdict not yet persisted — retry next tick
         if verdict is None:
             return
@@ -700,6 +706,23 @@ class Queen:
     @staticmethod
     def _plan_review_task_id(mission: dict) -> str:
         return f"review-plan-{mission['mission_id']}"
+
+    @staticmethod
+    def _extract_verdict_from_plan_task(plan_task: dict) -> dict | None:
+        """Extract review verdict from the plan task's current attempt.
+
+        The worker stores the review verdict on the original (plan) task, not
+        on the review task. This is the fallback for plan review detection.
+        """
+        current = plan_task.get("current_attempt")
+        if not current:
+            return None
+        for attempt in plan_task.get("attempts", []):
+            if attempt.get("attempt_id") == current:
+                rv = attempt.get("review_verdict")
+                if rv and isinstance(rv, dict) and "verdict" in rv:
+                    return rv
+        return None
 
     @staticmethod
     def _mission_slug(mission_id: str) -> str:
