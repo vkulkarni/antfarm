@@ -43,7 +43,7 @@ TmuxProcessManager  SubprocessProcessManager
 | Restart adoption | Yes — discovers tmux sessions | **No** — in-memory dict lost on restart |
 | Debug attach | `tmux attach -t name` | Not possible |
 | Process survival | Workers outlive colony | Workers die with colony |
-| Metadata persistence | Metadata files + tmux sessions | Metadata files only (best-effort) |
+| Metadata persistence | Metadata files + tmux sessions | Metadata files (within-process only; discarded on restart) |
 
 SubprocessProcessManager is explicitly a **degraded fallback** that preserves current v0.6.1 behavior. It does not provide restart adoption. This is documented, not hidden.
 
@@ -143,9 +143,10 @@ class ProcessManager(ABC):
 
     Each implementation persists ProcessMetadata files for correct validation
     and cleanup on restart. Reliable restart adoption (discovering and reattaching
-    to workers from a previous run) is only guaranteed for TmuxProcessManager.
-    SubprocessProcessManager writes metadata for PID-based liveness checks but
-    cannot reliably adopt after a colony restart since Popen handles are lost.
+    to workers from a previous run) is only supported by TmuxProcessManager.
+    SubprocessProcessManager explicitly overrides adopt_existing() to return
+    {} — Popen handles are lost on restart and PID reuse makes liveness
+    checks unsafe. See SubprocessProcessManager for rationale.
     """
 
     def __init__(self, prefix: str = "auto-", state_dir: str | None = None):
@@ -376,8 +377,10 @@ class SubprocessProcessManager(ProcessManager):
     """Spawns workers via subprocess.Popen — fallback when tmux unavailable.
 
     IMPORTANT: This is a degraded fallback. It does NOT support restart
-    adoption — the in-memory _processes dict is lost on restart. Workers
-    die with the colony process. Use TmuxProcessManager for production.
+    adoption — the in-memory _processes dict is lost on restart, Popen
+    handles are gone, and PID-based liveness is unsafe (PID reuse).
+    Workers die with the colony process. Use TmuxProcessManager for
+    production.
     """
 
     def __init__(self, prefix: str = "auto-", state_dir: str | None = None):
@@ -398,8 +401,9 @@ class SubprocessProcessManager(ProcessManager):
         process = subprocess.Popen(cmd, stdout=log_file, stderr=log_file)
         self._processes[name] = process
 
-        # Persist metadata — allows _validate_from_metadata on restart
-        # (best-effort: subprocess adoption checks PID liveness)
+        # Persist metadata for liveness queries within this process lifetime
+        # and for doctor/debug tooling. NOT used for restart adoption — see
+        # adopt_existing() override below.
         from datetime import UTC, datetime
         self._write_metadata(ProcessMetadata(
             name=name, role=role, manager_type="subprocess",
@@ -408,6 +412,35 @@ class SubprocessProcessManager(ProcessManager):
 
         logger.info("started subprocess: %s pid=%d", name, process.pid)
         return True
+
+    def adopt_existing(self) -> dict[str, str]:
+        """Subprocess backend does NOT support restart adoption.
+
+        Rationale:
+        - Popen handles are lost on colony restart — stop()/is_alive()
+          would not work for "adopted" processes.
+        - PID-based liveness checks are unsafe: the OS may have reused
+          the PID for an unrelated process, leading to false adoption.
+
+        Behavior: scan subprocess metadata files left by prior runs and
+        remove them (best-effort cleanup), then return empty. Callers
+        that need restart recovery must use TmuxProcessManager.
+        """
+        removed = 0
+        for meta in self._list_metadata():
+            if not meta.name.startswith(self.prefix):
+                continue
+            if meta.manager_type != "subprocess":
+                continue
+            self._remove_metadata(meta.name)
+            removed += 1
+        if removed:
+            logger.info(
+                "subprocess manager: discarded %d stale metadata file(s) "
+                "— restart adoption not supported for subprocess backend",
+                removed,
+            )
+        return {}
 
     def is_alive(self, name: str) -> bool:
         proc = self._processes.get(name)
@@ -661,12 +694,24 @@ def test_subprocess_pm_list_managed():
     pm.stop("auto-builder-1")
     pm.stop("auto-builder-2")
 
-def test_adopt_existing_returns_roles():
-    pm = SubprocessProcessManager()
-    pm.start("auto-builder-1", ["sleep", "60"])
-    pm.start("auto-reviewer-2", ["sleep", "60"])
-    adopted = pm.adopt_existing()
-    assert adopted == {"auto-builder-1": "builder", "auto-reviewer-2": "reviewer"}
+def test_subprocess_adopt_existing_returns_empty(tmp_path):
+    """Subprocess backend intentionally does NOT adopt across restart.
+
+    Verifies the documented contract: SubprocessProcessManager.adopt_existing()
+    returns {} and cleans stale metadata, even when prior metadata files exist.
+    """
+    pm = SubprocessProcessManager(state_dir=str(tmp_path))
+    pm.start("auto-builder-1", ["sleep", "60"], role="builder")
+    pm.start("auto-reviewer-2", ["sleep", "60"], role="reviewer")
+
+    # Simulate "restart" — new pm instance reads metadata but must not adopt
+    pm2 = SubprocessProcessManager(state_dir=str(tmp_path))
+    adopted = pm2.adopt_existing()
+    assert adopted == {}
+    # Stale metadata was cleaned
+    assert pm2._read_metadata("auto-builder-1") is None
+    assert pm2._read_metadata("auto-reviewer-2") is None
+
     pm.stop("auto-builder-1")
     pm.stop("auto-reviewer-2")
 
@@ -780,7 +825,7 @@ PRs 1-2 can be combined. PR 3 follows. PR 4 is trivial.
 | `ANTFARM_NO_TMUX=1` | Forces SubprocessProcessManager even if tmux installed |
 | Session name collision | `start()` returns False. Caller retries once with bumped counter. |
 | Colony restarts (tmux) | `adopt_existing()` reads metadata files + discovers tmux sessions. Full recovery. |
-| Colony restarts (subprocess) | Metadata files exist but PID validation may fail (processes died). **No restart adoption.** Doctor recovers stale tasks. |
+| Colony restarts (subprocess) | `adopt_existing()` returns {} and discards any leftover subprocess metadata. **No restart adoption** (PID reuse is unsafe, Popen handles are lost). Doctor recovers stale tasks. |
 | Runner restarts | Same adoption via ProcessManager metadata files |
 | Worker finishes, session ends | `is_alive()` returns False, `_cleanup_exited()` removes from managed + metadata |
 | `tmux kill-server` externally | All workers die. Metadata files remain. Next adoption cleans stale metadata. Doctor recovers tasks. |
