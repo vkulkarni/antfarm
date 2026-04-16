@@ -48,7 +48,9 @@ A mission is a complete unit of work: one spec, one plan, all implementation tas
 | **v0.5.9** | Safety hardening | Max attempts + `blocked`, doctor daemon, cascade invalidation |
 | **v0.6.0** | Autonomous runs | Mission model, Queen controller, plan review, single-host autoscaler, morning digest |
 | **v0.6.1** | Scale + integration | Runner, multi-node autoscaler, prompt cache sharing |
-| **v0.6.2** | Claude Code plugin | MCP server, slash commands, hooks (full spec: SPEC_v06_plugin.md) |
+| **v0.6.2** | Reliable spawning | tmux-based worker spawning — fixes silent subprocess failures |
+| **v0.6.3** | Operability | Live activity feed, silent failure detection, worker name collision fix, Operator Guide |
+| **v0.6.4** | Claude Code plugin | MCP server, slash commands, hooks (full spec: SPEC_v06_plugin.md), SDK adapter |
 
 ---
 
