@@ -420,13 +420,29 @@ class WorkerRuntime:
                     trail_msg = (
                         f"plan complete: created {len(plan_result['created_ids'])} tasks"
                     )
-                with contextlib.suppress(Exception):
+                try:
                     self.colony.mark_harvest_pending(task_id, attempt_id)
-                with contextlib.suppress(Exception):
+                except Exception as exc:
+                    logger.warning(
+                        "mark_harvest_pending failed task_id=%s attempt_id=%s: %s",
+                        task_id, attempt_id, exc,
+                    )
+                try:
                     self.colony.harvest(
                         task_id, attempt_id, pr="", branch="",
                         artifact=artifact,
                     )
+                    logger.info("plan harvested task_id=%s", task_id)
+                except Exception as exc:
+                    logger.error(
+                        "plan harvest FAILED task_id=%s attempt_id=%s: %s",
+                        task_id, attempt_id, exc,
+                    )
+                    with contextlib.suppress(Exception):
+                        self.colony.trail(
+                            task_id, self.worker_id,
+                            f"plan harvest failed: {exc}",
+                        )
                 with contextlib.suppress(Exception):
                     self.colony.trail(task_id, self.worker_id, trail_msg)
                 return True

@@ -736,6 +736,7 @@ class TestMissingVerdictKickback:
 
         def _fake_run(cmd, **kwargs):
             captured["cmd"] = cmd
+            captured["input"] = kwargs.get("input")
 
             class _P:
                 returncode = 0
@@ -753,7 +754,8 @@ class TestMissingVerdictKickback:
         finally:
             _sp.run = orig
 
-        prompt = captured["cmd"][-1]
+        # claude-code passes prompt via stdin, not as CLI arg
+        prompt = captured.get("input") or captured["cmd"][-1]
         assert "MANDATORY" in prompt
         assert "[REVIEW_VERDICT]" in prompt
         assert "[/REVIEW_VERDICT]" in prompt
