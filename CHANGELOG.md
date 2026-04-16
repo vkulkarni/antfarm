@@ -6,6 +6,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-04-16
+
+### Added
+- **ProcessManager abstraction** (`antfarm/core/process_manager.py`) — uniform interface for spawning, stopping, and adopting worker processes across backends (#204)
+- `TmuxProcessManager` — spawns workers via `tmux new-session -d`, gives each worker a real TTY, enables restart adoption by re-discovering existing sessions (#204)
+- `SubprocessProcessManager` — fallback backend using `subprocess.Popen`; explicitly no restart adoption (degraded mode) (#204)
+- `ProcessMetadata` JSON files in `{state_dir}/processes/` replacing raw PID files; stores manager_type, session/pid, command, started_at
+- `parse_session_name(name, prefix)` helper — caller-supplied prefix, returns `(suffix, index) | None`
+- Doctor check `check_tmux_available` — warns when tmux is not installed (subprocess fallback is less reliable) (via #208)
+- Doctor check `check_orphan_tmux_sessions` — flags tmux sessions with antfarm prefixes (`auto-`, `runner-`) whose ProcessMetadata file is missing (via #208)
+- One-time startup warning in `serve.py` when tmux is unavailable (via #208)
+
+### Changed
+- Autoscaler `_start_worker` / `_stop_worker` / `_adopt_existing` now delegate to the configured ProcessManager (#208)
+- Runner worker spawning now delegates to the configured ProcessManager (#209)
+- Worker process lifecycle is now backend-agnostic — tmux is the default when available, subprocess is the fallback
+
+## [0.6.1] - 2026-04-15
+
+### Added
+- **Runner daemon** — desired-state reconciliation for fixed worker pools; complements the elastic Autoscaler (#183)
+- **Actuator abstraction** — pluggable placement strategies for multi-host worker provisioning (#184, #185)
+- **Multi-node autoscaler** — shared scaling logic works across nodes via shared Actuator (#186)
+- **Prompt cache sharing** — context generation and prepend for worker prompts to maximize cache hits (#187)
+- Node model gains `runner_url`, `max_workers`, `capabilities` fields (#181)
+- Backend gains `list_nodes()`, `get_node()`, extended node registration (#182)
+- Server node endpoints expose the extended Node fields (#182)
+- CLI: `antfarm runner` command + doctor checks + end-to-end tests (#188, #189, #190)
+
+### Fixed
+- Workers no longer exit on empty queue — they poll (#144 / #180)
+- Reviewer retries when `[REVIEW_VERDICT]` tags are missing instead of failing silently (#143 / #179)
+- Missing `planner.md` agent definition caused silent failure; agents now copied into worktrees (#192)
+- `claude -p` prompt now passed via stdin to avoid argv length limits (#192)
+- Planner harvest failures are now logged instead of suppressed; artifact preserved (#195)
+- Doctor encodes slashes in `worker_id` for file lookups — no more false stale recovery (#196)
+- Queen falls back to the plan task when a review verdict is not found on the review task (#197)
+
 ## [0.6.0] - 2026-04-11
 
 ### Added
