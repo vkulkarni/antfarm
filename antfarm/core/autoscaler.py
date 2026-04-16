@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from antfarm.core.backends.base import TaskBackend
+from antfarm.core.process_manager import ProcessManager, get_process_manager
 
 if TYPE_CHECKING:
     from antfarm.core.actuator import Actuator  # noqa: F401
@@ -171,7 +171,6 @@ class ManagedWorker:
     name: str
     role: str  # "planner" | "builder" | "reviewer"
     worker_id: str
-    process: subprocess.Popen
 
 
 class Autoscaler:
@@ -182,6 +181,7 @@ class Autoscaler:
         backend: TaskBackend,
         config: AutoscalerConfig,
         clock=time.time,
+        _pm: ProcessManager | None = None,
     ):
         self.backend = backend
         self.config = config
@@ -189,9 +189,13 @@ class Autoscaler:
         self.managed: dict[str, ManagedWorker] = {}
         self._stopped = False
         self._counter = 0
+        self._pm = _pm if _pm is not None else get_process_manager(
+            prefix="auto-", state_dir=config.data_dir
+        )
 
     def run(self) -> None:
         """Main loop: reconcile desired vs actual workers every poll interval."""
+        self._adopt_existing()
         while not self._stopped:
             try:
                 self._reconcile()
@@ -200,11 +204,17 @@ class Autoscaler:
             time.sleep(self.config.poll_interval)
 
     def stop(self) -> None:
-        """Signal shutdown and terminate all managed workers."""
+        """Shutdown: stop all managed workers.
+
+        Metadata cleanup policy: stop() kills sessions/processes but does NOT
+        remove metadata files. Metadata is cleaned up during the next adoption
+        pass (stale metadata with dead processes gets removed). This is
+        intentional — metadata should outlive the colony process for tmux
+        restart adoption to work. Same policy applies in runner.stop().
+        """
         self._stopped = True
         for mw in list(self.managed.values()):
-            if mw.process.poll() is None:
-                mw.process.terminate()
+            self._pm.stop(mw.name)
 
     # ------------------------------------------------------------------
     # Core reconciliation
@@ -232,6 +242,17 @@ class Autoscaler:
     # Worker lifecycle
     # ------------------------------------------------------------------
 
+    def _adopt_existing(self) -> None:
+        """Adopt workers from a previous colony run."""
+        adopted = self._pm.adopt_existing()
+        max_n = self._pm.max_counter()
+        for name, role in adopted.items():
+            worker_id = f"{self.config.node_id}/{name}"
+            self.managed[name] = ManagedWorker(name=name, role=role, worker_id=worker_id)
+            logger.info("adopted worker %s (role=%s)", name, role)
+        if max_n > 0:
+            self._counter = max_n
+
     def _reconcile_role(self, role: str, desired: int, actual: int) -> None:
         delta = desired - actual
         while delta > 0:
@@ -243,54 +264,46 @@ class Autoscaler:
             delta += 1
 
     def _start_worker(self, role: str) -> None:
-        """Spawn a new worker subprocess for the given role."""
-        self._counter += 1
-        name = f"auto-{role}-{self._counter}"
-        worker_id = f"{self.config.node_id}/{name}"
+        """Spawn a new worker via ProcessManager. Retries once on name collision."""
+        for attempt in range(2):
+            self._counter += 1
+            name = f"auto-{role}-{self._counter}"
+            worker_id = f"{self.config.node_id}/{name}"
 
-        cmd = [
-            "antfarm",
-            "worker",
-            "start",
-            "--agent",
-            self.config.agent_type,
-            "--type",
-            role,
-            "--node",
-            self.config.node_id,
-            "--name",
-            name,
-            "--repo-path",
-            self.config.repo_path,
-            "--integration-branch",
-            self.config.integration_branch,
-            "--workspace-root",
-            self.config.workspace_root,
-            "--colony-url",
-            self.config.colony_url,
-        ]
-        if self.config.token:
-            cmd.extend(["--token", self.config.token])
+            cmd = [
+                "antfarm",
+                "worker",
+                "start",
+                "--agent",
+                self.config.agent_type,
+                "--type",
+                role,
+                "--node",
+                self.config.node_id,
+                "--name",
+                name,
+                "--repo-path",
+                self.config.repo_path,
+                "--integration-branch",
+                self.config.integration_branch,
+                "--workspace-root",
+                self.config.workspace_root,
+                "--colony-url",
+                self.config.colony_url,
+            ]
+            if self.config.token:
+                cmd.extend(["--token", self.config.token])
 
-        # Log to .antfarm/logs/autoscaler-{name}.log
-        log_dir = os.path.join(self.config.data_dir, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, f"autoscaler-{name}.log")
-        log_file = open(log_path, "a")  # noqa: SIM115
+            log_path = os.path.join(self.config.data_dir, "logs", f"autoscaler-{name}.log")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
-        process = subprocess.Popen(
-            cmd,
-            stdout=log_file,
-            stderr=log_file,
-        )
-
-        self.managed[name] = ManagedWorker(
-            name=name,
-            role=role,
-            worker_id=worker_id,
-            process=process,
-        )
-        logger.info("autoscaler started worker name=%s role=%s pid=%d", name, role, process.pid)
+            if self._pm.start(name, cmd, log_path, role=role):
+                self.managed[name] = ManagedWorker(name=name, role=role, worker_id=worker_id)
+                logger.info("autoscaler started worker name=%s role=%s", name, role)
+                return
+            if attempt == 0:
+                logger.info("start failed for %s, retrying with bumped counter", name)
+        logger.warning("failed to start worker after retry — skipping")
 
     def _stop_idle_worker(self, role: str) -> bool:
         """Stop one idle worker of the given role. Returns True if stopped."""
@@ -300,11 +313,11 @@ class Autoscaler:
         for name, mw in list(self.managed.items()):
             if mw.role != role:
                 continue
-            if mw.process.poll() is not None:
+            if not self._pm.is_alive(name):
                 continue  # already exited
             cw = colony_status_map.get(mw.worker_id)
             if cw and cw.get("status") == "idle":
-                mw.process.terminate()
+                self._pm.stop(name)
                 logger.info("autoscaler stopped idle worker name=%s role=%s", name, role)
                 del self.managed[name]
                 return True
@@ -313,20 +326,16 @@ class Autoscaler:
     def _cleanup_exited(self) -> None:
         """Remove managed workers whose processes have exited."""
         for name in list(self.managed):
-            mw = self.managed[name]
-            if mw.process.poll() is not None:
-                logger.info(
-                    "autoscaler cleaned up exited worker name=%s exit=%d",
-                    name,
-                    mw.process.returncode,
-                )
+            if not self._pm.is_alive(name):
+                logger.info("autoscaler cleaned up exited worker name=%s", name)
+                self._pm.cleanup(name)
                 del self.managed[name]
 
     def _count_actual(self) -> dict[str, int]:
         """Count running managed workers by role."""
         counts: dict[str, int] = {}
         for mw in self.managed.values():
-            if mw.process.poll() is None:  # still running
+            if self._pm.is_alive(mw.name):
                 counts[mw.role] = counts.get(mw.role, 0) + 1
         return counts
 
