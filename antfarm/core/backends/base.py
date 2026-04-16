@@ -4,6 +4,15 @@ Defines the TaskBackend interface with explicit mutation methods.
 No generic update(**fields) — each method enforces a valid state transition.
 
 Backend implementations: FileBackend (v0.1), PostgresBackend (v0.2+).
+
+Superseded-PR hygiene:
+    Whenever an implementation transitions an attempt to SUPERSEDED
+    (``kickback``, ``rereview``, ``resume_task``, ``reassign_task``), it
+    SHOULD close the PR associated with that attempt so duplicate PRs do
+    not accumulate. PR close MUST happen outside any internal lock — a
+    subprocess call inside a backend lock would stall every other worker
+    for its duration. Implementations typically delegate to
+    ``antfarm.core.pr_ops.PROps`` injected at construction time.
 """
 
 from abc import ABC, abstractmethod

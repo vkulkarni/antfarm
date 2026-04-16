@@ -21,6 +21,7 @@ GitHub's Link header rel="next" pattern.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import uuid
@@ -35,6 +36,7 @@ from antfarm.core.models import (
     TaskStatus,
     TrailEntry,
 )
+from antfarm.core.pr_ops import NullPROps, PROps
 
 from .base import TaskBackend
 
@@ -107,11 +109,13 @@ class GitHubBackend(TaskBackend):
         repo: str,
         token: str | None = None,
         label_prefix: str = "antfarm:",
+        pr_ops: PROps | None = None,
     ) -> None:
         self._repo = repo
         self._token = token
         self._prefix = label_prefix
         self._lock = threading.Lock()
+        self._pr_ops: PROps = pr_ops or NullPROps()
 
         # In-memory stores for ephemeral state
         self._workers: dict[str, dict] = {}
@@ -122,6 +126,17 @@ class GitHubBackend(TaskBackend):
             headers=self._default_headers(),
             timeout=30.0,
         )
+
+    def _close_superseded_pr(self, attempt: dict | None, reason: str) -> None:
+        """Close the PR on a superseded attempt. Never raises."""
+        if not attempt:
+            return
+        pr = attempt.get("pr")
+        if not pr:
+            return
+        # Never let PR close break a state transition — swallow any error.
+        with contextlib.suppress(Exception):
+            self._pr_ops.close_pr(pr, comment=f"Superseded by antfarm: {reason}")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -541,11 +556,13 @@ class GitHubBackend(TaskBackend):
         now = _now_iso()
         current_attempt_id = task.get("current_attempt")
         worker_id = "system"
+        superseded_attempt: dict | None = None
         for a in task["attempts"]:
             if a["attempt_id"] == current_attempt_id:
                 a["status"] = AttemptStatus.SUPERSEDED.value
                 a["completed_at"] = now
                 worker_id = a.get("worker_id") or "system"
+                superseded_attempt = dict(a)
                 break
 
         trail_entry = TrailEntry(ts=now, worker_id=worker_id, message=reason)
@@ -559,6 +576,8 @@ class GitHubBackend(TaskBackend):
         self._ensure_label(ready_label)
         self._swap_labels(issue_number, ["done"], "ready")
         self._add_comment(issue_number, f"[kickback] {reason}")
+
+        self._close_superseded_pr(superseded_attempt, reason)
 
     def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
         """Mark task as harvest_pending. Updates status in issue body."""
@@ -648,11 +667,13 @@ class GitHubBackend(TaskBackend):
 
         now = _now_iso()
         current_attempt_id = task.get("current_attempt")
+        superseded_attempt: dict | None = None
         if current_attempt_id:
             for a in task["attempts"]:
                 if a["attempt_id"] == current_attempt_id:
                     a["status"] = AttemptStatus.SUPERSEDED.value
                     a["completed_at"] = now
+                    superseded_attempt = dict(a)
                     break
             task["current_attempt"] = None
 
@@ -664,6 +685,8 @@ class GitHubBackend(TaskBackend):
         self._ensure_label(ready_label)
         self._swap_labels(issue_number, ["paused"], "ready")
 
+        self._close_superseded_pr(superseded_attempt, "task resumed from paused")
+
     def reassign_task(self, task_id: str, worker_id: str) -> None:
         """Reassign active task. Supersede attempt, return to READY."""
         task, issue_number = self._get_task_issue(task_id)
@@ -674,11 +697,13 @@ class GitHubBackend(TaskBackend):
 
         now = _now_iso()
         current_attempt_id = task.get("current_attempt")
+        superseded_attempt: dict | None = None
         if current_attempt_id:
             for a in task["attempts"]:
                 if a["attempt_id"] == current_attempt_id:
                     a["status"] = AttemptStatus.SUPERSEDED.value
                     a["completed_at"] = now
+                    superseded_attempt = dict(a)
                     break
 
         trail_entry = TrailEntry(ts=now, worker_id="system", message=f"Reassigned to {worker_id}")
@@ -691,6 +716,10 @@ class GitHubBackend(TaskBackend):
         ready_label = self._label_name("ready")
         self._ensure_label(ready_label)
         self._swap_labels(issue_number, ["active"], "ready")
+
+        self._close_superseded_pr(
+            superseded_attempt, f"task reassigned to {worker_id}"
+        )
 
     def block_task(self, task_id: str, reason: str) -> None:
         """Block a ready task. Swap label ready -> blocked."""

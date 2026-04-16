@@ -18,6 +18,7 @@ Scheduling is delegated entirely to scheduler.select_task().
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -34,6 +35,7 @@ from antfarm.core.models import (
     TaskStatus,
     TrailEntry,
 )
+from antfarm.core.pr_ops import NullPROps, PROps
 from antfarm.core.rate_limiter import is_worker_rate_limited
 from antfarm.core.scheduler import select_task
 
@@ -53,13 +55,38 @@ class FileBackend(TaskBackend):
     Args:
         root: Path to the .antfarm directory. Created if it doesn't exist.
         guard_ttl: Seconds before a guard is considered stale (default 300).
+        pr_ops: Optional PROps implementation used to close superseded PRs when
+            an attempt transitions to SUPERSEDED. Defaults to NullPROps (no-op)
+            so tests and environments without ``gh`` are unaffected.
     """
 
-    def __init__(self, root: str | Path, guard_ttl: int = _GUARD_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        guard_ttl: int = _GUARD_TTL_SECONDS,
+        pr_ops: PROps | None = None,
+    ) -> None:
         self._root = Path(root)
         self._guard_ttl = guard_ttl
         self._lock = threading.Lock()
+        self._pr_ops: PROps = pr_ops or NullPROps()
         self._init_dirs()
+
+    def _close_superseded_pr(self, attempt: dict | None, reason: str) -> None:
+        """Close the PR on a superseded attempt, outside any backend lock.
+
+        Must be invoked AFTER releasing ``self._lock`` — PR close shells out to
+        ``gh`` and could otherwise block every other worker for the subprocess
+        duration.
+        """
+        if not attempt:
+            return
+        pr = attempt.get("pr")
+        if not pr:
+            return
+        # Never let PR close break a state transition — swallow any error.
+        with contextlib.suppress(Exception):
+            self._pr_ops.close_pr(pr, comment=f"Superseded by antfarm: {reason}")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -356,6 +383,7 @@ class FileBackend(TaskBackend):
         to BLOCKED instead of READY. Per-task ``max_attempts`` overrides the
         function parameter.
         """
+        superseded_attempt: dict | None = None
         with self._lock:
             done_path = self._done_path(task_id)
             if not done_path.exists():
@@ -371,6 +399,7 @@ class FileBackend(TaskBackend):
                     a["status"] = AttemptStatus.SUPERSEDED.value
                     a["completed_at"] = now
                     worker_id = a.get("worker_id") or "system"
+                    superseded_attempt = dict(a)
                     break
 
             # Add failure trail entry
@@ -408,6 +437,10 @@ class FileBackend(TaskBackend):
                 data["status"] = TaskStatus.READY.value
                 self._write_json(done_path, data)
                 os.rename(done_path, self._ready_path(task_id))
+
+        # Close the superseded PR OUTSIDE the lock — gh subprocess would otherwise
+        # stall every other worker for its duration.
+        self._close_superseded_pr(superseded_attempt, reason)
 
     def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
         """Transition task from ACTIVE to HARVEST_PENDING.
@@ -489,6 +522,7 @@ class FileBackend(TaskBackend):
         updates spec + touches, appends a trail entry, and moves the file
         back into ready/ (unless it is already there).
         """
+        superseded_attempt: dict | None = None
         with self._lock:
             path = self._find_task_path(review_task_id)
             if path is None:
@@ -506,6 +540,7 @@ class FileBackend(TaskBackend):
                         if a.get("status") != AttemptStatus.SUPERSEDED.value:
                             a["status"] = AttemptStatus.SUPERSEDED.value
                             a["completed_at"] = now
+                            superseded_attempt = dict(a)
                         break
                 data["current_attempt"] = None
 
@@ -531,6 +566,12 @@ class FileBackend(TaskBackend):
             self._write_json(path, data)
             if path != ready_path:
                 os.rename(path, ready_path)
+
+        # Close the superseded PR OUTSIDE the lock.
+        self._close_superseded_pr(
+            superseded_attempt,
+            "re-review triggered by new parent attempt",
+        )
 
     def override_merge_order(self, task_id: str, position: int) -> None:
         """Set merge_override on a task in done/."""
@@ -577,6 +618,7 @@ class FileBackend(TaskBackend):
 
         Supersedes the current attempt so the task re-enters the queue cleanly.
         """
+        superseded_attempt: dict | None = None
         with self._lock:
             paused_path = self._paused_path(task_id)
             if not paused_path.exists():
@@ -595,6 +637,7 @@ class FileBackend(TaskBackend):
                     if a["attempt_id"] == current_attempt_id:
                         a["status"] = AttemptStatus.SUPERSEDED.value
                         a["completed_at"] = now
+                        superseded_attempt = dict(a)
                         break
                 data["current_attempt"] = None
 
@@ -604,8 +647,12 @@ class FileBackend(TaskBackend):
             self._write_json(paused_path, data)
             os.rename(paused_path, self._ready_path(task_id))
 
+        # Close the superseded PR OUTSIDE the lock.
+        self._close_superseded_pr(superseded_attempt, "task resumed from paused")
+
     def reassign_task(self, task_id: str, worker_id: str) -> None:
         """Reassign an active task. Supersedes current attempt, returns to ready/."""
+        superseded_attempt: dict | None = None
         with self._lock:
             active_path = self._active_path(task_id)
             if not active_path.exists():
@@ -623,6 +670,7 @@ class FileBackend(TaskBackend):
                     if a["attempt_id"] == current_attempt_id:
                         a["status"] = AttemptStatus.SUPERSEDED.value
                         a["completed_at"] = now
+                        superseded_attempt = dict(a)
                         break
 
             trail_entry = TrailEntry(
@@ -640,6 +688,9 @@ class FileBackend(TaskBackend):
 
             self._write_json(active_path, data)
             os.rename(active_path, self._ready_path(task_id))
+
+        # Close the superseded PR OUTSIDE the lock.
+        self._close_superseded_pr(superseded_attempt, f"task reassigned to {worker_id}")
 
     def block_task(self, task_id: str, reason: str) -> None:
         """Block a ready task. Moves from ready/ to blocked/."""
