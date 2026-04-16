@@ -200,7 +200,10 @@ def colony(
     import uvicorn
 
     from antfarm.core.backends import get_backend
+    from antfarm.core.logging_setup import setup_logging
     from antfarm.core.serve import get_app
+
+    setup_logging()
 
     if backend == "github":
         if not github_repo:
@@ -392,7 +395,10 @@ def worker_start(
     token: str | None,
 ):
     """Start a worker and enter the forage loop."""
+    from antfarm.core.logging_setup import setup_logging
     from antfarm.core.worker import WorkerRuntime
+
+    setup_logging()
 
     worker_name = name or worker_type
     ws_root = workspace_root or f".antfarm/workspaces/{worker_name}"
@@ -1395,7 +1401,10 @@ def runner(
     import os
     import socket
 
+    from antfarm.core.logging_setup import setup_logging
     from antfarm.core.runner import Runner
+
+    setup_logging()
 
     node_id = node or socket.gethostname()
     caps = [c.strip() for c in capabilities.split(",") if c.strip()] if capabilities else []
