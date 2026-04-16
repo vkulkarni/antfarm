@@ -793,19 +793,29 @@ class FileBackend(TaskBackend):
     # ------------------------------------------------------------------
 
     def register_worker(self, worker: dict) -> None:
-        """Register a worker.
+        """Register a worker (stale-tolerant).
+
+        Re-registration is allowed when the existing worker file's mtime is
+        older than ``self._guard_ttl`` (the stale heartbeat TTL); the prior
+        record is overwritten. When the existing file is fresh, registration
+        raises ValueError. When no file exists, registration succeeds.
+
+        The existence-and-mtime check and the file write are performed under
+        ``self._lock`` to close the TOCTOU window between deciding the prior
+        record is stale and overwriting it.
 
         Raises:
             ValueError: If a live (non-stale heartbeat) worker with the same ID exists.
         """
         worker_id = worker["worker_id"]
         worker_path = self._worker_path(worker_id)
-        if worker_path.exists():
-            stat = os.stat(str(worker_path))
-            age = datetime.now(UTC).timestamp() - stat.st_mtime
-            if age <= self._guard_ttl:
-                raise ValueError(f"Worker '{worker_id}' is already registered and live")
-        self._write_json(worker_path, worker)
+        with self._lock:
+            if worker_path.exists():
+                stat = os.stat(str(worker_path))
+                age = datetime.now(UTC).timestamp() - stat.st_mtime
+                if age <= self._guard_ttl:
+                    raise ValueError(f"Worker '{worker_id}' is already registered and live")
+            self._write_json(worker_path, worker)
 
     def deregister_worker(self, worker_id: str) -> None:
         """Deregister a worker. No-op if not found (idempotent)."""
