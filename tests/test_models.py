@@ -434,6 +434,35 @@ def test_task_mission_id_roundtrip():
     assert restored == task
 
 
+def test_node_roundtrip_extended():
+    node = Node(
+        node_id="node-1",
+        joined_at="2026-04-04T08:00:00Z",
+        last_seen="2026-04-04T10:00:00Z",
+        runner_url="http://localhost:7433",
+        max_workers=8,
+        capabilities=["claude-code", "codex"],
+    )
+    d = node.to_dict()
+    assert d["runner_url"] == "http://localhost:7433"
+    assert d["max_workers"] == 8
+    assert d["capabilities"] == ["claude-code", "codex"]
+    restored = Node.from_dict(d)
+    assert restored == node
+
+
+def test_node_backward_compat():
+    data = {
+        "node_id": "node-old",
+        "joined_at": "2026-04-04T08:00:00Z",
+        "last_seen": "2026-04-04T10:00:00Z",
+    }
+    node = Node.from_dict(data)
+    assert node.runner_url is None
+    assert node.max_workers == 4
+    assert node.capabilities == []
+
+
 def test_task_mission_id_default_none():
     task = Task(
         id="t-no-mission",
