@@ -221,6 +221,52 @@ def test_register_node_idempotent(client):
     assert r.json()["nodes"] == 1
 
 
+def test_register_node_extended(client):
+    r = client.post(
+        "/nodes",
+        json={
+            "node_id": "node-ext",
+            "runner_url": "http://mini-2:7433",
+            "max_workers": 2,
+            "capabilities": ["gpu", "large-context"],
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["node_id"] == "node-ext"
+
+    # Verify fields persisted
+    r = client.get("/nodes/node-ext")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["runner_url"] == "http://mini-2:7433"
+    assert data["max_workers"] == 2
+    assert data["capabilities"] == ["gpu", "large-context"]
+
+
+def test_get_nodes_list(client):
+    client.post("/nodes", json={"node_id": "node-a"})
+    client.post("/nodes", json={"node_id": "node-b"})
+
+    r = client.get("/nodes")
+    assert r.status_code == 200
+    nodes = r.json()
+    node_ids = [n["node_id"] for n in nodes]
+    assert "node-a" in node_ids
+    assert "node-b" in node_ids
+
+
+def test_get_node_detail(client):
+    client.post("/nodes", json={"node_id": "node-detail"})
+    r = client.get("/nodes/node-detail")
+    assert r.status_code == 200
+    assert r.json()["node_id"] == "node-detail"
+
+
+def test_get_node_not_found(client):
+    r = client.get("/nodes/nonexistent")
+    assert r.status_code == 404
+
+
 def test_signal_appends(client):
     _carry(client)
     task = _forage(client).json()

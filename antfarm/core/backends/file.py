@@ -768,6 +768,21 @@ class FileBackend(TaskBackend):
             else:
                 self._write_json(node_path, node)
 
+    def list_nodes(self) -> list[dict]:
+        """Return all registered nodes."""
+        nodes_dir = self._root / "nodes"
+        results = []
+        for p in sorted(nodes_dir.glob("*.json")):
+            results.append(self._read_json(p))
+        return results
+
+    def get_node(self, node_id: str) -> dict | None:
+        """Return a single node by ID, or None if not found."""
+        node_path = self._node_path(node_id)
+        if not node_path.exists():
+            return None
+        return self._read_json(node_path)
+
     # ------------------------------------------------------------------
     # Workers
     # ------------------------------------------------------------------

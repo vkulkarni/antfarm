@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from antfarm.core.backends.base import TaskBackend
 
@@ -214,6 +214,9 @@ class CarryRequest(BaseModel):
 
 class NodeRequest(BaseModel):
     node_id: str
+    runner_url: str | None = None
+    max_workers: int = 4
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class WorkerRegisterRequest(BaseModel):
@@ -385,9 +388,29 @@ def get_app(
     def register_node(req: NodeRequest):
         """Register a node. Idempotent — re-registering updates last_seen."""
         now = _now_iso()
-        node = {"node_id": req.node_id, "joined_at": now, "last_seen": now}
+        node = {
+            "node_id": req.node_id,
+            "joined_at": now,
+            "last_seen": now,
+            "runner_url": req.runner_url,
+            "max_workers": req.max_workers,
+            "capabilities": req.capabilities,
+        }
         _backend.register_node(node)
         return {"node_id": req.node_id}
+
+    @app.get("/nodes")
+    def list_nodes():
+        """List all registered nodes."""
+        return _backend.list_nodes()
+
+    @app.get("/nodes/{node_id}")
+    def get_node(node_id: str):
+        """Get a single node by ID, or 404."""
+        node = _backend.get_node(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"Node {node_id!r} not found")
+        return node
 
     # ------------------------------------------------------------------
     # Workers

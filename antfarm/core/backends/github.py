@@ -852,6 +852,14 @@ class GitHubBackend(TaskBackend):
         else:
             self._nodes[node_id] = dict(node)
 
+    def list_nodes(self) -> list[dict]:
+        """Return all registered nodes."""
+        return list(self._nodes.values())
+
+    def get_node(self, node_id: str) -> dict | None:
+        """Return a single node by ID, or None if not found."""
+        return self._nodes.get(node_id)
+
     # ------------------------------------------------------------------
     # Workers
     # ------------------------------------------------------------------
