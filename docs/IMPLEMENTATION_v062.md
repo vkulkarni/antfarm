@@ -226,22 +226,31 @@ class ProcessManager(ABC):
         """Discover and return existing processes from a previous run.
 
         Uses TWO sources for discovery:
-        1. Metadata files in {state_dir}/processes/ — portable across backends
+        1. Metadata files in {state_dir}/processes/ — filtered to THIS
+           manager's type to prevent cross-manager contamination (e.g.,
+           a tmux manager must not adopt leftover subprocess PIDs —
+           PID reuse would cause false adoption).
         2. Live session scan (tmux only) — catches sessions without metadata
 
         For each candidate, validates liveness:
         - tmux metadata → tmux has-session
-        - subprocess metadata → os.kill(pid, 0)
+        - subprocess metadata → os.kill(pid, 0) (only consulted by
+          SubprocessProcessManager, which overrides this method to
+          return {} anyway — see that class for rationale)
 
         Returns: {name: role} for each adopted process.
         """
         adopted = {}
         seen = set()
+        my_type = self._manager_type()
 
-        # 1. Metadata file adoption (works for both backends)
+        # 1. Metadata file adoption — FILTERED BY MANAGER TYPE.
+        #    A tmux manager must not trust subprocess metadata, and vice versa.
         for meta in self._list_metadata():
             if not meta.name.startswith(self.prefix):
                 continue
+            if meta.manager_type != my_type:
+                continue  # foreign metadata — ignore (subclass may sweep it)
             seen.add(meta.name)
             if self._validate_from_metadata(meta):
                 adopted[meta.name] = meta.role
@@ -260,8 +269,8 @@ class ProcessManager(ABC):
                 adopted[name] = parsed[1]
                 # Write metadata retroactively so next adoption finds it
                 self._write_metadata(ProcessMetadata(
-                    name=name, role=parsed[1], manager_type=self._manager_type(),
-                    session_name=name if self._manager_type() == "tmux" else None,
+                    name=name, role=parsed[1], manager_type=my_type,
+                    session_name=name if my_type == "tmux" else None,
                 ))
         return adopted
 
@@ -787,6 +796,30 @@ def test_tmux_pm_adopt_existing():
     finally:
         pm.stop("auto-builder-5")
         pm.stop("auto-reviewer-2")
+
+@pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not installed")
+def test_tmux_pm_ignores_subprocess_metadata(tmp_path):
+    """Cross-manager contamination guard.
+
+    A leftover subprocess metadata file (possibly with a reused PID) must
+    NOT be adopted by TmuxProcessManager. Filtering happens on
+    meta.manager_type == self._manager_type().
+    """
+    # Plant a subprocess metadata file for a name that doesn't correspond
+    # to any tmux session. Use this process's own PID so os.kill(pid, 0)
+    # would succeed — proving the guard is manager-type, not liveness.
+    sub = SubprocessProcessManager(state_dir=str(tmp_path))
+    meta = ProcessMetadata(
+        name="auto-builder-42", role="builder",
+        manager_type="subprocess", pid=os.getpid(),
+    )
+    sub._write_metadata(meta)
+
+    tmux_pm = TmuxProcessManager(state_dir=str(tmp_path))
+    adopted = tmux_pm.adopt_existing()
+    assert "auto-builder-42" not in adopted
+    # Foreign metadata is left intact — tmux won't sweep subprocess files.
+    assert tmux_pm._read_metadata("auto-builder-42") is not None
 ```
 
 **Modify `tests/test_autoscaler.py`:**
