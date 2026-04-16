@@ -306,7 +306,20 @@ class Autoscaler:
         logger.warning("failed to start worker after retry — skipping")
 
     def _stop_idle_worker(self, role: str) -> bool:
-        """Stop one idle worker of the given role. Returns True if stopped."""
+        """Stop one idle worker of the given role. Returns True if stopped.
+
+        A worker is reap-eligible only when BOTH:
+        - colony-side status == "idle", AND
+        - last_heartbeat is older than poll_interval
+
+        This grace period protects workers that have just claimed a task via
+        pull() but whose heartbeat hasn't ticked yet — the colony-side status
+        stays "idle" until the first heartbeat arrives (~30s), and the
+        autoscaler's own poll can fire in that window.
+
+        If last_heartbeat is missing or unparseable, the worker is NOT reaped
+        (fail-safe: treat as fresh).
+        """
         colony_workers = self.backend.list_workers()
         colony_status_map = {w["worker_id"]: w for w in colony_workers}
 
@@ -316,11 +329,23 @@ class Autoscaler:
             if not self._pm.is_alive(name):
                 continue  # already exited
             cw = colony_status_map.get(mw.worker_id)
-            if cw and cw.get("status") == "idle":
-                self._pm.stop(name)
-                logger.info("autoscaler stopped idle worker name=%s role=%s", name, role)
-                del self.managed[name]
-                return True
+            if not (cw and cw.get("status") == "idle"):
+                continue
+            # Guard: only reap if last_heartbeat is older than poll_interval.
+            last_hb = cw.get("last_heartbeat")
+            if not last_hb:
+                continue  # no heartbeat recorded — treat as fresh, skip
+            try:
+                hb_dt = datetime.fromisoformat(last_hb)
+                age = (datetime.now(UTC) - hb_dt).total_seconds()
+            except (ValueError, TypeError):
+                continue  # unparseable — fail-safe, skip
+            if age < self.config.poll_interval:
+                continue  # heartbeat is still fresh — worker just registered or claimed
+            self._pm.stop(name)
+            logger.info("autoscaler stopped idle worker name=%s role=%s", name, role)
+            del self.managed[name]
+            return True
         return False
 
     def _cleanup_exited(self) -> None:
