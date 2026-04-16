@@ -5,6 +5,7 @@ Uses FastAPI TestClient with a fresh FileBackend per test via tmp_path fixture.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -152,6 +153,29 @@ def test_harvest_wrong_attempt_returns_409(client):
         json={"attempt_id": "wrong-attempt-id", "pr": "pr-url", "branch": "feat/x"},
     )
     assert r.status_code == 409
+
+
+def test_register_worker_duplicate_returns_409(client):
+    """Registering the same live worker twice returns 409 on the second call."""
+    r = _register_worker(client, "worker-dup")
+    assert r.status_code == 201
+
+    r = _register_worker(client, "worker-dup")
+    assert r.status_code == 409
+
+
+def test_register_worker_stale_allows_reregister(client):
+    """After the worker file's mtime is aged past guard_ttl, re-register returns 201."""
+    r = _register_worker(client, "worker-stale")
+    assert r.status_code == 201
+
+    backend = serve_mod._backend
+    worker_path = backend._worker_path("worker-stale")
+    stale = time.time() - (backend._guard_ttl + 60)
+    os.utime(str(worker_path), (stale, stale))
+
+    r = _register_worker(client, "worker-stale")
+    assert r.status_code == 201
 
 
 def test_heartbeat_updates_worker(client):
