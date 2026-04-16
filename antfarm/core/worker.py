@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import json as _json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -540,6 +541,34 @@ class WorkerRuntime:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _setup_agent_definitions(workspace: str) -> None:
+        """Copy Claude Code agent definitions into the worktree if available.
+
+        Looks for agent definitions in the source repo's adapter directory
+        and copies them to {workspace}/.claude/agents/ so `claude --agent`
+        can find them.
+        """
+        import shutil
+
+        # Find adapter agents relative to the antfarm package
+        adapter_dir = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "adapters", "claude_code", "agents",
+        )
+        if not os.path.isdir(adapter_dir):
+            return
+
+        target_dir = os.path.join(workspace, ".claude", "agents")
+        os.makedirs(target_dir, exist_ok=True)
+        for fname in os.listdir(adapter_dir):
+            if fname.endswith(".md"):
+                src = os.path.join(adapter_dir, fname)
+                dst = os.path.join(target_dir, fname)
+                if not os.path.exists(dst):
+                    shutil.copy2(src, dst)
+                    logger.debug("copied agent definition %s to %s", fname, target_dir)
+
+    @staticmethod
     def _git(workspace: str, *args: str) -> str:
         """Run a git command in the workspace directory and return stdout."""
         proc = subprocess.run(
@@ -645,6 +674,9 @@ class WorkerRuntime:
         if not branch:
             branch = f"feat/{task['id']}-{task['current_attempt']}"
 
+        # Ensure Claude Code agent definitions exist in the worktree
+        self._setup_agent_definitions(workspace)
+
         if is_plan:
             prompt = (
                 f"Task: {title}\n\n"
@@ -741,7 +773,7 @@ class WorkerRuntime:
             cmd = [self.agent_type, prompt]
 
         env = {
-            **__import__("os").environ,
+            **os.environ,
             "ANTFARM_URL": self.colony.base_url,
             "WORKER_ID": self.worker_id,
         }
