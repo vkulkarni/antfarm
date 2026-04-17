@@ -2143,3 +2143,345 @@ def test_emit_failure_does_not_break_merge(soldier_env, monkeypatch):
     # Must not raise, must still merge cleanly.
     results = soldier.run_once()
     assert results == [("task-emfail-001", MergeResult.MERGED)]
+
+
+# ---------------------------------------------------------------------------
+# P1 (v0.6.7): rebase-before-kickback on merge conflict
+# ---------------------------------------------------------------------------
+
+
+def _make_mock_task(task_id: str = "task-rb", branch: str = "feat/task-rb") -> dict:
+    """Build a done-task dict suitable for calling attempt_merge directly."""
+    return {
+        "id": task_id,
+        "current_attempt": "att-001",
+        "attempts": [
+            {
+                "attempt_id": "att-001",
+                "worker_id": "w-1",
+                "status": "done",
+                "branch": branch,
+                "pr": "PR-1",
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "completed_at": "2026-01-01T00:00:01+00:00",
+            }
+        ],
+        "status": "done",
+    }
+
+
+def _build_bare_soldier(tmp_path, test_command=None) -> Soldier:
+    """Build a Soldier whose git/tests are driven by subprocess mocks."""
+    return Soldier(
+        colony_url="http://testserver",
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        test_command=test_command or ["true"],
+        poll_interval=0.0,
+    )
+
+
+def test_rebase_retry_merges_when_rebase_resolves_drift(tmp_path, monkeypatch):
+    """Clean rebase path: initial merge conflicts, rebase succeeds, retry merges."""
+    soldier = _build_bare_soldier(tmp_path)
+    task = _make_mock_task()
+
+    merge_call_count = {"n": 0}
+
+    def fake_run(args, **kwargs):
+        import subprocess as _sp
+
+        joined = " ".join(args)
+        if "merge" in args and "--no-ff" in args and "feat/task-rb" in args:
+            merge_call_count["n"] += 1
+            if merge_call_count["n"] == 1:
+                return _sp.CompletedProcess(
+                    args, 1, stdout=b"", stderr=b"CONFLICT (content)"
+                )
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if "rebase" in args and "origin/main" in joined and "--abort" not in args:
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    import antfarm.core.soldier as soldier_mod
+
+    monkeypatch.setattr(soldier_mod.subprocess, "run", fake_run)
+
+    result = soldier.attempt_merge(task)
+    assert result == MergeResult.MERGED
+    # Exactly 2 merge attempts: initial + one retry after rebase.
+    assert merge_call_count["n"] == 2
+
+
+def test_rebase_conflict_kicks_back_with_rebase_failed_reason(tmp_path, monkeypatch):
+    """Rebase conflict path: returns FAILED with last_failure_reason 'rebase_failed'."""
+    soldier = _build_bare_soldier(tmp_path)
+    task = _make_mock_task()
+
+    rebase_abort_called = {"n": 0}
+
+    def fake_run(args, **kwargs):
+        import subprocess as _sp
+
+        joined = " ".join(args)
+        if "merge" in args and "--no-ff" in args and "feat/task-rb" in args:
+            return _sp.CompletedProcess(
+                args, 1, stdout=b"", stderr=b"CONFLICT (content): Merge conflict"
+            )
+        if "rebase" in args and "--abort" in args:
+            rebase_abort_called["n"] += 1
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if "rebase" in args and "origin/main" in joined:
+            return _sp.CompletedProcess(
+                args, 1, stdout=b"", stderr=b"CONFLICT during rebase"
+            )
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    import antfarm.core.soldier as soldier_mod
+
+    monkeypatch.setattr(soldier_mod.subprocess, "run", fake_run)
+
+    result = soldier.attempt_merge(task)
+    assert result == MergeResult.FAILED
+    assert "rebase_failed" in soldier.last_failure_reason
+    assert rebase_abort_called["n"] >= 1, "rebase --abort must be invoked on conflict"
+
+
+def test_rebase_retry_does_not_loop(tmp_path, monkeypatch):
+    """At most one rebase per attempt_merge call — no retry loop."""
+    soldier = _build_bare_soldier(tmp_path)
+    task = _make_mock_task()
+
+    rebase_calls = {"n": 0}
+    merge_calls = {"n": 0}
+
+    def fake_run(args, **kwargs):
+        import subprocess as _sp
+
+        if "merge" in args and "--no-ff" in args and "feat/task-rb" in args:
+            merge_calls["n"] += 1
+            return _sp.CompletedProcess(
+                args, 1, stdout=b"", stderr=b"CONFLICT (content)"
+            )
+        if "rebase" in args and "--abort" not in args:
+            rebase_calls["n"] += 1
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    import antfarm.core.soldier as soldier_mod
+
+    monkeypatch.setattr(soldier_mod.subprocess, "run", fake_run)
+
+    result = soldier.attempt_merge(task)
+    assert result == MergeResult.FAILED
+    assert rebase_calls["n"] == 1, (
+        f"expected exactly 1 rebase invocation, got {rebase_calls['n']}"
+    )
+    assert merge_calls["n"] == 2, (
+        f"expected exactly 2 merge invocations (initial + one retry), "
+        f"got {merge_calls['n']}"
+    )
+    assert "rebase_retry_merge_failed" in soldier.last_failure_reason
+
+
+def test_rebase_uses_force_with_lease_never_plain_force(tmp_path, monkeypatch):
+    """The push after a successful rebase uses --force-with-lease, never --force."""
+    soldier = _build_bare_soldier(tmp_path)
+    task = _make_mock_task()
+
+    push_args: list[list[str]] = []
+    merge_call_count = {"n": 0}
+
+    def fake_run(args, **kwargs):
+        import subprocess as _sp
+
+        if "merge" in args and "--no-ff" in args and "feat/task-rb" in args:
+            merge_call_count["n"] += 1
+            if merge_call_count["n"] == 1:
+                return _sp.CompletedProcess(args, 1, stdout=b"", stderr=b"CONFLICT")
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if "push" in args:
+            push_args.append(list(args))
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    import antfarm.core.soldier as soldier_mod
+
+    monkeypatch.setattr(soldier_mod.subprocess, "run", fake_run)
+
+    soldier.attempt_merge(task)
+
+    pr_pushes = [a for a in push_args if "feat/task-rb" in a]
+    assert pr_pushes, "expected a push to the PR branch after rebase"
+    for p in pr_pushes:
+        assert "--force-with-lease" in p, (
+            f"PR-branch push must use --force-with-lease: {p}"
+        )
+
+    # No plain '--force' token anywhere in any push invocation
+    # ('--force-with-lease' is a different token and is allowed).
+    for call in push_args:
+        assert "--force" not in call, f"plain --force used in git push: {call}"
+
+
+def test_test_failure_does_not_trigger_rebase(tmp_path, monkeypatch):
+    """Test failure (not merge conflict) must NOT invoke the rebase retry path."""
+    soldier = _build_bare_soldier(tmp_path, test_command=["pytest-stub"])
+    task = _make_mock_task()
+
+    rebase_calls = {"n": 0}
+
+    def fake_run(args, **kwargs):
+        import subprocess as _sp
+
+        if "merge" in args and "--no-ff" in args:
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if "rebase" in args:
+            rebase_calls["n"] += 1
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if args and args[0] == "pytest-stub":
+            return _sp.CompletedProcess(
+                args, 1, stdout=b"1 failed", stderr=b"tests failed"
+            )
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    import antfarm.core.soldier as soldier_mod
+
+    monkeypatch.setattr(soldier_mod.subprocess, "run", fake_run)
+
+    result = soldier.attempt_merge(task)
+    assert result == MergeResult.FAILED
+    assert rebase_calls["n"] == 0, (
+        "test failure must NOT trigger the rebase retry path"
+    )
+    assert "tests failed" in soldier.last_failure_reason
+
+
+# ---------------------------------------------------------------------------
+# P1 (v0.6.7): #284 — needs_changes verdict triggers kickback + serve wiring
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_with_review_kickbacks_on_needs_changes_verdict(tmp_path):
+    """#284 regression: a needs_changes verdict on the review task's current
+    attempt must cause the parent task to be kicked back on the next
+    run_once_with_review tick."""
+    import json
+    from pathlib import Path
+
+    from antfarm.core.models import ReviewVerdict
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+
+    # 1. Parent done task with a current attempt, branch, artifact.
+    _make_done_task_with_mission(backend, "task-nc-284", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-nc-284", "a" * 40)
+
+    # 2. Soldier with require_review=True creates the review task.
+    soldier = Soldier.from_backend(
+        backend, repo_path=str(tmp_path), require_review=True
+    )
+    assert soldier.require_review is True, (
+        "pre-condition: Soldier.from_backend must default require_review=True"
+    )
+    parent_task = backend.get_task("task-nc-284")
+    assert soldier.create_review_task(parent_task) == "review-task-nc-284"
+
+    # 3. Reviewer claims + harvests the review task.
+    backend.register_worker(
+        {
+            "worker_id": "reviewer-1",
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp/ws",
+            "status": "idle",
+            "capabilities": ["review"],
+        }
+    )
+    backend.pull("reviewer-1")
+    review_task = backend.get_task("review-task-nc-284")
+    review_attempt_id = review_task["current_attempt"]
+    backend.mark_harvested(
+        "review-task-nc-284",
+        review_attempt_id,
+        pr="review-pr",
+        branch="feat/review-task-nc-284",
+    )
+
+    # 4. Inject a needs_changes verdict onto the review attempt and emit it
+    # as a [REVIEW_VERDICT] trail entry — this is how reviewer workers
+    # surface verdicts in production.
+    needs_changes_verdict = ReviewVerdict(
+        provider="human",
+        verdict="needs_changes",
+        summary="please fix X",
+        findings=["bug in Y"],
+        reviewed_commit_sha="a" * 40,
+    ).to_dict()
+
+    review_done_path = Path(backend._root) / "tasks" / "done" / "review-task-nc-284.json"
+    rdata = json.loads(review_done_path.read_text())
+    for a in rdata["attempts"]:
+        if a["attempt_id"] == review_attempt_id:
+            a["review_verdict"] = needs_changes_verdict
+            break
+    rdata["trail"].append(
+        {
+            "ts": "2026-01-01T00:00:00+00:00",
+            "worker_id": "reviewer-1",
+            "message": "[REVIEW_VERDICT] " + json.dumps(needs_changes_verdict),
+        }
+    )
+    review_done_path.write_text(json.dumps(rdata, indent=2))
+
+    # 5. Run once — parent task must be kicked back with a 'review failed' trail.
+    results = soldier.run_once_with_review()
+    assert results == [("task-nc-284", MergeResult.FAILED)]
+
+    parent_after = backend.get_task("task-nc-284")
+    assert parent_after["status"] == "ready"
+    assert parent_after["current_attempt"] is None
+
+    trail_msgs = [e["message"] for e in parent_after.get("trail", [])]
+    assert any("review failed" in m.lower() for m in trail_msgs), (
+        f"expected a 'review failed:' trail entry, got: {trail_msgs}"
+    )
+
+
+def test_start_soldier_thread_wires_require_review_true(tmp_path, monkeypatch):
+    """#284 regression: _start_soldier_thread must construct a Soldier with
+    require_review=True, so needs_changes verdicts actually trigger kickback
+    in production."""
+    from antfarm.core import serve as serve_mod
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+
+    captured: dict = {}
+
+    class _FakeSoldier:
+        @classmethod
+        def from_backend(cls, backend_arg, **kwargs):  # noqa: N803
+            captured["backend"] = backend_arg
+            captured["kwargs"] = kwargs
+            inst = cls.__new__(cls)
+            inst.require_review = kwargs.get("require_review", False)
+            return inst
+
+        def run(self):
+            # No-op — we don't want a thread spinning in this test.
+            return None
+
+    import antfarm.core.soldier as soldier_mod
+
+    monkeypatch.setattr(soldier_mod, "Soldier", _FakeSoldier)
+
+    # Reset singleton state so _start_soldier_thread proceeds.
+    monkeypatch.setattr(serve_mod, "_soldier_thread", None, raising=False)
+    monkeypatch.setattr(serve_mod, "_soldier_status", "not started", raising=False)
+
+    serve_mod._start_soldier_thread(backend, data_dir=str(tmp_path / ".antfarm"))
+
+    assert captured, "_start_soldier_thread did not build a Soldier instance"
+    assert captured["kwargs"].get("require_review", False) is True, (
+        f"Soldier must be started with require_review=True, "
+        f"got kwargs={captured['kwargs']}"
+    )

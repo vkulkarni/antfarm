@@ -586,15 +586,20 @@ class Soldier:
                 check=False,
             )
             if r.returncode != 0:
-                self.last_failure_reason = (
-                    f"merge conflict merging {branch}: {r.stderr.decode().strip()}"
+                # Merge conflict: try one deterministic rebase of the PR
+                # branch onto origin/<integration_branch> and retry the merge
+                # exactly once. Only merge-conflict failures trigger this
+                # path — test failures still kick back immediately. The
+                # helper is responsible for emitting the final ``merge_failed``
+                # diagnostic event (with reason=rebase_failed or
+                # reason=rebase_retry_merge_failed) on its failure paths.
+                initial_conflict_stderr = r.stderr.decode().strip()
+                return self._rebase_and_retry_merge(
+                    task_id=task_id,
+                    branch=branch,
+                    temp_branch=temp_branch,
+                    initial_conflict_stderr=initial_conflict_stderr,
                 )
-                _emit(
-                    "merge_failed",
-                    task_id,
-                    f"reason=merge_conflict: {self.last_failure_reason}",
-                )
-                return MergeResult.FAILED
 
             # Run tests
             r = subprocess.run(
@@ -768,6 +773,215 @@ class Soldier:
             )
             time.sleep(timeout)
             return False
+
+    def _rebase_and_retry_merge(
+        self,
+        task_id: str,
+        branch: str,
+        temp_branch: str,
+        initial_conflict_stderr: str,
+    ) -> MergeResult:
+        """Rebase ``branch`` onto origin/integration and retry the merge once.
+
+        Called from ``attempt_merge`` when the initial ``git merge --no-ff``
+        conflicts. Performs at MOST one rebase and one retry merge — no loops.
+
+        Flow:
+        1. Abort the in-progress conflicting merge so the temp branch is clean.
+        2. ``git fetch origin`` — pick up latest integration tip.
+        3. ``git checkout <branch>`` and
+           ``git rebase origin/<integration_branch>``.
+        4. If rebase conflicts: ``git rebase --abort``, set
+           ``last_failure_reason`` to ``rebase_failed: ...`` and return FAILED.
+        5. On clean rebase: ``git push --force-with-lease origin <branch>``
+           (never plain ``--force``), then recreate the temp branch from
+           origin/<integration_branch> and retry ``git merge --no-ff``.
+        6. If the retry merge succeeds, continue with tests / ff / push via
+           the rest of the pipeline; if it fails again, return FAILED with
+           ``rebase_retry_merge_failed: ...``.
+
+        Returns a definitive ``MergeResult`` — the caller must not re-attempt.
+        """
+        del initial_conflict_stderr  # captured for debugging; reason set below.
+
+        # 1) Abort the conflicting merge so we can move off temp_branch cleanly.
+        subprocess.run(
+            ["git", "merge", "--abort"],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+
+        # 2) Fetch again to get the very latest integration tip before rebasing.
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+
+        # 3) Check out the PR branch locally. Use -B so we reset any existing
+        # local branch to origin/<branch>, avoiding stale local state.
+        r = subprocess.run(
+            ["git", "checkout", "-B", branch, f"origin/{branch}"],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            self.last_failure_reason = (
+                f"rebase_failed: cannot checkout {branch}: {r.stderr.decode().strip()}"
+            )
+            _emit("merge_failed", task_id, f"reason={self.last_failure_reason}")
+            return MergeResult.FAILED
+
+        # 4) Rebase onto latest integration branch.
+        r = subprocess.run(
+            ["git", "rebase", f"origin/{self.integration_branch}"],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            rebase_stderr = r.stderr.decode().strip()
+            # Best-effort abort; suppress any exceptions.
+            with contextlib.suppress(Exception):
+                subprocess.run(
+                    ["git", "rebase", "--abort"],
+                    cwd=self.repo_path,
+                    capture_output=True,
+                    check=False,
+                )
+            self.last_failure_reason = f"rebase_failed: {rebase_stderr}"
+            _emit("merge_failed", task_id, f"reason={self.last_failure_reason}")
+            return MergeResult.FAILED
+
+        # 5) Push rebased branch with --force-with-lease (never plain --force).
+        r = subprocess.run(
+            ["git", "push", "--force-with-lease", "origin", branch],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            self.last_failure_reason = (
+                f"rebase_retry_merge_failed: push --force-with-lease failed: "
+                f"{r.stderr.decode().strip()}"
+            )
+            _emit("merge_failed", task_id, f"reason={self.last_failure_reason}")
+            return MergeResult.FAILED
+
+        # 6) Recreate the temp branch from latest origin/<integration_branch>.
+        # Delete any local temp branch first so checkout -b won't fail.
+        subprocess.run(
+            ["git", "checkout", self.integration_branch],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        subprocess.run(
+            ["git", "branch", "-D", temp_branch],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        r = subprocess.run(
+            ["git", "checkout", "-b", temp_branch, f"origin/{self.integration_branch}"],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            self.last_failure_reason = (
+                f"rebase_retry_merge_failed: could not recreate temp branch: "
+                f"{r.stderr.decode().strip()}"
+            )
+            _emit("merge_failed", task_id, f"reason={self.last_failure_reason}")
+            return MergeResult.FAILED
+
+        # 7) Retry the merge exactly once — no further rebase.
+        r = subprocess.run(
+            ["git", "merge", "--no-ff", branch],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            self.last_failure_reason = (
+                f"rebase_retry_merge_failed: {r.stderr.decode().strip()}"
+            )
+            _emit("merge_failed", task_id, f"reason={self.last_failure_reason}")
+            return MergeResult.FAILED
+
+        # 8) Run tests.
+        r = subprocess.run(
+            self.test_command,
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            self.last_failure_reason = (
+                f"tests failed: {r.stdout.decode().strip()} {r.stderr.decode().strip()}"
+            ).strip()
+            _emit(
+                "merge_failed",
+                task_id,
+                f"reason=test_failed: {self.last_failure_reason}",
+            )
+            return MergeResult.FAILED
+
+        # 9) Fast-forward integration branch.
+        r = subprocess.run(
+            ["git", "checkout", self.integration_branch],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            self.last_failure_reason = (
+                f"could not checkout {self.integration_branch}: {r.stderr.decode().strip()}"
+            )
+            _emit(
+                "merge_failed",
+                task_id,
+                f"reason=checkout_failed: {self.last_failure_reason}",
+            )
+            return MergeResult.FAILED
+
+        r = subprocess.run(
+            ["git", "merge", "--ff-only", temp_branch],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            self.last_failure_reason = f"ff-only merge failed: {r.stderr.decode().strip()}"
+            _emit(
+                "merge_failed",
+                task_id,
+                f"reason=rebase_failed: {self.last_failure_reason}",
+            )
+            return MergeResult.FAILED
+
+        # 10) Push integration branch to origin.
+        r = subprocess.run(
+            ["git", "push", "origin", self.integration_branch],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            self.last_failure_reason = f"push failed: {r.stderr.decode().strip()}"
+            _emit(
+                "merge_failed",
+                task_id,
+                f"reason=push_failed: {self.last_failure_reason}",
+            )
+            return MergeResult.FAILED
+
+        _emit("merge_succeeded", task_id, branch)
+        return MergeResult.MERGED
 
     def _cleanup(self) -> None:
         """Restore repo to a clean state after a merge attempt (success or failure).
