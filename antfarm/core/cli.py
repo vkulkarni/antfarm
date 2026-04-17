@@ -581,15 +581,62 @@ def _render_scout(status: dict, prev: dict | None) -> None:
         click.echo(f"{key:<25} {value_str}")
 
 
+def _format_event(event: dict) -> str:
+    """Format an SSE event dict as an activity-feed line: ``HH:MM:SS  <actor:12>  <detail>``."""
+    ts = event.get("ts", "") or ""
+    time_part = ts.split("T", 1)[1][:8] if "T" in ts else ts[:8]
+    actor = str(event.get("actor") or event.get("type") or "")
+    detail = event.get("detail", "")
+    return f"{time_part}  {actor:<12}  {detail}"
+
+
+def _scout_watch(colony_url: str, token: str | None) -> None:
+    """Stream ``/events`` via SSE, printing one formatted line per event.
+
+    Reconnects on connection close and carries the cursor forward so no events
+    are lost across reconnects. Exits cleanly on KeyboardInterrupt.
+    """
+    events_url = f"{colony_url.rstrip('/')}/events"
+    headers = _auth_headers(token)
+    cursor = 0
+    try:
+        while True:
+            try:
+                with httpx.stream(
+                    "GET",
+                    events_url,
+                    params={"after": cursor, "timeout": 30},
+                    headers=headers,
+                    timeout=None,
+                ) as r:
+                    r.raise_for_status()
+                    for line in r.iter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[len("data: ") :]
+                        try:
+                            event = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        event_id = event.get("id")
+                        if isinstance(event_id, int) and event_id > cursor:
+                            cursor = event_id
+                        click.echo(_format_event(event))
+            except httpx.HTTPError:
+                # Brief backoff before reconnect; cursor is preserved.
+                time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+
+
 @main.command()
-@click.option("--watch", is_flag=True, default=False, help="Re-poll continuously.")
-@click.option("--tui", is_flag=True, default=False, help="Launch rich TUI dashboard.")
 @click.option(
-    "--interval",
-    default=5,
-    show_default=True,
-    help="Seconds between polls (with --watch).",
+    "--watch",
+    is_flag=True,
+    default=False,
+    help="Stream live activity feed via /events SSE.",
 )
+@click.option("--tui", is_flag=True, default=False, help="Launch rich TUI dashboard.")
 @click.option(
     "--refresh",
     default=2.0,
@@ -601,12 +648,11 @@ def _render_scout(status: dict, prev: dict | None) -> None:
 def scout(
     watch: bool,
     tui: bool,
-    interval: int,
     refresh: float,
     colony_url: str,
     token: str | None,
 ):
-    """Show colony status as a table."""
+    """Show colony status as a table, or stream live activity feed with --watch."""
     if tui:
         from antfarm.core.tui import AntfarmTUI
 
@@ -614,21 +660,12 @@ def scout(
         dashboard.run()
         return
 
-    if not watch:
-        status = _get(colony_url, "/status", token=token)
-        _render_scout(status, None)
+    if watch:
+        _scout_watch(colony_url, token)
         return
 
-    prev_status = None
-    try:
-        while True:
-            click.clear()
-            status = _get(colony_url, "/status", token=token)
-            _render_scout(status, prev_status)
-            prev_status = status
-            time.sleep(interval)
-    except KeyboardInterrupt:
-        pass
+    status = _get(colony_url, "/status", token=token)
+    _render_scout(status, None)
 
 
 # ---------------------------------------------------------------------------
