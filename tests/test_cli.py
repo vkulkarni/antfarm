@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import httpx
 from click.testing import CliRunner
 
 from antfarm.core.cli import main
@@ -198,36 +199,173 @@ def test_cli_scout_uses_env_url(monkeypatch):
         assert "my-colony:8000" in call_url
 
 
-def test_scout_watch_basic():
-    """--watch polls repeatedly; KeyboardInterrupt after first sleep exits cleanly."""
+def _make_stream_ctx(lines: list[str]) -> MagicMock:
+    """Build a MagicMock that mimics ``httpx.stream(...)`` used as a context manager."""
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.iter_lines.return_value = iter(lines)
+    ctx = MagicMock()
+    ctx.__enter__.return_value = response
+    ctx.__exit__.return_value = False
+    return ctx
+
+
+def test_scout_watch_streams_events():
+    """--watch opens /events SSE stream and prints formatted rows."""
     runner = CliRunner()
 
-    status_data = {
-        "tasks_ready": 3,
-        "tasks_active": 1,
-        "tasks_done": 7,
-        "workers": 2,
-        "nodes": 1,
-    }
+    events = [
+        {
+            "id": 1,
+            "type": "harvested",
+            "actor": "runner",
+            "task_id": "task-1",
+            "detail": "pr=42 branch=feat/x",
+            "ts": "2026-04-16T14:32:11.000000+00:00",
+        },
+        {
+            "id": 2,
+            "type": "merged",
+            "actor": "soldier",
+            "task_id": "task-1",
+            "detail": "attempt=att-001",
+            "ts": "2026-04-16T14:33:02.000000+00:00",
+        },
+    ]
+    lines = [f"data: {json.dumps(e)}" for e in events]
 
-    with (
-        patch("antfarm.core.cli.httpx.get") as mock_get,
-        patch("antfarm.core.cli.time.sleep", side_effect=KeyboardInterrupt),
-    ):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = status_data
-        mock_get.return_value = mock_resp
+    call_count = {"n": 0}
 
+    def fake_stream(method, url, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _make_stream_ctx(lines)
+        # Second reconnect: simulate Ctrl-C to terminate the command.
+        raise KeyboardInterrupt
+
+    with patch("antfarm.core.cli.httpx.stream", side_effect=fake_stream):
         result = runner.invoke(
             main,
-            ["scout", "--watch", "--interval", "1", "--colony-url", "http://localhost:7433"],
+            ["scout", "--watch", "--colony-url", "http://localhost:7433"],
         )
 
-        assert result.exit_code == 0, result.output
-        assert "tasks_ready" in result.output
-        assert "3" in result.output
-        mock_get.assert_called_once()
+    assert result.exit_code == 0, result.output
+    assert "14:32:11" in result.output
+    assert "runner" in result.output
+    assert "pr=42 branch=feat/x" in result.output
+    assert "14:33:02" in result.output
+    assert "soldier" in result.output
+    assert "attempt=att-001" in result.output
+
+
+def test_scout_watch_tracks_cursor_across_reconnects():
+    """Cursor from prior batch is passed as ``after`` on the next connect."""
+    runner = CliRunner()
+
+    batch1 = [
+        {
+            "id": 3,
+            "type": "harvested",
+            "actor": "runner",
+            "task_id": "task-a",
+            "detail": "d1",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    ]
+    batch2 = [
+        {
+            "id": 7,
+            "type": "merged",
+            "actor": "soldier",
+            "task_id": "task-a",
+            "detail": "d2",
+            "ts": "2026-04-16T14:33:02+00:00",
+        }
+    ]
+
+    calls: list[dict] = []
+
+    def fake_stream(method, url, **kwargs):
+        calls.append(kwargs.get("params", {}))
+        if len(calls) == 1:
+            return _make_stream_ctx([f"data: {json.dumps(e)}" for e in batch1])
+        if len(calls) == 2:
+            return _make_stream_ctx([f"data: {json.dumps(e)}" for e in batch2])
+        raise KeyboardInterrupt
+
+    with patch("antfarm.core.cli.httpx.stream", side_effect=fake_stream):
+        result = runner.invoke(
+            main,
+            ["scout", "--watch", "--colony-url", "http://localhost:7433"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0].get("after") == 0
+    assert calls[1].get("after") == 3
+    assert "d1" in result.output
+    assert "d2" in result.output
+
+
+def test_scout_watch_ctrl_c_exits_cleanly():
+    """KeyboardInterrupt during iter_lines exits with status 0."""
+    runner = CliRunner()
+
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.iter_lines.side_effect = KeyboardInterrupt
+    ctx = MagicMock()
+    ctx.__enter__.return_value = response
+    ctx.__exit__.return_value = False
+
+    with patch("antfarm.core.cli.httpx.stream", return_value=ctx):
+        result = runner.invoke(
+            main,
+            ["scout", "--watch", "--colony-url", "http://localhost:7433"],
+        )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_scout_watch_reconnects_on_http_error():
+    """Transient HTTPError triggers backoff + reconnect; cursor is preserved."""
+    runner = CliRunner()
+
+    batch1 = [
+        {
+            "id": 5,
+            "type": "harvested",
+            "actor": "runner",
+            "task_id": "task-b",
+            "detail": "ok",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    ]
+
+    calls: list[dict] = []
+
+    def fake_stream(method, url, **kwargs):
+        calls.append(kwargs.get("params", {}))
+        if len(calls) == 1:
+            return _make_stream_ctx([f"data: {json.dumps(e)}" for e in batch1])
+        if len(calls) == 2:
+            raise httpx.ConnectError("server down")
+        raise KeyboardInterrupt
+
+    with (
+        patch("antfarm.core.cli.httpx.stream", side_effect=fake_stream),
+        patch("antfarm.core.cli.time.sleep"),
+    ):
+        result = runner.invoke(
+            main,
+            ["scout", "--watch", "--colony-url", "http://localhost:7433"],
+        )
+
+    assert result.exit_code == 0, result.output
+    # First call starts at cursor 0; after batch1 the cursor should advance to 5.
+    assert calls[0].get("after") == 0
+    assert calls[1].get("after") == 5
+    # Third call (after HTTPError backoff) retains the advanced cursor.
+    assert calls[2].get("after") == 5
 
 
 def test_scout_oneshot_unchanged():
