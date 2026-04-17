@@ -1033,6 +1033,78 @@ def test_orphan_fix_success_regression(tmp_path):
     assert findings[0].message == f"orphan tmux session: {own_orphan} (no matching metadata)"
 
 
+def test_check_orphan_tmux_sessions_fix_mixed_batch(tmp_path):
+    """Three orphans: clean kill, benign race, genuine failure — all classified correctly."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+    from antfarm.core.process_manager import colony_hash
+
+    data_dir = tmp_path / ".antfarm"
+    (data_dir / "processes").mkdir(parents=True)
+
+    h = colony_hash(str(data_dir))
+    session_clean = f"auto-{h}-builder-1"
+    session_race = f"auto-{h}-builder-2"
+    session_fail = f"auto-{h}-builder-3"
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = f"{session_clean}\n{session_race}\n{session_fail}\n"
+
+    kill_clean = MagicMock()
+    kill_clean.returncode = 0
+    kill_clean.stderr = ""
+
+    kill_race = MagicMock()
+    kill_race.returncode = 1
+    kill_race.stderr = "can't find session: " + session_race + "\n"
+
+    kill_fail = MagicMock()
+    kill_fail.returncode = 1
+    kill_fail.stderr = "some other error\n"
+
+    kill_calls: list[str] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["tmux", "list-sessions"]:
+            return list_result
+        if cmd[:2] == ["tmux", "kill-session"]:
+            target = cmd[cmd.index("-t") + 1]
+            kill_calls.append(target)
+            if target == session_clean:
+                return kill_clean
+            if target == session_race:
+                return kill_race
+            if target == session_fail:
+                return kill_fail
+            raise AssertionError(f"unexpected kill target: {target}")
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", side_effect=fake_run),
+    ):
+        findings = check_orphan_tmux_sessions({"data_dir": str(data_dir)}, fix=True)
+
+    assert len(findings) == 3
+
+    by_name = {f.message.split(":")[1].split("(")[0].strip(): f for f in findings}
+
+    f_clean = by_name[session_clean]
+    assert f_clean.fixed is True
+    assert "already gone" not in f_clean.message
+    assert "kill failed" not in f_clean.message
+
+    f_race = by_name[session_race]
+    assert f_race.fixed is True
+    assert "already gone" in f_race.message
+
+    f_fail = by_name[session_fail]
+    assert f_fail.fixed is False
+    assert "kill failed" in f_fail.message
+
+
 def test_two_mock_colonies_dont_cross_see(tmp_path):
     """Two colonies with distinct data_dirs each see only their own orphans."""
     from unittest.mock import MagicMock, patch
