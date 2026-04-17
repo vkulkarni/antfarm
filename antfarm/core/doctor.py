@@ -1064,7 +1064,29 @@ def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]
                 capture_output=True,
                 text=True,
             )
-            finding.fixed = kill.returncode == 0
+            if kill.returncode == 0:
+                finding.fixed = True
+            else:
+                # Race: session disappeared between list-sessions and kill-session.
+                # tmux emits these strings from cmd-kill-session.c / server.c when
+                # the target is gone or the server has exited. Treat as success.
+                stderr_lower = (kill.stderr or "").strip().lower()
+                gone_markers = (
+                    "can't find session",
+                    "session not found",
+                    "no server running",
+                )
+                if any(m in stderr_lower for m in gone_markers):
+                    finding.fixed = True
+                    finding.message += " (already gone)"
+                else:
+                    detail = (
+                        kill.stderr.strip().splitlines()[0]
+                        if kill.stderr and kill.stderr.strip()
+                        else f"returncode={kill.returncode}"
+                    )
+                    finding.message += f" — kill failed: {detail}"
+                    finding.fixed = False
 
         findings.append(finding)
 

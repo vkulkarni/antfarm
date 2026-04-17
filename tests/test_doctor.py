@@ -859,6 +859,108 @@ def test_orphan_fix_kills_session(tmp_path):
     assert kill_calls == [["tmux", "kill-session", "-t", own_orphan]]
 
 
+def _run_orphan_fix_with_kill_result(tmp_path, kill_returncode: int, kill_stderr: str):
+    """Shared helper: run check_orphan_tmux_sessions(fix=True) with a canned kill result."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+    from antfarm.core.process_manager import colony_hash
+
+    data_dir = tmp_path / ".antfarm"
+    (data_dir / "processes").mkdir(parents=True)
+
+    h = colony_hash(str(data_dir))
+    own_orphan = f"auto-{h}-builder-3"
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = f"{own_orphan}\n"
+
+    kill_result = MagicMock()
+    kill_result.returncode = kill_returncode
+    kill_result.stderr = kill_stderr
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["tmux", "list-sessions"]:
+            return list_result
+        if cmd[:2] == ["tmux", "kill-session"]:
+            return kill_result
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", side_effect=fake_run),
+    ):
+        findings = check_orphan_tmux_sessions({"data_dir": str(data_dir)}, fix=True)
+
+    return findings, own_orphan
+
+
+def test_orphan_fix_race_session_gone_marks_fixed(tmp_path):
+    """kill-session racing with tmux auto-cleanup ('can't find session') counts as fixed."""
+    findings, _ = _run_orphan_fix_with_kill_result(
+        tmp_path,
+        kill_returncode=1,
+        kill_stderr="can't find session: auto-abcdef-builder-3\n",
+    )
+    assert len(findings) == 1
+    assert findings[0].fixed is True
+    assert "already gone" in findings[0].message
+
+
+def test_orphan_fix_race_no_server_marks_fixed(tmp_path):
+    """kill-session when tmux server has exited ('no server running') counts as fixed."""
+    findings, _ = _run_orphan_fix_with_kill_result(
+        tmp_path,
+        kill_returncode=1,
+        kill_stderr="no server running on /tmp/tmux-501/default\n",
+    )
+    assert len(findings) == 1
+    assert findings[0].fixed is True
+    assert "already gone" in findings[0].message
+
+
+def test_orphan_fix_genuine_failure_surfaces_stderr(tmp_path):
+    """Genuine kill failure surfaces stderr's first line and leaves fixed=False."""
+    findings, _ = _run_orphan_fix_with_kill_result(
+        tmp_path,
+        kill_returncode=1,
+        kill_stderr="permission denied\nother line\n",
+    )
+    assert len(findings) == 1
+    assert findings[0].fixed is False
+    assert "kill failed" in findings[0].message
+    assert "permission denied" in findings[0].message
+    # Only first line surfaced.
+    assert "other line" not in findings[0].message
+
+
+def test_orphan_fix_empty_stderr_nonzero_returncode(tmp_path):
+    """Nonzero exit with empty stderr surfaces returncode instead."""
+    findings, _ = _run_orphan_fix_with_kill_result(
+        tmp_path,
+        kill_returncode=2,
+        kill_stderr="",
+    )
+    assert len(findings) == 1
+    assert findings[0].fixed is False
+    assert "kill failed" in findings[0].message
+    assert "returncode=2" in findings[0].message
+
+
+def test_orphan_fix_success_regression(tmp_path):
+    """Regression guard: successful kill still marks fixed and does not annotate message."""
+    findings, own_orphan = _run_orphan_fix_with_kill_result(
+        tmp_path,
+        kill_returncode=0,
+        kill_stderr="",
+    )
+    assert len(findings) == 1
+    assert findings[0].fixed is True
+    # Message must match the original format exactly — no "already gone" / "kill failed" suffixes.
+    assert findings[0].message == f"orphan tmux session: {own_orphan} (no matching metadata)"
+
+
 def test_two_mock_colonies_dont_cross_see(tmp_path):
     """Two colonies with distinct data_dirs each see only their own orphans."""
     from unittest.mock import MagicMock, patch
