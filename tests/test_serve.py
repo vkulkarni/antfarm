@@ -913,7 +913,7 @@ def test_carry_accepts_mission_id(client):
 
 
 def test_startup_logs_colony_hash(tmp_path, caplog):
-    """Colony startup logs the 8-char data_dir hash so operators can correlate sessions."""
+    """Colony hash log fires once when the server actually starts (lifespan startup)."""
     import logging
 
     from antfarm.core.backends.file import FileBackend
@@ -922,8 +922,16 @@ def test_startup_logs_colony_hash(tmp_path, caplog):
     data_dir = str(tmp_path / ".antfarm")
     backend = FileBackend(root=data_dir)
 
+    app = get_app(backend=backend, data_dir=data_dir)
+
+    # Log must NOT appear from get_app() alone — only on server startup.
+    pre_start_matching = [r for r in caplog.records if "colony hash:" in r.getMessage()]
+    assert not pre_start_matching, "colony hash log must not fire on get_app(), only on startup"
+
+    # Startup fires when TestClient enters its context manager.
     with caplog.at_level(logging.INFO, logger="antfarm.core.serve"):
-        get_app(backend=backend, data_dir=data_dir)
+        with TestClient(app):
+            pass
 
     expected_hash = colony_hash(data_dir)
     matching = [
@@ -931,5 +939,21 @@ def test_startup_logs_colony_hash(tmp_path, caplog):
         for r in caplog.records
         if "colony hash:" in r.getMessage() and expected_hash in r.getMessage()
     ]
-    assert matching, f"expected colony hash log, got: {[r.getMessage() for r in caplog.records]}"
+    assert matching, f"expected colony hash log on startup, got: {[r.getMessage() for r in caplog.records]}"
     assert os.path.realpath(data_dir) in matching[0].getMessage()
+
+
+def test_get_app_does_not_log_colony_hash(tmp_path, caplog):
+    """get_app() must not emit colony hash log — it only fires on server startup."""
+    import logging
+
+    from antfarm.core.backends.file import FileBackend
+
+    data_dir = str(tmp_path / ".antfarm")
+    backend = FileBackend(root=data_dir)
+
+    with caplog.at_level(logging.INFO, logger="antfarm.core.serve"):
+        get_app(backend=backend, data_dir=data_dir)
+
+    noisy = [r for r in caplog.records if "colony hash:" in r.getMessage()]
+    assert not noisy, f"get_app() must not log colony hash, but got: {[r.getMessage() for r in noisy]}"
