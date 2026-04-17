@@ -847,6 +847,66 @@ def test_sse_events_on_harvest(tmp_path):
     assert len(events) >= 1
     assert events[0]["type"] == "harvested"
     assert events[0]["task_id"] == "task-001"
+    assert events[0]["actor"] == "colony"
+
+
+def test_emit_event_default_actor_is_colony():
+    """_emit_event without an actor argument defaults to actor='colony'."""
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    serve_mod._emit_event("harvested", "task-001", "pr=x branch=y")
+
+    assert len(serve_mod._event_queue) == 1
+    assert serve_mod._event_queue[0]["actor"] == "colony"
+
+
+def test_emit_event_accepts_explicit_actor():
+    """_emit_event records whatever actor the caller passes."""
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    serve_mod._emit_event("plan_created", "plan-001", "queen made a plan", actor="queen")
+
+    assert len(serve_mod._event_queue) == 1
+    event = serve_mod._event_queue[0]
+    assert event["actor"] == "queen"
+    assert event["type"] == "plan_created"
+    assert event["task_id"] == "plan-001"
+    assert event["detail"] == "queen made a plan"
+
+
+def test_sse_events_include_actor_field(tmp_path):
+    """The /events SSE payload includes the actor key for each event."""
+    import json as json_mod
+
+    from antfarm.core.backends.file import FileBackend
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    _carry(client)
+    task = _forage(client).json()
+    attempt_id = task["current_attempt"]
+    client.post(
+        f"/tasks/{task['id']}/harvest",
+        json={"attempt_id": attempt_id, "pr": "pr-1", "branch": "feat/x"},
+    )
+
+    with client.stream("GET", "/events?after=0&timeout=2") as r:
+        assert r.status_code == 200
+        events = []
+        for line in r.iter_lines():
+            if line.startswith("data: "):
+                events.append(json_mod.loads(line[len("data: ") :]))
+
+    assert len(events) >= 1
+    assert all("actor" in event for event in events)
+    assert events[0]["actor"] == "colony"
 
 
 # ---------------------------------------------------------------------------
