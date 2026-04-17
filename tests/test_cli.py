@@ -400,7 +400,8 @@ def test_cli_doctor_sweep_prints_colony_hash_before_preview(tmp_path: Path):
         )
 
     assert result.exit_code == 0, result.output
-    assert "Colony hash:" in result.output
+    assert "Colony id:" in result.output
+    assert "hash:" in result.output
 
 
 # ---------------------------------------------------------------------------

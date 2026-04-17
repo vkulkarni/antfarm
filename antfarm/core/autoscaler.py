@@ -23,7 +23,11 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from antfarm.core.backends.base import TaskBackend
-from antfarm.core.process_manager import ProcessManager, colony_hash, get_process_manager
+from antfarm.core.process_manager import (
+    ProcessManager,
+    colony_session_hash,
+    get_process_manager,
+)
 
 if TYPE_CHECKING:
     from antfarm.core.actuator import Actuator  # noqa: F401
@@ -189,7 +193,11 @@ class Autoscaler:
         self.managed: dict[str, ManagedWorker] = {}
         self._stopped = False
         self._counter = 0
-        self._prefix = f"auto-{colony_hash(config.data_dir)}-"
+        # Ensure data_dir exists before deriving the session prefix — the
+        # persisted-UUID identity needs a real directory. See also
+        # Runner.__init__ for the matching guard.
+        os.makedirs(config.data_dir, exist_ok=True)
+        self._prefix = f"auto-{colony_session_hash(config.data_dir)}-"
         self._pm = (
             _pm
             if _pm is not None

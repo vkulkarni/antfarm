@@ -717,13 +717,13 @@ def test_check_orphan_tmux_sessions_detects_orphans(tmp_path):
     from unittest.mock import MagicMock, patch
 
     from antfarm.core.doctor import check_orphan_tmux_sessions
-    from antfarm.core.process_manager import colony_hash
+    from antfarm.core.process_manager import colony_session_hash
 
     data_dir = tmp_path / ".antfarm"
     processes_dir = data_dir / "processes"
     processes_dir.mkdir(parents=True)
 
-    h = colony_hash(str(data_dir))
+    h = colony_session_hash(str(data_dir))
     known = f"auto-{h}-builder-1"
     orphan = f"auto-{h}-planner-2"
 
@@ -837,12 +837,12 @@ def test_orphan_own_prefix_detected_as_warning(tmp_path):
     from unittest.mock import MagicMock, patch
 
     from antfarm.core.doctor import check_orphan_tmux_sessions
-    from antfarm.core.process_manager import colony_hash
+    from antfarm.core.process_manager import colony_session_hash
 
     data_dir = tmp_path / ".antfarm"
     (data_dir / "processes").mkdir(parents=True)
 
-    h = colony_hash(str(data_dir))
+    h = colony_session_hash(str(data_dir))
     orphan = f"runner-{h}-builder-7"
 
     mock_result = MagicMock()
@@ -890,12 +890,12 @@ def test_orphan_fix_kills_session(tmp_path):
     from unittest.mock import MagicMock, patch
 
     from antfarm.core.doctor import check_orphan_tmux_sessions
-    from antfarm.core.process_manager import colony_hash
+    from antfarm.core.process_manager import colony_session_hash
 
     data_dir = tmp_path / ".antfarm"
     (data_dir / "processes").mkdir(parents=True)
 
-    h = colony_hash(str(data_dir))
+    h = colony_session_hash(str(data_dir))
     own_orphan = f"auto-{h}-builder-3"
     peer = "auto-ffffffff-builder-3"
 
@@ -936,12 +936,12 @@ def _run_orphan_fix_with_kill_result(tmp_path, kill_returncode: int, kill_stderr
     from unittest.mock import MagicMock, patch
 
     from antfarm.core.doctor import check_orphan_tmux_sessions
-    from antfarm.core.process_manager import colony_hash
+    from antfarm.core.process_manager import colony_session_hash
 
     data_dir = tmp_path / ".antfarm"
     (data_dir / "processes").mkdir(parents=True)
 
-    h = colony_hash(str(data_dir))
+    h = colony_session_hash(str(data_dir))
     own_orphan = f"auto-{h}-builder-3"
 
     list_result = MagicMock()
@@ -1038,12 +1038,12 @@ def test_check_orphan_tmux_sessions_fix_mixed_batch(tmp_path):
     from unittest.mock import MagicMock, patch
 
     from antfarm.core.doctor import check_orphan_tmux_sessions
-    from antfarm.core.process_manager import colony_hash
+    from antfarm.core.process_manager import colony_session_hash
 
     data_dir = tmp_path / ".antfarm"
     (data_dir / "processes").mkdir(parents=True)
 
-    h = colony_hash(str(data_dir))
+    h = colony_session_hash(str(data_dir))
     session_clean = f"auto-{h}-builder-1"
     session_race = f"auto-{h}-builder-2"
     session_fail = f"auto-{h}-builder-3"
@@ -1110,15 +1110,15 @@ def test_two_mock_colonies_dont_cross_see(tmp_path):
     from unittest.mock import MagicMock, patch
 
     from antfarm.core.doctor import check_orphan_tmux_sessions
-    from antfarm.core.process_manager import colony_hash
+    from antfarm.core.process_manager import colony_session_hash
 
     dir_a = tmp_path / "colony-a"
     dir_b = tmp_path / "colony-b"
     (dir_a / "processes").mkdir(parents=True)
     (dir_b / "processes").mkdir(parents=True)
 
-    h_a = colony_hash(str(dir_a))
-    h_b = colony_hash(str(dir_b))
+    h_a = colony_session_hash(str(dir_a))
+    h_b = colony_session_hash(str(dir_b))
     assert h_a != h_b
 
     name_a = f"auto-{h_a}-builder-1"

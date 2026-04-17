@@ -359,6 +359,15 @@ def get_app(
     """
     global _backend, _max_attempts
 
+    # Ensure a persisted colony id exists BEFORE any other code (including
+    # the config.json read below) touches the file. colony_id() serializes
+    # its own read-modify-write, so calling it first guarantees subsequent
+    # readers see a consistent config.json with the colony_id key present.
+    if os.path.isdir(data_dir):
+        from antfarm.core.process_manager import colony_id as _ensure_colony_id
+
+        _ensure_colony_id(data_dir)
+
     # Load config up front so backend construction can see repo_path.
     repo_path: str | None = None
     integration_branch = "main"
@@ -395,10 +404,15 @@ def get_app(
         # Fires only when uvicorn actually starts — not on every get_app() call,
         # which would spam test suite logs.
         try:
-            from antfarm.core.process_manager import colony_hash
+            from antfarm.core.process_manager import colony_id, colony_session_hash
 
             resolved = os.path.realpath(data_dir)
-            logger.info("colony hash: %s (data_dir: %s)", colony_hash(data_dir), resolved)
+            logger.info(
+                "colony id: %s hash: %s (data_dir: %s)",
+                colony_id(data_dir),
+                colony_session_hash(data_dir),
+                resolved,
+            )
         except ImportError:
             pass
         yield

@@ -3,6 +3,46 @@
 This document describes breaking operational changes that require manual
 action between Antfarm versions.
 
+## 0.8.0 — Colony UUID Identity (#238)
+
+Colony identity is now a persisted UUID stored as ``colony_id`` inside
+``{data_dir}/config.json``. The 8-char hash embedded in tmux session names
+(``auto-<hash>-*``, ``runner-<hash>-*``) is derived from this UUID rather
+than from ``os.path.realpath(data_dir)``.
+
+**Why:** realpath-based identity was fragile. Moving ``.antfarm`` with
+``mv``, remounting it via NFS, or re-pointing a Docker bind-mount all
+produced a new hash, silently orphaning every running tmux session.
+A persisted UUID is stable across all three.
+
+**Consequence:** the first startup after upgrade generates a new UUID for
+each colony. Tmux sessions spawned by a pre-upgrade build used the old
+realpath-based hash, so they no longer match the colony's new prefix and
+become unmanaged orphans.
+
+**Recovery:** drain in-flight work (see the "Before you sweep" section
+below), then clean up:
+
+```bash
+antfarm doctor --sweep-legacy-tmux
+```
+
+**Escape hatch (advanced).** To preserve the old hash across the upgrade —
+e.g., when you have legacy sessions you cannot drain safely — compute the
+pre-upgrade realpath hash and seed it as ``colony_id`` in
+``config.json`` *before* the first post-upgrade startup:
+
+```bash
+python3 -c "import hashlib, os; print(hashlib.sha256(os.path.realpath('.antfarm').encode()).hexdigest()[:8])"
+# -> a1b2c3d4
+
+# then seed config.json (jq preserves other keys):
+jq '.colony_id = "a1b2c3d4"' .antfarm/config.json > /tmp/c && mv /tmp/c .antfarm/config.json
+```
+
+Any non-empty string is accepted as ``colony_id`` — the value is simply
+rehashed through SHA-256. Future operators should prefer the UUID default.
+
 ## Session-name format changes
 
 Antfarm now prefixes tmux session names with an 8-char hash of the colony's

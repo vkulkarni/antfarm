@@ -79,12 +79,12 @@ def _mock_pm() -> MagicMock:
 
 
 def test_autoscaler_uses_hashed_prefix(tmp_path):
-    """Autoscaler's ProcessManager prefix is ``auto-{colony_hash(data_dir)}-``."""
-    from antfarm.core.process_manager import colony_hash
+    """Autoscaler's ProcessManager prefix is ``auto-{colony_session_hash(data_dir)}-``."""
+    from antfarm.core.process_manager import colony_session_hash
 
     data_dir = str(tmp_path / ".antfarm")
     a = _make_autoscaler(data_dir=data_dir)
-    expected = f"auto-{colony_hash(data_dir)}-"
+    expected = f"auto-{colony_session_hash(data_dir)}-"
     assert a._prefix == expected
 
 
@@ -627,11 +627,11 @@ class TestAdoptExisting:
         """
         from unittest.mock import MagicMock, patch
 
-        from antfarm.core.process_manager import TmuxProcessManager, colony_hash
+        from antfarm.core.process_manager import TmuxProcessManager, colony_session_hash
 
         data_dir = str(tmp_path / ".antfarm")
         os.makedirs(data_dir, exist_ok=True)
-        prefix = f"auto-{colony_hash(data_dir)}-"
+        prefix = f"auto-{colony_session_hash(data_dir)}-"
         pm = TmuxProcessManager(prefix=prefix, state_dir=data_dir)
 
         list_result = MagicMock()
@@ -656,11 +656,11 @@ class TestAdoptExisting:
         """
         from unittest.mock import MagicMock, patch
 
-        from antfarm.core.process_manager import TmuxProcessManager, colony_hash
+        from antfarm.core.process_manager import TmuxProcessManager, colony_session_hash
 
         data_dir = str(tmp_path / ".antfarm")
         os.makedirs(data_dir, exist_ok=True)
-        prefix = f"auto-{colony_hash(data_dir)}-"
+        prefix = f"auto-{colony_session_hash(data_dir)}-"
         pm = TmuxProcessManager(prefix=prefix, state_dir=data_dir)
 
         # Foreign hash that is very unlikely to collide with the real hash.

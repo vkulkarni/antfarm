@@ -9,6 +9,7 @@ Use get_process_manager() to get the right implementation.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -16,6 +17,8 @@ import os
 import shlex
 import shutil
 import subprocess
+import tempfile
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,21 +31,134 @@ logger = logging.getLogger(__name__)
 SESSION_NAME_SEP = "-"
 
 
-def colony_hash(data_dir: str) -> str:
-    """Stable 8-char hex hash for this colony's tmux session prefix.
+def colony_hash(key: str) -> str:
+    """Stable 8-char hex hash primitive.
 
-    Resolves symlinks so ``data_dir``, ``./data_dir``, and the corresponding
-    absolute path collapse to the same hash. Operators who physically move
-    the directory get a new prefix — acceptable, since a move implies restart.
+    Applies ``os.path.realpath`` to the input before hashing so a directory,
+    a relative path to it, and a symlink pointing at it all collapse to the
+    same hash. For non-path inputs (e.g., ``deploy.py``'s composite
+    ``realpath(config)|colony_url`` key), realpath is a near no-op.
+
+    This function is now a pure hashing primitive. For colony identity that
+    is stable across ``mv``/NFS/Docker bind-mounts, callers should use
+    :func:`colony_session_hash`, which derives its key from a persisted UUID
+    rather than the filesystem path.
 
     Args:
-        data_dir: Colony data directory (``.antfarm/`` path or Runner state dir).
+        key: Arbitrary string (historically a colony ``data_dir`` path).
 
     Returns:
-        First 8 hex chars of SHA-256 over the resolved realpath.
+        First 8 hex chars of SHA-256 over ``realpath(key)``.
     """
-    real = os.path.realpath(data_dir)
+    real = os.path.realpath(key)
     return hashlib.sha256(real.encode("utf-8")).hexdigest()[:8]
+
+
+def colony_id(data_dir: str) -> str:
+    """Return the persisted colony identity UUID for ``data_dir``.
+
+    Colony identity is stored as the ``colony_id`` key inside
+    ``{data_dir}/config.json``. On first call the file is created or updated
+    with a fresh ``uuid.uuid4()`` value; subsequent calls return the same
+    value. A UUID is stable across filesystem operations that change the
+    path (``mv``, NFS remounts, Docker bind-mount re-pointing), while the
+    legacy ``realpath(data_dir)`` hash was not.
+
+    Concurrency: reads and writes are serialized by an ``fcntl.flock`` on
+    a sidecar lock file ``{data_dir}/.config.lock`` and the write is atomic
+    (temp file + ``fsync`` + ``os.replace``), so two threads/processes that
+    race through first-call generation agree on a single id and never lose
+    unrelated config keys.
+
+    Edge case: when ``data_dir`` does not yet exist, no file is created and
+    a synthetic ``"legacy:" + realpath(data_dir)`` sentinel is returned.
+    The sentinel is deterministic per path, will not collide with any real
+    UUID, and lets :func:`colony_session_hash` still produce a stable
+    string before the colony has materialized on disk.
+
+    Args:
+        data_dir: Colony data directory (``.antfarm/`` or Runner state dir).
+
+    Returns:
+        The persisted colony id string. May be any non-empty string; callers
+        must not assume a strict UUID shape.
+    """
+    if not os.path.isdir(data_dir):
+        # Safety net for pre-create edge cases (e.g., doctor scanning a path
+        # that hasn't been initialized yet). Do NOT create the directory —
+        # that would hide real configuration bugs.
+        return "legacy:" + os.path.realpath(data_dir)
+
+    config_path = os.path.join(data_dir, "config.json")
+    lock_path = os.path.join(data_dir, ".config.lock")
+
+    # flock serializes first-call UUID generation across threads AND processes.
+    import fcntl
+
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        cfg: dict = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path) as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        cfg = loaded
+            except (json.JSONDecodeError, OSError):
+                # Corrupt config.json — preserve nothing; a fresh id is
+                # strictly better than failing colony startup.
+                cfg = {}
+
+        existing = cfg.get("colony_id")
+        if isinstance(existing, str) and existing:
+            return existing
+
+        new_id = str(uuid.uuid4())
+        cfg["colony_id"] = new_id
+
+        # Atomic write: tempfile + fsync + os.replace. Preserves all other
+        # keys. Same-directory temp guarantees os.replace is atomic on POSIX.
+        # NamedTemporaryFile context-managed to avoid SIM115; delete=False
+        # lets us survive context exit and rename into place.
+        tmp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=data_dir,
+                prefix=".config.json.",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                tmp_name = tmp.name
+                json.dump(cfg, tmp, indent=2)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_name, config_path)
+            tmp_name = None  # ownership transferred
+        finally:
+            if tmp_name is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_name)
+
+        return new_id
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def colony_session_hash(data_dir: str) -> str:
+    """Return the 8-char session-prefix hash derived from the persisted UUID.
+
+    This is the correct identity for tmux session naming: it is stable
+    across ``mv``, NFS remounts, and Docker bind-mount re-pointing, and it
+    differs between distinct colonies sharing the same path.
+
+    Equivalent to ``colony_hash(colony_id(data_dir))``.
+    """
+    return colony_hash(colony_id(data_dir))
 
 
 def parse_session_name(name: str, prefix: str) -> tuple[str, int] | None:
