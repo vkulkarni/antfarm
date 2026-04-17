@@ -1438,3 +1438,108 @@ def test_process_one_task_empty_stdout_with_stderr_not_silent(tc, runtime):
     assert not any("[FAILURE_RECORD]" in m for m in messages)
     # Success trail entries appear
     assert "agent completed, building artifact" in messages
+
+
+# ---------------------------------------------------------------------------
+# Activity-feed events (#191)
+#
+# WorkerRuntime emits SSE events with actor='worker' during
+# _process_one_task at three lifecycle points: task_claimed (after
+# forage), workspace_created (after WorkspaceManager.create), and
+# agent_launched (just before _launch_agent).
+# ---------------------------------------------------------------------------
+
+
+def _reset_event_bus() -> None:
+    import antfarm.core.serve as serve_mod
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+
+def _worker_events() -> list[dict]:
+    """Return all events emitted with actor='worker'."""
+    import antfarm.core.serve as serve_mod
+
+    return [dict(e) for e in serve_mod._event_queue if e.get("actor") == "worker"]
+
+
+def test_process_one_task_emits_lifecycle_events(tc, runtime):
+    """A successful task processing fires task_claimed, workspace_created,
+    and agent_launched — all with actor='worker' and the right task_id."""
+    _reset_event_bus()
+    _carry(tc, task_id="task-evt-001", title="Build the thing", spec="do it")
+
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+    runtime.run()
+
+    events = _worker_events()
+    by_type = {e["type"]: e for e in events}
+
+    assert "task_claimed" in by_type
+    assert "workspace_created" in by_type
+    assert "agent_launched" in by_type
+
+    for kind in ("task_claimed", "workspace_created", "agent_launched"):
+        assert by_type[kind]["actor"] == "worker"
+        assert by_type[kind]["task_id"] == "task-evt-001"
+
+    # Detail fields carry task title, workspace path, agent type respectively
+    assert by_type["task_claimed"]["detail"] == "Build the thing"
+    assert "ws" in by_type["workspace_created"]["detail"]
+    assert by_type["agent_launched"]["detail"] == "generic"
+
+
+def test_process_one_task_emits_events_in_order(tc, runtime):
+    """Lifecycle events fire in the order: task_claimed → workspace_created → agent_launched."""
+    _reset_event_bus()
+    _carry(tc, task_id="task-evt-order", title="ordered", spec="x")
+
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+    runtime.run()
+
+    lifecycle_types = [
+        e["type"] for e in _worker_events()
+        if e["type"] in {"task_claimed", "workspace_created", "agent_launched"}
+    ]
+    assert lifecycle_types == ["task_claimed", "workspace_created", "agent_launched"]
+
+
+def test_empty_queue_emits_no_worker_events(tc, runtime):
+    """When the queue is empty, no worker lifecycle events are emitted."""
+    _reset_event_bus()
+    runtime._launch_agent = _good_agent
+    runtime.run()
+
+    assert _worker_events() == []
+
+
+def test_agent_launched_detail_reflects_agent_type(tmp_path, http_client, tc):
+    """agent_launched detail carries the worker's agent_type (e.g. 'codex')."""
+    _reset_event_bus()
+    _carry(tc, task_id="task-evt-codex", title="codex-task", spec="x")
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-codex-evt",
+        agent_type="codex",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        client=http_client,
+    )
+    rt.workspace_mgr.create = MagicMock(return_value=str(tmp_path / "ws"))
+    rt._launch_agent = _good_agent
+    rt._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    rt._create_pr = lambda task, branch, workspace: ""
+    rt.run()
+
+    launched = [e for e in _worker_events() if e["type"] == "agent_launched"]
+    assert len(launched) == 1
+    assert launched[0]["detail"] == "codex"
