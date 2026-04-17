@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.6] - 2026-04-17
+
+### Added
+- Live activity feed (#191): `/events` SSE stream now carries lifecycle events from Queen, Autoscaler, Runner, Soldier, Doctor, and Worker with an `actor` field identifying the emitting subsystem. New `scout --watch` CLI streams events as `HH:MM:SS  <actor>  <detail>` lines. TUI gains a bottom "Activity" panel that auto-updates via SSE. (#274, #275, #277, #278, #281, #282, #283, #285)
+- `_emit_event(event_type, task_id, detail, actor="colony")` — `actor` parameter added with backward-compatible default; existing `harvested`/`kickback`/`merged` emissions continue to work unchanged. (#277)
+
 ### Changed
 - Colony identity is now a persisted UUID stored as `colony_id` in `{data_dir}/config.json`. Tmux session prefixes (`auto-<hash>-*`, `runner-<hash>-*`) derive from this UUID via the new `colony_session_hash()`, making identity stable across `mv`, NFS, and Docker bind-mounts. `colony_hash()` remains as a pure hashing primitive (used by `deploy.py`). **Breaking:** first startup after upgrade generates a new UUID; pre-upgrade tmux sessions use the old realpath-based hash and become orphans — run `antfarm doctor --sweep-legacy-tmux` after draining in-flight work. See UPGRADE.md for the escape hatch to preserve an old hash. (#238)
 
