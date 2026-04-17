@@ -6,6 +6,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-16
+
 ### Added
 - Document deploy identity model in UPGRADE.md — how (realpath config + colony_url) hash determines session ownership, with examples of shared vs isolated namespaces and the localhost-tunnel edge case. (#244)
 - Per-worker current-action visibility: `POST /workers/{id}/activity`, TUI Activity column with elapsed time, and doctor `check_stuck_workers` warning for workers idle on an action > 5 min. (#239)
@@ -15,6 +17,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Fixed
 - TUI now shows actionable guidance when the colony is unreachable, including the attempted URL and commands to start/redirect. (#246)
+- Doctor `check_orphan_tmux_sessions` hardened with `LC_ALL=C` (locale-independent stderr matching) and stderr truncation at 200 chars, so log output stays predictable and benign-race markers match reliably across locales. (#242)
+- Doctor `--fix` tolerates the `tmux kill-session` race when a session exits between list and kill; benign "can't find session" / "session not found" / "no server running" messages no longer produce spurious error findings. (#236)
 
 ### Changed
 - The `colony hash: ...` startup log now fires once per server startup (FastAPI startup event) instead of on every `get_app()` call, reducing noise in test suites. (#249)
