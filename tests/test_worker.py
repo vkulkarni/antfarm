@@ -1438,3 +1438,103 @@ def test_process_one_task_empty_stdout_with_stderr_not_silent(tc, runtime):
     assert not any("[FAILURE_RECORD]" in m for m in messages)
     # Success trail entries appear
     assert "agent completed, building artifact" in messages
+
+
+# ---------------------------------------------------------------------------
+# Activity-feed events (#191)
+#
+# WorkerRuntime._process_one_task emits SSE events to serve._event_queue at
+# three runtime decision points:
+#   task_claimed      — after a successful forage      (detail: task title)
+#   workspace_created — after WorkspaceManager.create  (detail: workspace path)
+#   agent_launched    — before _launch_agent starts    (detail: agent type)
+# All three carry actor="worker" and the relevant task_id.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def clear_events():
+    """Reset the SSE event queue before each event-assertion test."""
+    from antfarm.core import serve
+
+    serve._event_queue.clear()
+    yield serve._event_queue
+
+
+def _events_of_type(queue, event_type: str) -> list[dict]:
+    return [e for e in queue if e["type"] == event_type]
+
+
+def test_process_one_task_emits_task_claimed_event(tc, runtime, clear_events):
+    _carry(tc, task_id="task-evt-claim", title="Build the gadget")
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+
+    assert runtime._process_one_task() is True
+
+    matches = _events_of_type(clear_events, "task_claimed")
+    assert len(matches) == 1
+    evt = matches[0]
+    assert evt["actor"] == "worker"
+    assert evt["task_id"] == "task-evt-claim"
+    assert "Build the gadget" in evt["detail"]
+
+
+def test_process_one_task_emits_workspace_created_event(tc, runtime, clear_events):
+    _carry(tc, task_id="task-evt-ws")
+    runtime.workspace_mgr.create = MagicMock(return_value="/tmp/ws/task-evt-ws-att-001")
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+
+    assert runtime._process_one_task() is True
+
+    matches = _events_of_type(clear_events, "workspace_created")
+    assert len(matches) == 1
+    evt = matches[0]
+    assert evt["actor"] == "worker"
+    assert evt["task_id"] == "task-evt-ws"
+    assert evt["detail"] == "/tmp/ws/task-evt-ws-att-001"
+
+
+def test_process_one_task_emits_agent_launched_event(tc, runtime, clear_events):
+    _carry(tc, task_id="task-evt-launch")
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+
+    assert runtime._process_one_task() is True
+
+    matches = _events_of_type(clear_events, "agent_launched")
+    assert len(matches) == 1
+    evt = matches[0]
+    assert evt["actor"] == "worker"
+    assert evt["task_id"] == "task-evt-launch"
+    # runtime.agent_type is "generic" in the shared fixture
+    assert evt["detail"] == "generic"
+
+
+def test_process_one_task_event_order(tc, runtime, clear_events):
+    """Events fire in lifecycle order: claimed → workspace_created → agent_launched."""
+    _carry(tc, task_id="task-evt-order")
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+
+    assert runtime._process_one_task() is True
+
+    types = [
+        e["type"]
+        for e in clear_events
+        if e["type"] in {"task_claimed", "workspace_created", "agent_launched"}
+    ]
+    assert types == ["task_claimed", "workspace_created", "agent_launched"]
+
+
+def test_process_one_task_no_events_when_queue_empty(runtime, clear_events):
+    """Empty forage returns False and emits no worker events."""
+    assert runtime._process_one_task() is False
+
+    worker_events = [e for e in clear_events if e.get("actor") == "worker"]
+    assert worker_events == []
