@@ -232,9 +232,7 @@ def test_merge_conflict_kicks_back(soldier_env):
     )
 
     # Now put conflicting change on dev AFTER the branch was made
-    _commit_file(
-        repo, "conflict.txt", "dev diverged content\n", "conflict on dev"
-    )
+    _commit_file(repo, "conflict.txt", "dev diverged content\n", "conflict on dev")
     _git(["git", "push", "origin", "dev"], cwd=repo)
 
     # Reset local dev to track origin/dev
@@ -946,9 +944,7 @@ def test_create_review_task_rereadies_on_sha_mismatch(tmp_path):
     backend.pull("w-task-rr-mm")
     pulled = backend.get_task("task-rr-mm")
     new_attempt_id = pulled["current_attempt"]
-    backend.mark_harvested(
-        "task-rr-mm", new_attempt_id, pr="PR-v2", branch="feat/task-rr-mm"
-    )
+    backend.mark_harvested("task-rr-mm", new_attempt_id, pr="PR-v2", branch="feat/task-rr-mm")
     _set_attempt_artifact_sha(backend, "task-rr-mm", "b" * 40)
     task = backend.get_task("task-rr-mm")
 
@@ -998,18 +994,14 @@ def test_rereview_is_idempotent(tmp_path):
     first = backend.get_task("review-task-rr-idem")
     assert first["status"] == "ready"
     assert first["current_attempt"] is None
-    superseded_count_1 = sum(
-        1 for a in first["attempts"] if a["status"] == "superseded"
-    )
+    superseded_count_1 = sum(1 for a in first["attempts"] if a["status"] == "superseded")
 
     # Second rereview: already ready, no current_attempt → no new supersession
     backend.rereview("review-task-rr-idem", new_spec, touches=["x"])
     second = backend.get_task("review-task-rr-idem")
     assert second["status"] == "ready"
     assert second["current_attempt"] is None
-    superseded_count_2 = sum(
-        1 for a in second["attempts"] if a["status"] == "superseded"
-    )
+    superseded_count_2 = sum(1 for a in second["attempts"] if a["status"] == "superseded")
     assert superseded_count_2 == superseded_count_1
 
 
@@ -1072,9 +1064,7 @@ def test_reattempt_end_to_end_flow(tmp_path):
     backend.store_review_verdict("task-rr-e2e", attempt_id, verdict.to_dict())
 
     # Merge queue should now include the task (require_review + passing + fresh)
-    soldier_req = Soldier.from_backend(
-        backend, repo_path=str(tmp_path), require_review=True
-    )
+    soldier_req = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
     ids = [t["id"] for t in soldier_req.get_merge_queue()]
     assert "task-rr-e2e" in ids
 
@@ -1127,9 +1117,7 @@ def test_create_review_task_noops_on_legacy_review_without_marker(tmp_path):
         "created_at": now,
         "updated_at": now,
     }
-    active_path = (
-        Path(backend._root) / "tasks" / "active" / "review-task-rr-legacy.json"
-    )
+    active_path = Path(backend._root) / "tasks" / "active" / "review-task-rr-legacy.json"
     active_path.write_text(json.dumps(legacy_review, indent=2))
 
     review_before = backend.get_task("review-task-rr-legacy")
@@ -1147,9 +1135,7 @@ def test_create_review_task_noops_on_legacy_review_without_marker(tmp_path):
     assert review_after["updated_at"] == updated_at_before
     assert len(review_after.get("trail", [])) == trail_len_before
     # Must still be in active/ folder (not bounced to ready/)
-    ready_path = (
-        Path(backend._root) / "tasks" / "ready" / "review-task-rr-legacy.json"
-    )
+    ready_path = Path(backend._root) / "tasks" / "ready" / "review-task-rr-legacy.json"
     assert not ready_path.exists()
     assert active_path.exists()
 
@@ -1199,9 +1185,7 @@ def test_run_once_with_review_rereadies_on_sha_mismatch(tmp_path):
         branch="feat/review-task-rr-roc",
     )
     # Inject a review verdict artifact so extract_verdict_from_review_task finds it
-    review_done_path = (
-        Path(backend._root) / "tasks" / "done" / "review-task-rr-roc.json"
-    )
+    review_done_path = Path(backend._root) / "tasks" / "done" / "review-task-rr-roc.json"
     rdata = json.loads(review_done_path.read_text())
     for a in rdata["attempts"]:
         if a["attempt_id"] == review_attempt_id:
@@ -1256,3 +1240,97 @@ def test_run_once_with_review_rereadies_on_sha_mismatch(tmp_path):
     for a in parent_after["attempts"]:
         if a["attempt_id"] == new_attempt_id:
             assert a.get("review_verdict") is None
+
+
+# ---------------------------------------------------------------------------
+# is_infra_task-based filtering (Issue #259)
+# ---------------------------------------------------------------------------
+
+
+def _carry_and_harvest_with_caps(
+    colony_client: ColonyClient,
+    repo_path: str,
+    task_id: str,
+    branch_name: str,
+    capabilities_required: list[str],
+) -> dict:
+    """Like _carry_and_harvest, but sets capabilities_required on the task."""
+    worker_id = f"worker-{task_id}"
+    colony_client.register_worker(
+        worker_id=worker_id,
+        node_id="node-1",
+        agent_type="generic",
+        workspace_root="/tmp/ws",
+        capabilities=capabilities_required,
+    )
+    colony_client._client.post(
+        "/tasks",
+        json={
+            "id": task_id,
+            "title": f"Task {task_id}",
+            "spec": "do the thing",
+            "depends_on": [],
+            "priority": 10,
+            "capabilities_required": capabilities_required,
+        },
+    ).raise_for_status()
+
+    task = colony_client.forage(worker_id)
+    assert task is not None
+    attempt_id = task["current_attempt"]
+
+    _git(["git", "checkout", "-b", branch_name, "origin/dev"], cwd=repo_path)
+    _commit_file(repo_path, f"{task_id}.txt", "change\n", f"work for {task_id}")
+    _git(["git", "push", "origin", branch_name], cwd=repo_path)
+    _git(["git", "checkout", "dev"], cwd=repo_path)
+
+    colony_client.harvest(
+        task_id=task_id,
+        attempt_id=attempt_id,
+        pr=f"https://github.com/x/y/pull/{task_id}",
+        branch=branch_name,
+    )
+    return colony_client.get_task(task_id)
+
+
+def test_process_done_tasks_skips_review_capability_task(soldier_env):
+    """Task with capabilities_required=['review'] but non-'review-' id is skipped.
+
+    Exercises the is_infra_task() consolidation: previously only ids starting
+    with 'review-' were skipped in process_done_tasks. Now any task whose
+    capabilities include 'review' is treated as infra.
+    """
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest_with_caps(
+        cc,
+        repo,
+        "task-cap-review",
+        "feat/task-cap-review",
+        capabilities_required=["review"],
+    )
+
+    created = soldier.process_done_tasks()
+    # Should NOT create a review-of-review task
+    assert not any("task-cap-review" in rid for rid in created)
+
+
+def test_get_done_candidates_skips_review_capability_task(soldier_env):
+    """Task with capabilities_required=['review'] but non-'review-' id is
+    excluded from the merge queue via _get_done_candidates."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest_with_caps(
+        cc,
+        repo,
+        "task-cap-review-2",
+        "feat/task-cap-review-2",
+        capabilities_required=["review"],
+    )
+
+    candidates = soldier._get_done_candidates()
+    assert not any(t["id"] == "task-cap-review-2" for t in candidates)
