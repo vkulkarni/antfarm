@@ -245,6 +245,10 @@ class HeartbeatRequest(BaseModel):
     cooldown_until: str | None = None
 
 
+class ActivityRequest(BaseModel):
+    action: str | None = None
+
+
 class PullRequest(BaseModel):
     worker_id: str
 
@@ -479,6 +483,16 @@ def get_app(
         if req.cooldown_until is not None or "cooldown_until" not in (req.status or {}):
             update["cooldown_until"] = req.cooldown_until
         _backend.heartbeat(worker_id, update)
+        return {"ok": True}
+
+    @app.post("/workers/{worker_id:path}/activity", status_code=200)
+    def worker_activity(worker_id: str, req: ActivityRequest):
+        """Set or clear the worker's current action.
+
+        Does not update last_heartbeat — activity is a separate signal. Unknown
+        workers are a silent no-op at the backend layer.
+        """
+        _backend.update_worker_activity(worker_id, req.action)
         return {"ok": True}
 
     @app.get("/workers", status_code=200)

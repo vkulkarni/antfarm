@@ -370,9 +370,7 @@ class FileBackend(TaskBackend):
             self._write_json(active_path, data)
             os.rename(active_path, done_path)
 
-    def kickback(
-        self, task_id: str, reason: str, max_attempts: int = 3
-    ) -> None:
+    def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
         """Move task from done/ to ready/ or blocked/ if max attempts exhausted.
 
         Soldier calls kickback after a failed integration merge. The task
@@ -419,21 +417,16 @@ class FileBackend(TaskBackend):
             finished = sum(
                 1
                 for a in data["attempts"]
-                if a["status"]
-                in (AttemptStatus.DONE.value, AttemptStatus.SUPERSEDED.value)
+                if a["status"] in (AttemptStatus.DONE.value, AttemptStatus.SUPERSEDED.value)
             )
 
             if finished >= effective_max:
-                assert_task_transition(
-                    data["status"], TaskStatus.BLOCKED.value
-                )
+                assert_task_transition(data["status"], TaskStatus.BLOCKED.value)
                 data["status"] = TaskStatus.BLOCKED.value
                 self._write_json(done_path, data)
                 os.rename(done_path, self._blocked_path(task_id))
             else:
-                assert_task_transition(
-                    data["status"], TaskStatus.READY.value
-                )
+                assert_task_transition(data["status"], TaskStatus.READY.value)
                 data["status"] = TaskStatus.READY.value
                 self._write_json(done_path, data)
                 os.rename(done_path, self._ready_path(task_id))
@@ -464,9 +457,7 @@ class FileBackend(TaskBackend):
             data["updated_at"] = _now_iso()
             self._write_json(active_path, data)
 
-    def store_review_verdict(
-        self, task_id: str, attempt_id: str, verdict: dict
-    ) -> None:
+    def store_review_verdict(self, task_id: str, attempt_id: str, verdict: dict) -> None:
         """Store a ReviewVerdict on the task's current attempt in done/."""
         with self._lock:
             done_path = self._done_path(task_id)
@@ -526,9 +517,7 @@ class FileBackend(TaskBackend):
         with self._lock:
             path = self._find_task_path(review_task_id)
             if path is None:
-                raise FileNotFoundError(
-                    f"Review task '{review_task_id}' not found"
-                )
+                raise FileNotFoundError(f"Review task '{review_task_id}' not found")
 
             data = self._read_json(path)
             now = _now_iso()
@@ -545,9 +534,7 @@ class FileBackend(TaskBackend):
                 data["current_attempt"] = None
 
             # Normalize touches: trim + dedupe (preserve case)
-            data["touches"] = list(
-                dict.fromkeys(t.strip() for t in (touches or []))
-            )
+            data["touches"] = list(dict.fromkeys(t.strip() for t in (touches or [])))
             data["spec"] = new_spec
 
             trail_entry = TrailEntry(
@@ -937,6 +924,27 @@ class FileBackend(TaskBackend):
         data["last_heartbeat"] = _now_iso()
         self._write_json(worker_path, data)
         # Touch to ensure mtime reflects now (write_json via replace does this)
+
+    def update_worker_activity(self, worker_id: str, action: str | None) -> None:
+        """Set current_action / current_action_at on the worker file.
+
+        Does not update ``last_heartbeat`` — activity is a separate signal so a
+        worker stuck on a tool call can be flagged even while heartbeating.
+        Silently no-ops if the worker file does not exist so early hook firings
+        cannot interfere with registration flow.
+        """
+        worker_path = self._worker_path(worker_id)
+        with self._lock:
+            if not worker_path.exists():
+                return
+            data = self._read_json(worker_path)
+            if action is None or action == "":
+                data["current_action"] = None
+                data["current_action_at"] = None
+            else:
+                data["current_action"] = action[:200]
+                data["current_action_at"] = _now_iso()
+            self._write_json(worker_path, data)
 
     # ------------------------------------------------------------------
     # Workers (list)

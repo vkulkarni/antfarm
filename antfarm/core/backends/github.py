@@ -42,8 +42,7 @@ from .base import TaskBackend
 
 _GITHUB_API = "https://api.github.com"
 _GITHUB_BACKEND_MSG = (
-    "Mission mode requires FileBackend in v0.6.0. "
-    "Use --backend file or wait for v0.6.1."
+    "Mission mode requires FileBackend in v0.6.0. Use --backend file or wait for v0.6.1."
 )
 _SPEC_FENCE_OPEN = "<!-- antfarm-spec\n"
 _SPEC_FENCE_CLOSE = "\n-->"
@@ -189,11 +188,15 @@ class GitHubBackend(TaskBackend):
             self._api("GET", f"/labels/{name}")
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
-                self._api("POST", "/labels", json={
-                    "name": name,
-                    "color": "0075ca",
-                    "description": f"Antfarm managed label: {name}",
-                })
+                self._api(
+                    "POST",
+                    "/labels",
+                    json={
+                        "name": name,
+                        "color": "0075ca",
+                        "description": f"Antfarm managed label: {name}",
+                    },
+                )
             else:
                 raise
 
@@ -228,11 +231,14 @@ class GitHubBackend(TaskBackend):
 
     def _find_issues_by_label(self, label: str, state: str = "open") -> list[dict]:
         """List issues with a specific label."""
-        return self._paginated_get("/issues", {
-            "labels": label,
-            "state": state,
-            "per_page": 100,
-        })
+        return self._paginated_get(
+            "/issues",
+            {
+                "labels": label,
+                "state": state,
+                "per_page": 100,
+            },
+        )
 
     def _issue_to_task(self, issue: dict) -> dict:
         """Parse a GitHub Issue dict into an Antfarm task dict.
@@ -353,11 +359,15 @@ class GitHubBackend(TaskBackend):
         self._ensure_label(ready_label)
 
         body = _render_body(task)
-        self._api("POST", "/issues", json={
-            "title": task.get("title", task_id),
-            "body": body,
-            "labels": [ready_label],
-        })
+        self._api(
+            "POST",
+            "/issues",
+            json={
+                "title": task.get("title", task_id),
+                "body": body,
+                "labels": [ready_label],
+            },
+        )
         return task_id
 
     def pull(self, worker_id: str) -> dict | None:
@@ -623,17 +633,13 @@ class GitHubBackend(TaskBackend):
         self._api("PATCH", f"/issues/{issue_number}", json={"state": "closed"})
         self._add_comment(issue_number, "[merged] Task merged successfully.")
 
-    def store_review_verdict(
-        self, task_id: str, attempt_id: str, verdict: dict
-    ) -> None:
+    def store_review_verdict(self, task_id: str, attempt_id: str, verdict: dict) -> None:
         """Store a ReviewVerdict on the task's current attempt."""
         task, issue_number = self._get_task_issue(task_id)
         if issue_number is None:
             raise FileNotFoundError(f"Task '{task_id}' not found")
         if task.get("current_attempt") != attempt_id:
-            raise ValueError(
-                f"attempt_id '{attempt_id}' is not the current attempt"
-            )
+            raise ValueError(f"attempt_id '{attempt_id}' is not the current attempt")
         for a in task["attempts"]:
             if a["attempt_id"] == attempt_id:
                 a["review_verdict"] = verdict
@@ -717,9 +723,7 @@ class GitHubBackend(TaskBackend):
         self._ensure_label(ready_label)
         self._swap_labels(issue_number, ["active"], "ready")
 
-        self._close_superseded_pr(
-            superseded_attempt, f"task reassigned to {worker_id}"
-        )
+        self._close_superseded_pr(superseded_attempt, f"task reassigned to {worker_id}")
 
     def block_task(self, task_id: str, reason: str) -> None:
         """Block a ready task. Swap label ready -> blocked."""
@@ -924,6 +928,20 @@ class GitHubBackend(TaskBackend):
             self._workers[worker_id] = {"worker_id": worker_id}
         self._workers[worker_id].update(status)
         self._workers[worker_id]["last_heartbeat"] = _now_iso()
+
+    def update_worker_activity(self, worker_id: str, action: str | None) -> None:
+        """Set current_action / current_action_at on the worker record.
+
+        Silently no-ops for unknown worker IDs. Does not touch last_heartbeat.
+        """
+        if worker_id not in self._workers:
+            return
+        if action is None or action == "":
+            self._workers[worker_id]["current_action"] = None
+            self._workers[worker_id]["current_action_at"] = None
+        else:
+            self._workers[worker_id]["current_action"] = action[:200]
+            self._workers[worker_id]["current_action_at"] = _now_iso()
 
     def list_workers(self) -> list[dict]:
         """Return all registered workers."""

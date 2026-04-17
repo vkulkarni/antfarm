@@ -50,6 +50,7 @@ def run_doctor(backend, config: dict, fix: bool = False) -> list[Finding]:
     findings.extend(check_colony_reachable(config))
     findings.extend(check_git_config())
     findings.extend(check_stale_workers(backend, config, fix))
+    findings.extend(check_stuck_workers(backend, config, fix))
     findings.extend(check_stale_tasks(backend, config, fix))
     findings.extend(check_stale_guards(backend, config, fix))
     findings.extend(check_workspace_conflicts(backend))
@@ -295,6 +296,87 @@ def check_stale_workers(backend, config: dict, fix: bool = False) -> list[Findin
         except FileNotFoundError:
             # File disappeared between glob and stat
             continue
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 4b: Stuck workers (fresh heartbeat, stale current_action_at)
+# ---------------------------------------------------------------------------
+
+
+def check_stuck_workers(backend, config: dict, fix: bool = False) -> list[Finding]:
+    """Flag workers whose current_action has been in flight longer than stuck_ttl.
+
+    A worker is "stuck" when its heartbeat is fresh (so it is not a stale
+    worker) but its ``current_action_at`` is older than ``stuck_ttl`` seconds.
+    This means the worker is still alive but has been executing a single tool
+    call (or other activity) for too long — usually a symptom of a hung
+    subprocess, a network-pegged tool, or an agent spinning on a stuck loop.
+
+    This check never auto-fixes. It emits a warning so operators can
+    investigate or kill the worker manually.
+
+    Args:
+        backend: TaskBackend instance.
+        config: Doctor config dict; ``stuck_ttl`` (default 300) controls the
+            threshold in seconds. ``worker_ttl`` (default 300) determines
+            whether heartbeat is considered fresh.
+        fix: Unused — stuck workers are not auto-fixable.
+
+    Returns:
+        List of findings, one per stuck worker.
+    """
+    del fix  # unused; stuck workers are reported, not auto-fixed
+    findings: list[Finding] = []
+    data_dir = Path(config["data_dir"])
+    stuck_ttl = config.get("stuck_ttl", 300)
+    worker_ttl = config.get("worker_ttl", 300)
+    workers_dir = data_dir / "workers"
+
+    if not workers_dir.exists():
+        return findings
+
+    now = datetime.now(UTC)
+    now_ts = now.timestamp()
+    for worker_file in workers_dir.glob("*.json"):
+        try:
+            stat = os.stat(str(worker_file))
+            heartbeat_age = now_ts - stat.st_mtime
+            if heartbeat_age > worker_ttl:
+                # Already caught by check_stale_workers — don't double-report
+                continue
+            with open(str(worker_file)) as fh:
+                data = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+
+        action = data.get("current_action")
+        action_at = data.get("current_action_at")
+        if not action or not action_at:
+            continue
+
+        try:
+            start = datetime.fromisoformat(action_at)
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=UTC)
+            elapsed = int((now - start).total_seconds())
+        except (ValueError, TypeError):
+            continue
+
+        if elapsed > stuck_ttl:
+            worker_id = data.get("worker_id", worker_file.stem)
+            findings.append(
+                Finding(
+                    severity="warning",
+                    check="stuck_worker",
+                    message=(
+                        f"Worker {worker_id!r} stuck on '{action}' for {elapsed}s "
+                        f"(threshold={stuck_ttl}s)"
+                    ),
+                    auto_fixable=False,
+                )
+            )
 
     return findings
 

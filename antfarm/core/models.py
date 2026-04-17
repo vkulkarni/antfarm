@@ -489,6 +489,8 @@ class Worker:
     status: WorkerStatus = WorkerStatus.IDLE
     capabilities: list[str] = field(default_factory=list)
     cooldown_until: str | None = None
+    current_action: str | None = None
+    current_action_at: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -501,6 +503,8 @@ class Worker:
             "registered_at": self.registered_at,
             "last_heartbeat": self.last_heartbeat,
             "cooldown_until": self.cooldown_until,
+            "current_action": self.current_action,
+            "current_action_at": self.current_action_at,
         }
 
     @classmethod
@@ -515,6 +519,8 @@ class Worker:
             registered_at=data["registered_at"],
             last_heartbeat=data["last_heartbeat"],
             cooldown_until=data.get("cooldown_until"),
+            current_action=data.get("current_action"),
+            current_action_at=data.get("current_action_at"),
         )
 
 

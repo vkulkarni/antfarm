@@ -378,12 +378,11 @@ def test_scent_new_entries(tmp_path):
         assert r.status_code == 200
         for line in r.iter_lines():
             if line.startswith("data: "):
-                entry = json.loads(line[len("data: "):])
+                entry = json.loads(line[len("data: ") :])
                 messages.append(entry.get("message", ""))
 
     t.join(timeout=5)
     assert "late entry" in messages
-
 
 
 def test_carry_with_capabilities_and_pull_with_capable_worker(tmp_path):
@@ -594,6 +593,62 @@ def test_heartbeat_without_rate_limit_fields(client):
 
 
 # ---------------------------------------------------------------------------
+# Worker activity endpoint (#239)
+# ---------------------------------------------------------------------------
+
+
+def test_activity_endpoint_stamps_timestamp(client):
+    """POST /workers/{id}/activity sets current_action and current_action_at."""
+    _register_worker(client, "worker-act")
+    r = client.post(
+        "/workers/worker-act/activity",
+        json={"action": "Running: Bash"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"ok": True}
+
+    workers = client.get("/workers").json()
+    worker = next(w for w in workers if w["worker_id"] == "worker-act")
+    assert worker["current_action"] == "Running: Bash"
+    assert worker["current_action_at"] is not None
+
+
+def test_activity_endpoint_clears_with_null(client):
+    """POST /workers/{id}/activity with null action clears both fields."""
+    _register_worker(client, "worker-act")
+    client.post("/workers/worker-act/activity", json={"action": "Running: Bash"})
+    client.post("/workers/worker-act/activity", json={"action": None})
+
+    worker = next(w for w in client.get("/workers").json() if w["worker_id"] == "worker-act")
+    assert worker["current_action"] is None
+    assert worker["current_action_at"] is None
+
+
+def test_activity_independent_from_heartbeat(client):
+    """Activity endpoint must not touch last_heartbeat."""
+    _register_worker(client, "worker-act")
+    before = next(w for w in client.get("/workers").json() if w["worker_id"] == "worker-act")
+    original_hb = before["last_heartbeat"]
+
+    import time as _time
+
+    _time.sleep(0.01)
+    r = client.post("/workers/worker-act/activity", json={"action": "Running: Bash"})
+    assert r.status_code == 200
+
+    after = next(w for w in client.get("/workers").json() if w["worker_id"] == "worker-act")
+    assert after["last_heartbeat"] == original_hb
+
+
+def test_activity_endpoint_unknown_worker_noop(client):
+    """Unknown worker is a silent 200 no-op (never creates a worker record)."""
+    r = client.post("/workers/ghost-worker/activity", json={"action": "Running: Bash"})
+    assert r.status_code == 200
+    # No worker record should have been created
+    assert client.get("/workers").json() == []
+
+
+# ---------------------------------------------------------------------------
 # Rate limit: GET /workers endpoint
 # ---------------------------------------------------------------------------
 
@@ -711,37 +766,35 @@ def test_from_backend_idempotent_review_creation(tmp_path):
     from antfarm.core.soldier import Soldier
 
     backend = FileBackend(root=str(tmp_path / ".antfarm"))
-    soldier = Soldier.from_backend(
-        backend, repo_path=str(tmp_path), require_review=True
-    )
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
 
     # Carry a task, forage, and harvest it manually
     from datetime import UTC, datetime
 
     now = datetime.now(UTC).isoformat()
-    backend.carry({
-        "id": "task-001",
-        "title": "Test",
-        "spec": "spec",
-        "complexity": "M",
-        "priority": 10,
-        "depends_on": [],
-        "touches": [],
-        "capabilities_required": [],
-        "created_by": "test",
-        "status": "ready",
-        "current_attempt": None,
-        "attempts": [],
-        "trail": [],
-        "signals": [],
-        "created_at": now,
-        "updated_at": now,
-    })
+    backend.carry(
+        {
+            "id": "task-001",
+            "title": "Test",
+            "spec": "spec",
+            "complexity": "M",
+            "priority": 10,
+            "depends_on": [],
+            "touches": [],
+            "capabilities_required": [],
+            "created_by": "test",
+            "status": "ready",
+            "current_attempt": None,
+            "attempts": [],
+            "trail": [],
+            "signals": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
     task = backend.pull("worker-1")
     assert task is not None
-    backend.mark_harvested(
-        "task-001", task["current_attempt"], "pr-url", "feat/branch"
-    )
+    backend.mark_harvested("task-001", task["current_attempt"], "pr-url", "feat/branch")
 
     # Create review task
     done_task = backend.get_task("task-001")
@@ -789,7 +842,7 @@ def test_sse_events_on_harvest(tmp_path):
         events = []
         for line in r.iter_lines():
             if line.startswith("data: "):
-                events.append(json_mod.loads(line[len("data: "):]))
+                events.append(json_mod.loads(line[len("data: ") :]))
 
     assert len(events) >= 1
     assert events[0]["type"] == "harvested"

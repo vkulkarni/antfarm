@@ -128,6 +128,78 @@ def test_stale_worker_fixed(setup):
 
 
 # ---------------------------------------------------------------------------
+# Stuck worker checks (#239)
+# ---------------------------------------------------------------------------
+
+
+def test_stuck_worker_detected(setup):
+    """Fresh heartbeat + stale current_action_at emits a stuck_worker warning."""
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-stuck"))
+
+    # Simulate an activity set in the past by writing directly into the worker file.
+    worker_file = Path(config["data_dir"]) / "workers" / "worker-stuck.json"
+    data = json.loads(worker_file.read_text())
+    stale_ts = datetime.now(UTC).timestamp() - 600
+    data["current_action"] = "Running: Bash"
+    data["current_action_at"] = datetime.fromtimestamp(stale_ts, tz=UTC).isoformat()
+    worker_file.write_text(json.dumps(data))
+    # Keep heartbeat fresh: touch mtime to now so check_stale_workers doesn't fire.
+    now = time.time()
+    os.utime(str(worker_file), (now, now))
+
+    findings = run_doctor(backend, config, fix=False)
+    stuck = [f for f in findings if f.check == "stuck_worker"]
+    assert len(stuck) == 1
+    assert "worker-stuck" in stuck[0].message
+    assert "Running: Bash" in stuck[0].message
+    assert stuck[0].severity == "warning"
+    assert stuck[0].auto_fixable is False
+    assert stuck[0].fixed is False
+
+
+def test_stuck_worker_not_detected_when_recent(setup):
+    """Action set recently does not trigger the stuck_worker check."""
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-ok"))
+    backend.update_worker_activity("worker-ok", "Running: Bash")
+
+    findings = run_doctor(backend, config, fix=False)
+    stuck = [f for f in findings if f.check == "stuck_worker"]
+    assert stuck == []
+
+
+def test_stuck_worker_not_detected_without_action(setup):
+    """Worker without current_action is never stuck."""
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-idle"))
+
+    findings = run_doctor(backend, config, fix=False)
+    stuck = [f for f in findings if f.check == "stuck_worker"]
+    assert stuck == []
+
+
+def test_stuck_worker_not_double_reported_when_heartbeat_also_stale(setup):
+    """A worker with stale heartbeat is only reported as stale, not also stuck."""
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-dead"))
+
+    worker_file = Path(config["data_dir"]) / "workers" / "worker-dead.json"
+    data = json.loads(worker_file.read_text())
+    data["current_action"] = "Running: Bash"
+    data["current_action_at"] = datetime.fromtimestamp(time.time() - 600, tz=UTC).isoformat()
+    worker_file.write_text(json.dumps(data))
+    # Backdate heartbeat mtime — stale worker
+    _backdate(worker_file, seconds=1200)
+
+    findings = run_doctor(backend, config, fix=False)
+    stale = [f for f in findings if f.check == "stale_worker"]
+    stuck = [f for f in findings if f.check == "stuck_worker"]
+    assert len(stale) == 1
+    assert stuck == []
+
+
+# ---------------------------------------------------------------------------
 # 4. test_stale_task_detected
 # ---------------------------------------------------------------------------
 

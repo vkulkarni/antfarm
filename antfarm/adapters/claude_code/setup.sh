@@ -41,14 +41,27 @@ for agent_md in "${ADAPTER_DIR}/agents/"*.md; do
   fi
 done
 
-# 3. Add heartbeat PostToolUse hook to .claude/settings.json
+# 3. Add heartbeat + activity hooks to .claude/settings.json
 HEARTBEAT_CMD="${ADAPTER_DIR}/hooks/heartbeat.sh"
+PRE_TOOL_CMD="${ADAPTER_DIR}/hooks/pre_tool.sh"
+POST_TOOL_CMD="${ADAPTER_DIR}/hooks/post_tool.sh"
 
 if [ ! -f "${SETTINGS_FILE}" ]; then
-  # Create a minimal settings.json with the heartbeat hook
+  # Create a minimal settings.json with heartbeat + activity hooks
   cat > "${SETTINGS_FILE}" <<EOF
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${PRE_TOOL_CMD}"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "",
@@ -56,6 +69,10 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
           {
             "type": "command",
             "command": "${HEARTBEAT_CMD}"
+          },
+          {
+            "type": "command",
+            "command": "${POST_TOOL_CMD}"
           }
         ]
       }
@@ -63,9 +80,9 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
   }
 }
 EOF
-  echo "[created] ${SETTINGS_FILE} with heartbeat hook"
+  echo "[created] ${SETTINGS_FILE} with heartbeat + activity hooks"
 else
-  # Check if heartbeat is already present
+  # Heartbeat already present?
   if grep -q "heartbeat.sh" "${SETTINGS_FILE}" 2>/dev/null; then
     echo "[exists]  heartbeat hook already in ${SETTINGS_FILE}"
   else
@@ -79,6 +96,17 @@ else
     echo '          }'
     echo ""
   fi
+
+  # Activity hooks already present?
+  if grep -q "pre_tool.sh" "${SETTINGS_FILE}" 2>/dev/null; then
+    echo "[exists]  activity hooks already in ${SETTINGS_FILE}"
+  else
+    echo ""
+    echo "[manual]  activity hooks NOT added automatically — settings.json already exists."
+    echo "          Add a PreToolUse entry pointing to ${PRE_TOOL_CMD}"
+    echo "          and an additional PostToolUse entry pointing to ${POST_TOOL_CMD}."
+    echo ""
+  fi
 fi
 
 echo ""
@@ -87,6 +115,7 @@ echo "  .claude/agents/worker.md   — worker agent (forage → implement → ha
 echo "  .claude/agents/soldier.md  — v0.2 placeholder (conflict resolution)"
 echo "  .claude/agents/queen.md    — example: AI-driven task decomposition"
 echo "  PostToolUse heartbeat hook — keeps worker slot alive automatically"
+echo "  PreToolUse/PostToolUse activity hooks — surface current worker action in TUI"
 echo ""
 echo "Set environment variables before starting a worker session:"
 echo "  export ANTFARM_URL=http://localhost:8000"
