@@ -17,6 +17,7 @@ Policy:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import subprocess
 import time
@@ -60,6 +61,7 @@ class Soldier:
         test_command: list[str] | None = None,
         poll_interval: float = 30.0,
         require_review: bool = False,
+        poll_external_merges: bool = True,
         client=None,
     ):
         self.colony = ColonyClient(colony_url, client=client)
@@ -68,6 +70,7 @@ class Soldier:
         self.test_command = test_command or ["pytest", "-x", "-q"]
         self.poll_interval = poll_interval
         self.require_review = require_review
+        self.poll_external_merges = poll_external_merges
         self.last_failure_reason = ""
 
     # ------------------------------------------------------------------
@@ -84,6 +87,8 @@ class Soldier:
                 time.sleep(self.poll_interval)
                 continue
             for task in queue:
+                if self._reconcile_external_merge(task):
+                    continue
                 result = self.attempt_merge(task)
                 attempt_id = task["current_attempt"]
                 if result == MergeResult.MERGED:
@@ -102,6 +107,9 @@ class Soldier:
         results = []
         queue = self.get_merge_queue()
         for task in queue:
+            if self._reconcile_external_merge(task):
+                results.append((task["id"], MergeResult.MERGED))
+                continue
             result = self.attempt_merge(task)
             attempt_id = task["current_attempt"]
             if result == MergeResult.MERGED:
@@ -587,6 +595,74 @@ class Soldier:
         return None
 
     @staticmethod
+    def _get_attempt_pr(task: dict) -> str | None:
+        """Extract the PR URL/identifier from the task's current attempt."""
+        current_attempt_id = task.get("current_attempt")
+        if not current_attempt_id:
+            return None
+        for attempt in task.get("attempts", []):
+            if attempt.get("attempt_id") == current_attempt_id:
+                return attempt.get("pr") or None
+        return None
+
+    def _check_pr_merged_on_origin(self, pr: str) -> bool | None:
+        """Check whether a PR has been merged on the origin (GitHub).
+
+        Shells out to ``gh pr view <pr> --json state -q '.state'``.
+
+        Returns:
+            True  — PR state is "MERGED"
+            False — PR state is "OPEN" or "CLOSED" (not merged)
+            None  — unable to determine (gh missing, network error, timeout,
+                    unexpected output). Callers should fall through to the
+                    normal merge path.
+        """
+        if not pr:
+            return None
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "view", pr, "--json", "state", "-q", ".state"],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        state = (result.stdout or "").strip()
+        if state == "MERGED":
+            return True
+        if state in ("OPEN", "CLOSED"):
+            return False
+        return None
+
+    def _reconcile_external_merge(self, task: dict) -> bool:
+        """Mark the task as merged if its PR was merged on origin.
+
+        Returns True if the attempt was reconciled (mark_merged called or
+        already-merged). Returns False if no reconciliation happened and the
+        caller should fall through to the normal merge path.
+        """
+        if not self.poll_external_merges:
+            return False
+        pr = self._get_attempt_pr(task)
+        if not pr:
+            return False
+        merged = self._check_pr_merged_on_origin(pr)
+        if merged is not True:
+            return False
+        task_id = task["id"]
+        attempt_id = task["current_attempt"]
+        # ValueError means already merged — idempotent no-op.
+        with contextlib.suppress(ValueError):
+            self.colony.mark_merged(task_id, attempt_id)
+        logger.info("reconciled externally-merged PR %s for %s", pr, task_id)
+        return True
+
+    @staticmethod
     def _has_merged_attempt(task: dict) -> bool:
         """Return True if the task has at least one attempt with status MERGED."""
         return any(attempt.get("status") == "merged" for attempt in task.get("attempts", []))
@@ -858,6 +934,7 @@ class Soldier:
         test_command: list[str] | None = None,
         poll_interval: float = 30.0,
         require_review: bool = True,
+        poll_external_merges: bool = True,
     ) -> Soldier:
         """Create a Soldier that talks directly to a TaskBackend.
 
@@ -873,6 +950,7 @@ class Soldier:
         instance.test_command = test_command or ["pytest", "-x", "-q"]
         instance.poll_interval = poll_interval
         instance.require_review = require_review
+        instance.poll_external_merges = poll_external_merges
         instance.last_failure_reason = ""
         return instance
 

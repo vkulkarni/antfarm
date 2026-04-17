@@ -873,6 +873,17 @@ def harvest(
     click.echo(f"Task harvested: {result}")
 
 
+@main.command("mark-merged")
+@click.argument("task_id")
+@click.option("--attempt-id", required=True, help="The attempt ID to mark MERGED.")
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def mark_merged(task_id: str, attempt_id: str, colony_url: str, token: str | None):
+    """Manually reconcile a task whose PR was merged outside Antfarm."""
+    result = _post(colony_url, f"/tasks/{task_id}/merge", {"attempt_id": attempt_id}, token=token)
+    click.echo(f"Task marked merged: {result}")
+
+
 @main.command()
 @click.argument("resource")
 @click.option("--owner", required=True, help="Owner identifier for this guard.")

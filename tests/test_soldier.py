@@ -1358,3 +1358,81 @@ def test_get_merge_queue_skips_review_capability_task(soldier_env):
 
     queue = soldier.get_merge_queue()
     assert not any(t["id"] == "task-cap-review-3" for t in queue)
+
+
+# ---------------------------------------------------------------------------
+# External merge reconciliation (#264)
+# ---------------------------------------------------------------------------
+
+
+def test_run_once_skips_externally_merged_pr(soldier_env, monkeypatch):
+    """When gh reports the PR as MERGED, mark_merged is called and attempt_merge is skipped."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-ext-merged", "feat/task-ext-merged")
+
+    # Fake: origin reports MERGED
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", lambda self, pr: True)
+
+    # Fail loudly if attempt_merge is invoked — the reconciler should short-circuit.
+    def _fail(*_a, **_k):  # pragma: no cover — invoked only on regression
+        raise AssertionError("attempt_merge should not run when PR is already merged on origin")
+
+    monkeypatch.setattr(Soldier, "attempt_merge", _fail)
+
+    results = soldier.run_once()
+    assert results == [("task-ext-merged", MergeResult.MERGED)]
+
+    task = cc.get_task("task-ext-merged")
+    attempts = task["attempts"]
+    assert any(a["status"] == "merged" for a in attempts)
+
+
+def test_run_once_proceeds_when_pr_not_merged(soldier_env, monkeypatch):
+    """When gh reports the PR as not merged (False), the normal merge path runs."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-ext-open", "feat/task-ext-open")
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", lambda self, pr: False)
+
+    calls: list[str] = []
+    real_attempt_merge = Soldier.attempt_merge
+
+    def _tracking(self, task):
+        calls.append(task["id"])
+        return real_attempt_merge(self, task)
+
+    monkeypatch.setattr(Soldier, "attempt_merge", _tracking)
+
+    results = soldier.run_once()
+    assert calls == ["task-ext-open"]
+    assert results == [("task-ext-open", MergeResult.MERGED)]
+
+
+def test_run_once_falls_through_on_unknown(soldier_env, monkeypatch):
+    """When gh status is unknown (None), the normal merge path runs."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-ext-unknown", "feat/task-ext-unknown")
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", lambda self, pr: None)
+
+    calls: list[str] = []
+    real_attempt_merge = Soldier.attempt_merge
+
+    def _tracking(self, task):
+        calls.append(task["id"])
+        return real_attempt_merge(self, task)
+
+    monkeypatch.setattr(Soldier, "attempt_merge", _tracking)
+
+    results = soldier.run_once()
+    assert calls == ["task-ext-unknown"]
+    assert results == [("task-ext-unknown", MergeResult.MERGED)]
