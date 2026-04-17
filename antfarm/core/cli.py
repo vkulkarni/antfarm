@@ -1017,7 +1017,7 @@ def deploy(
     from antfarm.core.deploy import deploy_status
 
     if show_status:
-        status = deploy_status(fleet_config)
+        status = deploy_status(fleet_config, colony_url)
         for node_id, sessions in status.items():
             if sessions:
                 click.echo(f"{node_id}: {len(sessions)} session(s) running")
