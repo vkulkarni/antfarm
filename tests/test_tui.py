@@ -4,6 +4,7 @@ Tests classification, helpers, render methods, and pipeline bar
 without any live terminal or network I/O.
 """
 
+import httpx
 from rich.table import Table
 from rich.text import Text
 
@@ -817,3 +818,41 @@ def test_tui_mission_panel_overflow():
     assert isinstance(result, Table)
     # 5 shown + 1 overflow hint
     assert result.row_count == 6
+
+
+# ---------------------------------------------------------------------------
+# Connection error handling
+# ---------------------------------------------------------------------------
+
+
+def test_tui_shows_hint_on_connect_error(monkeypatch):
+    """ConnectError shows actionable guidance with URL and commands."""
+    tui = _make_tui()
+
+    def _fail(*args, **kwargs):
+        raise httpx.ConnectError("boom")
+
+    monkeypatch.setattr(tui, "_fetch", _fail)
+    layout = tui._build_display()
+
+    # Walk the layout to extract the Panel renderable text
+    panel = layout.renderable
+    text = str(panel.renderable)
+    assert "Can't reach colony at http://localhost:7433" in text
+    assert "antfarm colony" in text
+    assert "--colony-url" in text
+
+
+def test_tui_shows_generic_error_on_other_exceptions(monkeypatch):
+    """Non-ConnectError exceptions fall through to the generic error message."""
+    tui = _make_tui()
+
+    def _fail(*args, **kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(tui, "_fetch", _fail)
+    layout = tui._build_display()
+
+    panel = layout.renderable
+    text = str(panel.renderable)
+    assert "Connection error: kaboom" in text

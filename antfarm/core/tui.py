@@ -73,6 +73,17 @@ class AntfarmTUI:
             tasks = full.get("tasks", [])
             workers = full.get("workers", [])
             soldier_status = full.get("soldier", "unknown")
+        except httpx.ConnectError:
+            layout = Layout()
+            msg = (
+                f"[red]Can't reach colony at {self.colony_url} — is it running?[/red]\n\n"
+                f"[bold]Start the colony on this host:[/bold]\n"
+                f"    antfarm colony\n\n"
+                f"[bold]Or point the TUI elsewhere:[/bold]\n"
+                f"    antfarm scout --tui --colony-url http://<host>:<port>"
+            )
+            layout.update(Panel(msg, title="Antfarm TUI"))
+            return layout
         except Exception as exc:
             layout = Layout()
             layout.update(Panel(f"[red]Connection error: {exc}[/red]", title="Antfarm TUI"))
