@@ -11,6 +11,9 @@ Usage:
 
 from __future__ import annotations
 
+import collections
+import json
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -52,10 +55,65 @@ class AntfarmTUI:
         colony_url: str,
         token: str | None = None,
         refresh_interval: float = 2.0,
+        autostart_activity: bool = True,
     ):
         self.colony_url = colony_url.rstrip("/")
         self.token = token
         self.refresh_interval = refresh_interval
+
+        self._activity_events: collections.deque = collections.deque(maxlen=1000)
+        self._activity_cursor: int = 0
+        self._activity_lock = threading.Lock()
+        self._activity_thread: threading.Thread | None = None
+        if autostart_activity:
+            self._start_activity_thread()
+
+    def _start_activity_thread(self) -> None:
+        """Start the background SSE consumer thread (idempotent)."""
+        if self._activity_thread is not None and self._activity_thread.is_alive():
+            return
+        t = threading.Thread(
+            target=self._activity_loop,
+            daemon=True,
+            name="antfarm-tui-activity",
+        )
+        self._activity_thread = t
+        t.start()
+
+    def _activity_loop(self) -> None:
+        """Consume the colony /events SSE stream, retrying silently on error."""
+        while True:
+            try:
+                self._poll_events_once()
+            except Exception:
+                time.sleep(1)
+
+    def _poll_events_once(self) -> None:
+        """Open one streaming request to /events and ingest each event."""
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        with httpx.stream(
+            "GET",
+            f"{self.colony_url}/events",
+            params={"after": self._activity_cursor, "timeout": 5},
+            headers=headers,
+            timeout=30.0,
+        ) as response:
+            for line in response.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                try:
+                    event = json.loads(line[5:].strip())
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                self._ingest_event(event)
+
+    def _ingest_event(self, event: dict) -> None:
+        """Append an event to the activity deque and advance the cursor."""
+        with self._activity_lock:
+            self._activity_events.append(event)
+            eid = event.get("id", 0)
+            if isinstance(eid, int) and eid > self._activity_cursor:
+                self._activity_cursor = eid
 
     def run(self) -> None:
         """Main loop using rich.live.Live."""
@@ -110,6 +168,7 @@ class AntfarmTUI:
             Layout(name="review", size=12),
             Layout(name="merge_ready", size=6),
             Layout(name="merged", size=6),
+            Layout(name="activity", size=8),
         )
 
         # Header: banner (left) + colony summary (right) side by side
@@ -216,6 +275,13 @@ class AntfarmTUI:
             Panel(
                 self._render_recently_merged(snap.recently_merged),
                 title=(f"[bold green]Recently Merged ({len(snap.recently_merged)})[/bold green]"),
+            )
+        )
+
+        layout["activity"].update(
+            Panel(
+                self._render_activity(max_rows=6),
+                title="[bold white]Activity[/bold white]",
             )
         )
 
@@ -765,6 +831,36 @@ class AntfarmTUI:
 
         self._add_overflow_hint(table, len(tasks), max_shown)
         return table
+
+    def _render_activity(self, max_rows: int = 6) -> Text:
+        """Render the tail of the activity event deque as timestamped lines."""
+        with self._activity_lock:
+            events = list(self._activity_events)
+
+        text = Text()
+        if not events:
+            text.append("(waiting for events\u2026)", style="dim")
+            return text
+
+        tail = events[-max_rows:]
+        for i, ev in enumerate(tail):
+            ts = ev.get("ts", "") or ""
+            try:
+                dt = datetime.fromisoformat(ts)
+                time_str = dt.astimezone().strftime("%H:%M:%S")
+            except (ValueError, TypeError):
+                time_str = "--:--:--"
+
+            actor = (ev.get("actor") or "-")[:12].ljust(12)
+            event_type = ev.get("type", "") or ""
+            detail = ev.get("detail") or event_type or "-"
+
+            style = "red" if "failed" in event_type else ""
+            text.append(f"{time_str}  {actor}  {detail}", style=style)
+            if i < len(tail) - 1:
+                text.append("\n")
+
+        return text
 
     def _render_recently_merged(self, tasks: list[dict], max_shown: int = 5) -> Table:
         """Render recently merged tasks."""
