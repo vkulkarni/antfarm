@@ -10,8 +10,6 @@ Not a framework. Not AGI. Not a cloud service.
 
 A self-hosted coordinator that fans coding tasks across multiple AI agent sessions — on one machine or many — and merges the results through a deterministic gate.
 
-Antfarm is not a multi-agent framework like CrewAI or AutoGen — there is no agent-to-agent conversation. It is closer to a CI runner pool: each task is sealed (one AI session, one git worktree, one PR), a deterministic gate merges the results, and coordination happens through specs and code review, not chat.
-
 ---
 
 ## What it looks like
@@ -133,8 +131,6 @@ A spec file is a Markdown document describing the change you want: goal, accepta
 **What happens on a merge conflict?** The Soldier tries a deterministic rebase and `--force-with-lease` push. Genuine conflicts are kicked back to the builder for a new attempt. The gate never invokes an AI to resolve conflicts.
 
 **Auth?** None in v0.6.x. An optional bearer token is available on the colony HTTP API, but the threat model assumes a trusted private network — run it behind Tailscale, WireGuard, or an SSH tunnel.
-
-**How is this different from tmux-orchestrator?** tmux-orchestrator is single-machine and human-in-the-loop. Antfarm adds mission planning, a deterministic merge gate, autoscaling, multi-machine coordination, and SSE event streams.
 
 **What if a worker hangs or crashes?** The Doctor classifies stuck workers and the `--fix` flag recovers them. The autoscaler respawns the pool.
 
