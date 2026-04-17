@@ -1436,3 +1436,168 @@ def test_run_once_falls_through_on_unknown(soldier_env, monkeypatch):
     results = soldier.run_once()
     assert calls == ["task-ext-unknown"]
     assert results == [("task-ext-unknown", MergeResult.MERGED)]
+
+
+# ---------------------------------------------------------------------------
+# Soldier activity-feed events (#191)
+#
+# Soldier emits SSE events to serve._event_queue at each merge-lifecycle
+# transition with actor="soldier":
+#   merge_started, merge_succeeded, merge_failed, reconciled_external.
+# Colony-owned events (harvested/kickback/merged) are emitted from serve.py
+# with actor="colony" and must not be re-emitted by soldier.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def clear_events():
+    """Clear the SSE event queue before each event-assertion test."""
+    from antfarm.core import serve
+
+    serve._event_queue.clear()
+    yield serve._event_queue
+
+
+def _events_of_type(queue, event_type: str) -> list[dict]:
+    return [e for e in queue if e["type"] == event_type]
+
+
+def test_soldier_emits_merge_started_and_succeeded_on_green_merge(soldier_env, clear_events):
+    """On a clean merge, soldier emits merge_started then merge_succeeded."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-ev-ok", "feat/task-ev-ok")
+
+    results = soldier.run_once()
+    assert results == [("task-ev-ok", MergeResult.MERGED)]
+
+    started = _events_of_type(clear_events, "merge_started")
+    succeeded = _events_of_type(clear_events, "merge_succeeded")
+    assert len(started) == 1
+    assert len(succeeded) == 1
+
+    assert started[0]["actor"] == "soldier"
+    assert started[0]["task_id"] == "task-ev-ok"
+    assert started[0]["detail"] == "feat/task-ev-ok"
+
+    assert succeeded[0]["actor"] == "soldier"
+    assert succeeded[0]["task_id"] == "task-ev-ok"
+    assert succeeded[0]["detail"] == "feat/task-ev-ok"
+
+    # Ordering: started must come before succeeded.
+    assert started[0]["id"] < succeeded[0]["id"]
+
+
+def test_soldier_emits_merge_failed_on_conflict(soldier_env, clear_events):
+    """A merge conflict emits merge_failed with actor='soldier' and no merge_succeeded."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _commit_file(repo, "conflict-ev.txt", "base\n", "base on dev")
+    _git(["git", "push", "origin", "dev"], cwd=repo)
+
+    _carry_and_harvest(
+        cc,
+        repo,
+        "task-ev-conflict",
+        "feat/task-ev-conflict",
+        file_name="conflict-ev.txt",
+        file_content="branch change\n",
+    )
+
+    _commit_file(repo, "conflict-ev.txt", "dev diverged\n", "dev diverges")
+    _git(["git", "push", "origin", "dev"], cwd=repo)
+    _git(["git", "fetch", "origin"], cwd=repo)
+    _git(["git", "reset", "--hard", "origin/dev"], cwd=repo)
+
+    results = soldier.run_once()
+    assert results == [("task-ev-conflict", MergeResult.FAILED)]
+
+    failed = _events_of_type(clear_events, "merge_failed")
+    succeeded = _events_of_type(clear_events, "merge_succeeded")
+    assert len(failed) == 1
+    assert succeeded == []
+    assert failed[0]["actor"] == "soldier"
+    assert failed[0]["task_id"] == "task-ev-conflict"
+    assert "conflict" in failed[0]["detail"].lower()
+
+
+def test_soldier_emits_merge_failed_on_test_failure(soldier_env, clear_events):
+    """A test failure (non-zero test_command) emits merge_failed."""
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    failing_soldier = Soldier(
+        colony_url="http://testserver",
+        repo_path=repo,
+        integration_branch="dev",
+        test_command=["false"],
+        poll_interval=0.0,
+        client=soldier_env["soldier"].colony._client,
+    )
+
+    _carry_and_harvest(cc, repo, "task-ev-testfail", "feat/task-ev-testfail")
+
+    results = failing_soldier.run_once()
+    assert results == [("task-ev-testfail", MergeResult.FAILED)]
+
+    failed = _events_of_type(clear_events, "merge_failed")
+    succeeded = _events_of_type(clear_events, "merge_succeeded")
+    assert len(failed) == 1
+    assert succeeded == []
+    assert failed[0]["actor"] == "soldier"
+    assert failed[0]["task_id"] == "task-ev-testfail"
+    assert "test" in failed[0]["detail"].lower()
+
+
+def test_soldier_emits_reconciled_external_and_skips_merge_events(
+    soldier_env, clear_events, monkeypatch
+):
+    """When the PR is already merged on origin, soldier emits reconciled_external and
+    does not run the attempt_merge path (so no merge_started/succeeded fire)."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-ev-ext", "feat/task-ev-ext")
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", lambda self, pr: True)
+
+    results = soldier.run_once()
+    assert results == [("task-ev-ext", MergeResult.MERGED)]
+
+    reconciled = _events_of_type(clear_events, "reconciled_external")
+    assert len(reconciled) == 1
+    assert reconciled[0]["actor"] == "soldier"
+    assert reconciled[0]["task_id"] == "task-ev-ext"
+    assert reconciled[0]["detail"].startswith("pr=")
+
+    # Reconciliation path short-circuits the merge attempt; soldier must not
+    # emit merge_started/merge_succeeded from that path.
+    assert _events_of_type(clear_events, "merge_started") == []
+    assert _events_of_type(clear_events, "merge_succeeded") == []
+
+
+def test_soldier_does_not_re_emit_colony_event_types(soldier_env, clear_events):
+    """Colony-owned events (harvested/kickback/merged) must not fire with actor='soldier'."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-ev-noreemit", "feat/task-ev-noreemit")
+
+    # Clear events emitted by the _carry_and_harvest setup (which calls colony
+    # endpoints that emit with actor='colony') so this assertion focuses on
+    # events soldier itself produces during run_once.
+    clear_events.clear()
+
+    soldier.run_once()
+
+    for e in clear_events:
+        if e["type"] in ("harvested", "kickback", "merged"):
+            assert e["actor"] != "soldier", (
+                f"soldier must not re-emit colony-owned event {e['type']}: {e}"
+            )
