@@ -27,6 +27,7 @@ from antfarm.core.missions import (
     is_infra_task,
     link_task_to_mission,
 )
+from antfarm.core.serve import _emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,10 @@ class Queen:
         """
         plan_task_id = mission.get("plan_task_id")
         if plan_task_id is None:
+            spec = mission.get("spec") or ""
+            title = spec.strip().splitlines()[0] if spec.strip() else ""
+            detail = f"{mission['mission_id']}: {title}" if title else mission["mission_id"]
+            _emit_event("mission_created", "", detail, actor="queen")
             plan_task_id = self._create_plan_task(mission)
             self.backend.update_mission(
                 mission["mission_id"],
@@ -231,6 +236,12 @@ class Queen:
 
         if verdict["verdict"] == "pass":
             artifact = PlanArtifact.from_dict(mission["plan_artifact"])
+            _emit_event(
+                "plan_approved",
+                mission.get("plan_task_id") or "",
+                f"mission={mission['mission_id']} tasks={artifact.task_count}",
+                actor="queen",
+            )
             self._spawn_child_tasks(mission, artifact)
             self._transition(mission, MissionStatus.BUILDING)
             self._maybe_generate_context(mission)
@@ -295,6 +306,15 @@ class Queen:
                 mission,
                 MissionStatus.COMPLETE,
                 extras={"report": report.to_dict(), "completed_at": _now_iso()},
+            )
+            _emit_event(
+                "mission_complete",
+                "",
+                (
+                    f"mission={mission['mission_id']} "
+                    f"merged={report.merged_tasks} blocked={report.blocked_tasks}"
+                ),
+                actor="queen",
             )
             return
 
@@ -388,6 +408,12 @@ class Queen:
 
         with contextlib.suppress(ValueError):
             link_task_to_mission(self.backend, task, mission_id)
+        _emit_event(
+            "plan_task_created",
+            plan_task_id,
+            f"mission={mission_id}",
+            actor="queen",
+        )
         return plan_task_id
 
     def _create_plan_review_task(self, mission: dict, artifact: PlanArtifact) -> str:
@@ -523,6 +549,12 @@ class Queen:
             with contextlib.suppress(ValueError):
                 link_task_to_mission(self.backend, task, mission_id)
 
+        _emit_event(
+            "tasks_seeded",
+            "",
+            f"mission={mission_id} count={len(child_ids)}",
+            actor="queen",
+        )
         return child_ids
 
     # --- artifact extraction ---

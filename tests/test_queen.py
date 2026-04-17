@@ -1242,3 +1242,159 @@ def test_queen_context_written_in_correct_data_dir(env, tmp_path):
     # The context file must exist under the custom data_dir
     expected = _os.path.join(data_dir, "missions", f"{mission['mission_id']}_context.md")
     assert _os.path.isfile(expected)
+
+
+# ---------------------------------------------------------------------------
+# Queen activity-feed events (#191)
+#
+# Queen emits SSE events to serve._event_queue at decision points:
+#   mission_created, plan_task_created, plan_approved, tasks_seeded,
+#   mission_complete — all with actor="queen".
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def clear_events():
+    """Clear the SSE event queue before each event-assertion test."""
+    from antfarm.core import serve
+
+    serve._event_queue.clear()
+    yield serve._event_queue
+
+
+def _event_types(queue) -> list[str]:
+    return [e["type"] for e in queue]
+
+
+def _find_event(queue, event_type: str) -> dict | None:
+    for e in queue:
+        if e["type"] == event_type:
+            return e
+    return None
+
+
+def test_queen_emits_mission_created_and_plan_task_created(env, clear_events):
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend, spec="Build a widget\nsecond line")
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    mc = _find_event(clear_events, "mission_created")
+    assert mc is not None
+    assert mc["actor"] == "queen"
+    assert mission["mission_id"] in mc["detail"]
+    assert "Build a widget" in mc["detail"]
+    # mission-level event → empty task_id
+    assert mc["task_id"] == ""
+
+    ptc = _find_event(clear_events, "plan_task_created")
+    assert ptc is not None
+    assert ptc["actor"] == "queen"
+    assert ptc["task_id"] == f"plan-{mission['mission_id']}"
+    assert mission["mission_id"] in ptc["detail"]
+
+
+def test_queen_emits_plan_approved_on_review_pass(env, clear_events):
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend)
+    m = backend.get_mission(mission["mission_id"])
+
+    # Planning → REVIEWING_PLAN
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    # Verdict pass → plan_approved event
+    clear_events.clear()
+    review_task_id = f"review-plan-{mission['mission_id']}"
+    _set_review_verdict_on_task(backend, review_task_id, _make_review_verdict("pass"))
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    evt = _find_event(clear_events, "plan_approved")
+    assert evt is not None
+    assert evt["actor"] == "queen"
+    expected_plan_id = f"plan-{mission['mission_id']}"
+    assert evt["task_id"] in (m.get("plan_task_id"), expected_plan_id)
+    assert mission["mission_id"] in evt["detail"]
+
+
+def test_queen_emits_tasks_seeded_on_spawn(env, clear_events):
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
+    m = backend.get_mission(mission["mission_id"])
+
+    # Planning → BUILDING (which spawns children)
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"], task_count=3)
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+
+    clear_events.clear()
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    evt = _find_event(clear_events, "tasks_seeded")
+    assert evt is not None
+    assert evt["actor"] == "queen"
+    assert evt["task_id"] == ""
+    assert "count=3" in evt["detail"]
+    assert mission["mission_id"] in evt["detail"]
+
+
+def test_queen_emits_mission_complete_on_all_merged(env, clear_events):
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
+    m = backend.get_mission(mission["mission_id"])
+
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # → BUILDING
+
+    # Mark all children merged
+    slug = queen._mission_slug(mission["mission_id"])
+    for i in range(2):
+        child_id = f"task-{slug}-{i + 1:02d}"
+        child = backend.get_task(child_id)
+        child["status"] = "done"
+        child["current_attempt"] = f"att-c{i}"
+        child["attempts"] = [
+            {
+                "attempt_id": f"att-c{i}",
+                "worker_id": "test-worker",
+                "status": "merged",
+                "branch": f"feat/{child_id}",
+                "pr": f"https://github.com/test/pr/{i}",
+                "started_at": _now_iso(),
+                "completed_at": _now_iso(),
+            }
+        ]
+        _force_task_state(backend, child_id, child)
+
+    clear_events.clear()
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] == "complete"
+
+    evt = _find_event(clear_events, "mission_complete")
+    assert evt is not None
+    assert evt["actor"] == "queen"
+    assert evt["task_id"] == ""
+    assert mission["mission_id"] in evt["detail"]
+    assert "merged=2" in evt["detail"]
