@@ -58,11 +58,11 @@ class TestRunnerDefaults:
         assert r._pm is not None
 
     def test_runner_uses_hashed_prefix(self, tmp_path):
-        """Runner's ProcessManager prefix is ``runner-{colony_hash(state_dir)}-`` (#231)."""
-        from antfarm.core.process_manager import colony_hash
+        """Runner's ProcessManager prefix is ``runner-{colony_session_hash(state_dir)}-`` (#238)."""
+        from antfarm.core.process_manager import colony_session_hash
 
         r = _make_runner(tmp_path)
-        expected = f"runner-{colony_hash(r.state_dir)}-"
+        expected = f"runner-{colony_session_hash(r.state_dir)}-"
         assert r._prefix == expected
 
 
@@ -308,10 +308,10 @@ class TestAdoptExistingWorkers:
         the legacy name lacks the hash token so ``list_managed()`` filters it
         out before it reaches ``_adopt_existing_workers``.
         """
-        from antfarm.core.process_manager import TmuxProcessManager, colony_hash
+        from antfarm.core.process_manager import TmuxProcessManager, colony_session_hash
 
         r = _make_runner(tmp_path)
-        prefix = f"runner-{colony_hash(r.state_dir)}-"
+        prefix = f"runner-{colony_session_hash(r.state_dir)}-"
         r._pm = TmuxProcessManager(prefix=prefix, state_dir=r.state_dir)
         r._prefix = prefix
 

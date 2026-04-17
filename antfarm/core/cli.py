@@ -733,11 +733,12 @@ def doctor(fix: bool, data_dir: str, sweep_legacy_tmux: bool, yes: bool):
         sys.exit(2)
 
     if sweep_legacy_tmux:
-        from antfarm.core.process_manager import colony_hash
+        from antfarm.core.process_manager import colony_id, colony_session_hash
 
-        h = colony_hash(data_dir)
+        cid = colony_id(data_dir)
+        h = colony_session_hash(data_dir)
         real = os.path.realpath(data_dir)
-        click.echo(f"Colony hash: {h} (data_dir: {real})")
+        click.echo(f"Colony id: {cid} hash: {h} (data_dir: {real})")
         click.echo(
             "Legacy sessions (no hash) will be killed; all hashed sessions will be untouched."
         )

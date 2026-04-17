@@ -1091,9 +1091,10 @@ def check_tmux_available(config: dict) -> list[Finding]:
 def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]:
     """Detect tmux sessions owned by THIS colony that have no matching metadata.
 
-    Session names carry an 8-char SHA-256 hash of the colony's resolved
-    ``data_dir`` (see :func:`antfarm.core.process_manager.colony_hash`), so
-    this check considers only sessions matching one of THIS colony's prefixes:
+    Session names carry an 8-char SHA-256 hash of the colony's persisted
+    UUID identity (see :func:`antfarm.core.process_manager.colony_session_hash`),
+    so this check considers only sessions matching one of THIS colony's
+    prefixes:
 
     - ``auto-{hash}-`` — autoscaler-spawned workers
     - ``runner-{hash}-`` — Runner-spawned workers
@@ -1133,13 +1134,13 @@ def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]
         # tmux server not running — no sessions to check
         return []
 
-    from antfarm.core.process_manager import colony_hash, parse_session_name
+    from antfarm.core.process_manager import colony_session_hash, parse_session_name
 
     data_dir = config.get("data_dir", "")
     if not data_dir:
         return []
 
-    h = colony_hash(data_dir)
+    h = colony_session_hash(data_dir)
     own_prefixes = (f"auto-{h}-", f"runner-{h}-")
     processes_dir = Path(data_dir) / "processes"
 

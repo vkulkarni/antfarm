@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from antfarm.core.process_manager import colony_hash, get_process_manager
+from antfarm.core.process_manager import colony_session_hash, get_process_manager
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,14 @@ class Runner:
         self._lock = threading.Lock()
         self._colony = None  # ColonyClient, set in run()
 
-        self._prefix = f"runner-{colony_hash(self.state_dir)}-"
+        # Ensure state_dir exists before deriving the session prefix —
+        # colony_session_hash() needs a real directory to persist its UUID.
+        # Otherwise the first init would return a "legacy:" sentinel hash
+        # and a later call (after run() created state_dir) would see a
+        # different UUID-based hash, splitting managed sessions across
+        # two prefixes.
+        os.makedirs(self.state_dir, exist_ok=True)
+        self._prefix = f"runner-{colony_session_hash(self.state_dir)}-"
         self._pm = get_process_manager(prefix=self._prefix, state_dir=self.state_dir)
 
     def run(self) -> None:

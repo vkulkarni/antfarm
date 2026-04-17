@@ -913,11 +913,11 @@ def test_carry_accepts_mission_id(client):
 
 
 def test_startup_logs_colony_hash(tmp_path, caplog):
-    """Colony hash log fires once when the server actually starts (lifespan startup)."""
+    """Colony id+hash log fires once when the server actually starts (lifespan startup)."""
     import logging
 
     from antfarm.core.backends.file import FileBackend
-    from antfarm.core.process_manager import colony_hash
+    from antfarm.core.process_manager import colony_id, colony_session_hash
 
     data_dir = str(tmp_path / ".antfarm")
     backend = FileBackend(root=data_dir)
@@ -925,27 +925,30 @@ def test_startup_logs_colony_hash(tmp_path, caplog):
     app = get_app(backend=backend, data_dir=data_dir)
 
     # Log must NOT appear from get_app() alone — only on server startup.
-    pre_start_matching = [r for r in caplog.records if "colony hash:" in r.getMessage()]
-    assert not pre_start_matching, "colony hash log must not fire on get_app(), only on startup"
+    pre_start_matching = [r for r in caplog.records if "colony id:" in r.getMessage()]
+    assert not pre_start_matching, "colony id log must not fire on get_app(), only on startup"
 
     # Startup fires when TestClient enters its context manager.
     with caplog.at_level(logging.INFO, logger="antfarm.core.serve"), TestClient(app):
         pass
 
-    expected_hash = colony_hash(data_dir)
+    expected_id = colony_id(data_dir)
+    expected_hash = colony_session_hash(data_dir)
     matching = [
         r
         for r in caplog.records
-        if "colony hash:" in r.getMessage() and expected_hash in r.getMessage()
+        if "colony id:" in r.getMessage()
+        and expected_id in r.getMessage()
+        and expected_hash in r.getMessage()
     ]
     assert matching, (
-        f"expected colony hash log on startup, got: {[r.getMessage() for r in caplog.records]}"
+        f"expected colony id log on startup, got: {[r.getMessage() for r in caplog.records]}"
     )
     assert os.path.realpath(data_dir) in matching[0].getMessage()
 
 
 def test_get_app_does_not_log_colony_hash(tmp_path, caplog):
-    """get_app() must not emit colony hash log — it only fires on server startup."""
+    """get_app() must not emit colony id/hash log — it only fires on server startup."""
     import logging
 
     from antfarm.core.backends.file import FileBackend
@@ -956,7 +959,7 @@ def test_get_app_does_not_log_colony_hash(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger="antfarm.core.serve"):
         get_app(backend=backend, data_dir=data_dir)
 
-    noisy = [r for r in caplog.records if "colony hash:" in r.getMessage()]
+    noisy = [r for r in caplog.records if "colony id:" in r.getMessage()]
     assert not noisy, (
-        f"get_app() must not log colony hash, but got: {[r.getMessage() for r in noisy]}"
+        f"get_app() must not log colony id, but got: {[r.getMessage() for r in noisy]}"
     )

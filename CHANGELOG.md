@@ -6,6 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- Colony identity is now a persisted UUID stored as `colony_id` in `{data_dir}/config.json`. Tmux session prefixes (`auto-<hash>-*`, `runner-<hash>-*`) derive from this UUID via the new `colony_session_hash()`, making identity stable across `mv`, NFS, and Docker bind-mounts. `colony_hash()` remains as a pure hashing primitive (used by `deploy.py`). **Breaking:** first startup after upgrade generates a new UUID; pre-upgrade tmux sessions use the old realpath-based hash and become orphans — run `antfarm doctor --sweep-legacy-tmux` after draining in-flight work. See UPGRADE.md for the escape hatch to preserve an old hash. (#238)
+
 ## [0.7.0] - 2026-04-16
 
 ### Added
