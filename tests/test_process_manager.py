@@ -10,6 +10,7 @@ from antfarm.core.process_manager import (
     ProcessMetadata,
     SubprocessProcessManager,
     TmuxProcessManager,
+    colony_hash,
     get_process_manager,
     parse_session_name,
 )
@@ -30,6 +31,54 @@ def test_parse_session_name():
     assert parse_session_name("invalid", "auto-") is None
     # Empty role
     assert parse_session_name("auto--1", "auto-") is None
+
+
+def test_parse_session_name_with_hashed_prefix():
+    """Hashed prefixes (per #231) parse correctly for both adapters."""
+    assert parse_session_name("auto-a1b2c3d4-builder-3", "auto-a1b2c3d4-") == ("builder", 3)
+    assert parse_session_name("runner-a1b2c3d4-planner-1", "runner-a1b2c3d4-") == ("planner", 1)
+    # Multi-dash role under hashed prefix
+    assert parse_session_name("auto-a1b2c3d4-code-reviewer-5", "auto-a1b2c3d4-") == (
+        "code-reviewer",
+        5,
+    )
+    # Foreign hash is not matched by own-hash prefix
+    assert parse_session_name("auto-deadbeef-builder-3", "auto-a1b2c3d4-") is None
+
+
+# --- colony_hash tests (per #231) ---
+
+
+def test_colony_hash_stable_same_data_dir(tmp_path):
+    """Calling colony_hash twice on the same data_dir returns the same hash."""
+    path = str(tmp_path / "state")
+    os.makedirs(path, exist_ok=True)
+    assert colony_hash(path) == colony_hash(path)
+
+
+def test_colony_hash_differs_for_different_data_dir(tmp_path):
+    """Different data_dirs produce different hashes."""
+    a = str(tmp_path / "colony-a")
+    b = str(tmp_path / "colony-b")
+    os.makedirs(a, exist_ok=True)
+    os.makedirs(b, exist_ok=True)
+    assert colony_hash(a) != colony_hash(b)
+
+
+def test_colony_hash_resolves_symlinks(tmp_path):
+    """A symlink to a data_dir produces the same hash as the real path."""
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    os.symlink(str(real), str(link))
+    assert colony_hash(str(link)) == colony_hash(str(real))
+
+
+def test_colony_hash_length_is_8(tmp_path):
+    """Hash is exactly 8 hex chars — matches the session-name budget."""
+    h = colony_hash(str(tmp_path))
+    assert len(h) == 8
+    assert all(c in "0123456789abcdef" for c in h)
 
 
 def test_get_process_manager_no_tmux():

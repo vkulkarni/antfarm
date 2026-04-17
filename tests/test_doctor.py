@@ -72,17 +72,13 @@ def test_healthy_colony_no_findings(setup):
     # Exclude tmux_available: it fires in CI/minimal environments where tmux
     # is not installed — this is expected and not a colony health issue.
     #
-    # orphan_tmux_session is also tolerated here (defense in depth): it is an
-    # ``info``-severity finding so the severity filter below already skips it,
-    # but we list it explicitly so the intent is code, not just comment. This
-    # matters when the test host has live tmux sessions owned by a peer colony
-    # (different data_dir on the same machine) — those are not failures of the
-    # colony under test.
+    # orphan_tmux_session is now scoped by colony hash — peer-colony sessions
+    # on the same host carry a different hash and are ignored, so it is no
+    # longer broadened into this exclusion tuple.
     errors_warnings = [
         f
         for f in findings
-        if f.severity in ("error", "warning")
-        and f.check not in ("tmux_available", "orphan_tmux_session")
+        if f.severity in ("error", "warning") and f.check not in ("tmux_available",)
     ]
     assert errors_warnings == [], f"Expected no errors/warnings, got: {errors_warnings}"
 
@@ -645,24 +641,29 @@ def test_check_orphan_tmux_sessions_no_tmux():
 
 
 def test_check_orphan_tmux_sessions_detects_orphans(tmp_path):
-    """Antfarm-prefixed session without metadata emits info finding; one WITH metadata does not."""
+    """Own-hash session without metadata emits warning finding; one WITH metadata does not."""
     from unittest.mock import MagicMock, patch
 
     from antfarm.core.doctor import check_orphan_tmux_sessions
+    from antfarm.core.process_manager import colony_hash
 
     data_dir = tmp_path / ".antfarm"
     processes_dir = data_dir / "processes"
     processes_dir.mkdir(parents=True)
 
+    h = colony_hash(str(data_dir))
+    known = f"auto-{h}-builder-1"
+    orphan = f"auto-{h}-planner-2"
+
     # Write metadata for the non-orphan session
-    (processes_dir / "auto-builder-1.json").write_text(
-        '{"name": "auto-builder-1", "role": "builder", "manager_type": "tmux"}'
+    (processes_dir / f"{known}.json").write_text(
+        f'{{"name": "{known}", "role": "builder", "manager_type": "tmux"}}'
     )
 
     config = {"data_dir": str(data_dir)}
 
-    # Two antfarm sessions: one with metadata, one orphan; plus one non-antfarm session
-    session_names = "auto-builder-1\nauto-planner-2\nsome-unrelated-session\n"
+    # Two own-hash sessions: one with metadata, one orphan; plus one non-antfarm session
+    session_names = f"{known}\n{orphan}\nsome-unrelated-session\n"
 
     mock_result = MagicMock()
     mock_result.returncode = 0
@@ -676,9 +677,9 @@ def test_check_orphan_tmux_sessions_detects_orphans(tmp_path):
 
     orphan_checks = [f for f in findings if f.check == "orphan_tmux_session"]
     assert len(orphan_checks) == 1
-    assert "auto-planner-2" in orphan_checks[0].message
-    assert orphan_checks[0].severity == "info"
-    assert orphan_checks[0].auto_fixable is False
+    assert orphan in orphan_checks[0].message
+    assert orphan_checks[0].severity == "warning"
+    assert orphan_checks[0].auto_fixable is True
 
 
 def test_check_orphan_tmux_sessions_no_server():
@@ -706,14 +707,13 @@ def test_check_orphan_tmux_sessions_no_server():
 
 
 def test_run_doctor_on_colony_with_peer_auto_tmux_sessions_produces_no_warnings(setup, monkeypatch):
-    """Peer-colony tmux sessions must not raise error/warning findings.
+    """Peer-colony tmux sessions must be ignored entirely (different hash prefix).
 
-    Scenario: another antfarm colony (different data_dir, same host) owns live
-    ``auto-*`` tmux sessions. From this colony's point of view those sessions
-    have no matching metadata in its own ``processes/`` directory, so
-    ``check_orphan_tmux_sessions`` will flag them. The finding must be
-    ``info`` severity so that the Soldier merge gate — which treats any
-    error/warning as blocking — does not kick back every PR during dogfooding.
+    Scenario: another antfarm colony (different ``data_dir``, same host) owns
+    live ``auto-*`` tmux sessions. Their session names carry that peer's
+    colony hash (derived from its ``data_dir`` realpath), which will not
+    match THIS colony's hash. ``check_orphan_tmux_sessions`` must therefore
+    produce zero findings for peer sessions — not even ``info``.
     """
     import subprocess as real_subprocess
     from unittest.mock import MagicMock
@@ -722,10 +722,11 @@ def test_run_doctor_on_colony_with_peer_auto_tmux_sessions_produces_no_warnings(
 
     backend, config = setup
 
-    # Simulate a peer colony's sessions appearing in `tmux ls` output.
+    # Simulate peer-colony sessions: `auto-{foreign_hash}-...`. Any hex digest
+    # other than this colony's own hash exercises the ownership filter.
     tmux_result = MagicMock()
     tmux_result.returncode = 0
-    tmux_result.stdout = "auto-reviewer-99\nauto-builder-42\n"
+    tmux_result.stdout = "auto-ffffffff-reviewer-99\nauto-deadbeef-builder-42\n"
 
     real_run = real_subprocess.run
 
@@ -743,11 +744,8 @@ def test_run_doctor_on_colony_with_peer_auto_tmux_sessions_produces_no_warnings(
     findings = run_doctor(backend, config, fix=False)
 
     orphan_findings = [f for f in findings if f.check == "orphan_tmux_session"]
-    assert len(orphan_findings) == 2, (
-        f"expected both peer sessions to be flagged, got: {orphan_findings}"
-    )
-    assert all(f.severity == "info" for f in orphan_findings), (
-        f"peer-session findings must be info-severity, got: {orphan_findings}"
+    assert orphan_findings == [], (
+        f"peer-colony sessions (foreign hash) must be ignored, got: {orphan_findings}"
     )
 
     # The real regression guard: Soldier's gate asserts no errors/warnings.
@@ -755,3 +753,144 @@ def test_run_doctor_on_colony_with_peer_auto_tmux_sessions_produces_no_warnings(
     assert blocking == [], (
         f"peer-colony tmux sessions must not produce error/warning findings: {blocking}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Colony-hashed orphan scoping (#231)
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_own_prefix_detected_as_warning(tmp_path):
+    """Own-hash session without metadata is flagged warning + auto_fixable."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+    from antfarm.core.process_manager import colony_hash
+
+    data_dir = tmp_path / ".antfarm"
+    (data_dir / "processes").mkdir(parents=True)
+
+    h = colony_hash(str(data_dir))
+    orphan = f"runner-{h}-builder-7"
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = f"{orphan}\n"
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", return_value=mock_result),
+    ):
+        findings = check_orphan_tmux_sessions({"data_dir": str(data_dir)}, fix=False)
+
+    assert len(findings) == 1
+    assert findings[0].severity == "warning"
+    assert findings[0].auto_fixable is True
+    assert findings[0].fixed is False
+    assert orphan in findings[0].message
+
+
+def test_orphan_peer_prefix_ignored(tmp_path):
+    """Foreign-hash session produces zero findings — not even info."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+
+    data_dir = tmp_path / ".antfarm"
+    (data_dir / "processes").mkdir(parents=True)
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    # Use 'ffffffff' which will not collide with the real hash of data_dir.
+    mock_result.stdout = "auto-ffffffff-reviewer-99\nrunner-deadbeef-planner-3\n"
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", return_value=mock_result),
+    ):
+        findings = check_orphan_tmux_sessions({"data_dir": str(data_dir)}, fix=False)
+
+    assert findings == []
+
+
+def test_orphan_fix_kills_session(tmp_path):
+    """With fix=True, tmux kill-session is invoked for own orphans only."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+    from antfarm.core.process_manager import colony_hash
+
+    data_dir = tmp_path / ".antfarm"
+    (data_dir / "processes").mkdir(parents=True)
+
+    h = colony_hash(str(data_dir))
+    own_orphan = f"auto-{h}-builder-3"
+    peer = "auto-ffffffff-builder-3"
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = f"{own_orphan}\n{peer}\n"
+
+    kill_result = MagicMock()
+    kill_result.returncode = 0
+
+    calls: list = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["tmux", "list-sessions"]:
+            return list_result
+        if cmd[:2] == ["tmux", "kill-session"]:
+            return kill_result
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", side_effect=fake_run),
+    ):
+        findings = check_orphan_tmux_sessions({"data_dir": str(data_dir)}, fix=True)
+
+    # Exactly one finding (our orphan); peer session is ignored entirely.
+    assert len(findings) == 1
+    assert findings[0].fixed is True
+
+    # Exactly one kill invocation, targeting our orphan (NOT the peer).
+    kill_calls = [c for c in calls if c[:2] == ["tmux", "kill-session"]]
+    assert kill_calls == [["tmux", "kill-session", "-t", own_orphan]]
+
+
+def test_two_mock_colonies_dont_cross_see(tmp_path):
+    """Two colonies with distinct data_dirs each see only their own orphans."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+    from antfarm.core.process_manager import colony_hash
+
+    dir_a = tmp_path / "colony-a"
+    dir_b = tmp_path / "colony-b"
+    (dir_a / "processes").mkdir(parents=True)
+    (dir_b / "processes").mkdir(parents=True)
+
+    h_a = colony_hash(str(dir_a))
+    h_b = colony_hash(str(dir_b))
+    assert h_a != h_b
+
+    name_a = f"auto-{h_a}-builder-1"
+    name_b = f"auto-{h_b}-reviewer-2"
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = f"{name_a}\n{name_b}\nnot-antfarm\n"
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", return_value=mock_result),
+    ):
+        findings_a = check_orphan_tmux_sessions({"data_dir": str(dir_a)}, fix=False)
+        findings_b = check_orphan_tmux_sessions({"data_dir": str(dir_b)}, fix=False)
+
+    assert len(findings_a) == 1 and name_a in findings_a[0].message
+    assert name_b not in findings_a[0].message
+
+    assert len(findings_b) == 1 and name_b in findings_b[0].message
+    assert name_a not in findings_b[0].message

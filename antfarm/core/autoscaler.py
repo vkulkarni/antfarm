@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from antfarm.core.backends.base import TaskBackend
-from antfarm.core.process_manager import ProcessManager, get_process_manager
+from antfarm.core.process_manager import ProcessManager, colony_hash, get_process_manager
 
 if TYPE_CHECKING:
     from antfarm.core.actuator import Actuator  # noqa: F401
@@ -189,8 +189,11 @@ class Autoscaler:
         self.managed: dict[str, ManagedWorker] = {}
         self._stopped = False
         self._counter = 0
-        self._pm = _pm if _pm is not None else get_process_manager(
-            prefix="auto-", state_dir=config.data_dir
+        self._prefix = f"auto-{colony_hash(config.data_dir)}-"
+        self._pm = (
+            _pm
+            if _pm is not None
+            else get_process_manager(prefix=self._prefix, state_dir=config.data_dir)
         )
 
     def run(self) -> None:
@@ -267,7 +270,7 @@ class Autoscaler:
         """Spawn a new worker via ProcessManager. Retries once on name collision."""
         for attempt in range(2):
             self._counter += 1
-            name = f"auto-{role}-{self._counter}"
+            name = f"{self._prefix}{role}-{self._counter}"
             worker_id = f"{self.config.node_id}/{name}"
 
             cmd = [

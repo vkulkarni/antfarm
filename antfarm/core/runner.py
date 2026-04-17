@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
-from antfarm.core.process_manager import get_process_manager
+from antfarm.core.process_manager import colony_hash, get_process_manager
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +125,8 @@ class Runner:
         self._lock = threading.Lock()
         self._colony = None  # ColonyClient, set in run()
 
-        self._pm = get_process_manager(prefix="runner-", state_dir=self.state_dir)
+        self._prefix = f"runner-{colony_hash(self.state_dir)}-"
+        self._pm = get_process_manager(prefix=self._prefix, state_dir=self.state_dir)
 
     def run(self) -> None:
         """Start the Runner daemon.
@@ -291,7 +292,7 @@ class Runner:
 
         for attempt in range(2):
             self._counter += 1
-            name = f"runner-{role}-{self._counter}"
+            name = f"{self._prefix}{role}-{self._counter}"
             log_path = os.path.join(log_dir, f"{name}.log")
 
             # Inject name into cmd (--name argument)

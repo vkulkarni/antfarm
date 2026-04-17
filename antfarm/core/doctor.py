@@ -58,7 +58,7 @@ def run_doctor(backend, config: dict, fix: bool = False) -> list[Finding]:
     findings.extend(check_dependency_cycles(backend))
     findings.extend(check_runner_health(backend, config))
     findings.extend(check_tmux_available(config))
-    findings.extend(check_orphan_tmux_sessions(config))
+    findings.extend(check_orphan_tmux_sessions(config, fix))
 
     return findings
 
@@ -980,29 +980,38 @@ def check_tmux_available(config: dict) -> list[Finding]:
 # Check 13: Orphan tmux sessions
 # ---------------------------------------------------------------------------
 
-_ANTFARM_PREFIXES = ("auto-", "runner-")
 
+def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]:
+    """Detect tmux sessions owned by THIS colony that have no matching metadata.
 
-def check_orphan_tmux_sessions(config: dict) -> list[Finding]:
-    """Detect tmux sessions with antfarm prefixes that have no matching metadata file.
+    Session names carry an 8-char SHA-256 hash of the colony's resolved
+    ``data_dir`` (see :func:`antfarm.core.process_manager.colony_hash`), so
+    this check considers only sessions matching one of THIS colony's prefixes:
 
-    An orphan session is one whose name starts with a known antfarm prefix
-    (``auto-`` or ``runner-``) but whose ProcessMetadata file is absent from
-    ``{state_dir}/processes/{name}.json``.  This can happen when the colony
-    process crashed before writing metadata, or after a manual ``tmux kill-server``.
+    - ``auto-{hash}-`` — autoscaler-spawned workers
+    - ``runner-{hash}-`` — Runner-spawned workers
 
-    Severity is ``info``, not ``warning``, because we cannot reliably distinguish
-    our own orphan from a live session owned by a peer colony (different
-    ``data_dir`` on the same host) from tmux alone. Users running ``antfarm
-    doctor`` still see the finding, but automated gates (e.g. the Soldier merge
-    gate's "no errors/warnings" assertion) do not fire spuriously on hosts that
-    run multiple colonies or host long-lived dogfood sessions.
+    Sessions owned by peer colonies (different ``data_dir`` on the same host)
+    use a different hash and are ignored — they are not our problem.
+
+    An orphan is a session matching one of our prefixes but without a
+    corresponding ``ProcessMetadata`` file under
+    ``{data_dir}/processes/{name}.json``. This can happen when the colony
+    crashed before writing metadata, or after a manual ``tmux kill-server``
+    that left state files behind.
+
+    Severity is ``warning`` with ``auto_fixable=True``: prefix filtering
+    guarantees ownership, so ``--fix`` can safely ``tmux kill-session`` the
+    orphan without risking a peer colony's workers.
 
     Args:
-        config: Doctor config dict. Uses ``data_dir`` to locate process metadata.
+        config: Doctor config dict. Uses ``data_dir`` to derive the colony
+            hash and locate process metadata.
+        fix: If True, kill each orphan via ``tmux kill-session`` and mark
+            the finding as ``fixed=True``.
 
     Returns:
-        List of findings (report only, no fix).
+        List of findings for this colony's orphans.
     """
     if not shutil.which("tmux"):
         return []
@@ -1016,10 +1025,15 @@ def check_orphan_tmux_sessions(config: dict) -> list[Finding]:
         # tmux server not running — no sessions to check
         return []
 
-    from antfarm.core.process_manager import parse_session_name
+    from antfarm.core.process_manager import colony_hash, parse_session_name
 
     data_dir = config.get("data_dir", "")
-    processes_dir = Path(data_dir) / "processes" if data_dir else None
+    if not data_dir:
+        return []
+
+    h = colony_hash(data_dir)
+    own_prefixes = (f"auto-{h}-", f"runner-{h}-")
+    processes_dir = Path(data_dir) / "processes"
 
     findings: list[Finding] = []
     for name in result.stdout.strip().splitlines():
@@ -1027,26 +1041,31 @@ def check_orphan_tmux_sessions(config: dict) -> list[Finding]:
         if not name:
             continue
 
-        # Check if this is an antfarm session (matches any known prefix)
-        is_antfarm = any(
-            parse_session_name(name, prefix) is not None for prefix in _ANTFARM_PREFIXES
-        )
-        if not is_antfarm:
+        # Only consider sessions owned by THIS colony (hash match).
+        # Peer-colony sessions use a different hash and are skipped entirely.
+        is_ours = any(parse_session_name(name, prefix) is not None for prefix in own_prefixes)
+        if not is_ours:
             continue
 
-        # Check if matching metadata file exists
-        if processes_dir is not None:
-            metadata_file = processes_dir / f"{name}.json"
-            if metadata_file.exists():
-                continue
+        # Skip sessions with matching metadata — those are tracked, not orphans.
+        if (processes_dir / f"{name}.json").exists():
+            continue
 
-        findings.append(
-            Finding(
-                severity="info",
-                check="orphan_tmux_session",
-                message=f"orphan tmux session: {name} (no matching metadata)",
-                auto_fixable=False,
-            )
+        finding = Finding(
+            severity="warning",
+            check="orphan_tmux_session",
+            message=f"orphan tmux session: {name} (no matching metadata)",
+            auto_fixable=True,
         )
+
+        if fix:
+            kill = subprocess.run(
+                ["tmux", "kill-session", "-t", name],
+                capture_output=True,
+                text=True,
+            )
+            finding.fixed = kill.returncode == 0
+
+        findings.append(finding)
 
     return findings
