@@ -3,7 +3,7 @@
 This document describes breaking operational changes that require manual
 action between Antfarm versions.
 
-## 0.8.0 — Colony UUID Identity (#238)
+## Unreleased — Colony UUID Identity (#238)
 
 Colony identity is now a persisted UUID stored as ``colony_id`` inside
 ``{data_dir}/config.json``. The 8-char hash embedded in tmux session names
@@ -54,7 +54,7 @@ prevents silent collisions when two colonies run on the same host.
 **Old:** `auto-builder-3`, `runner-planner-1`
 **New:** `auto-<hash>-builder-3`, `runner-<hash>-planner-1`
 
-### Unreleased — deploy session names (#235)
+### 0.6.4 — deploy session names (#235)
 
 **Old:** `antfarm-node1-claude-0`
 **New:** `antfarm-<hash>-node1-claude-0` (hash derived from
@@ -109,7 +109,7 @@ tmux ls | awk -F: '/^(auto|runner)-[^-]+-[^-]+-[0-9]+:/ && !/^(auto|runner)-[0-9
 tmux ls | awk -F: '/^antfarm-/ && !/^antfarm-[0-9a-f]{8}-/ {print $1}' | xargs -r -n1 tmux kill-session -t
 ```
 
-## Cleanup — `antfarm doctor --sweep-legacy-tmux` (Unreleased / 0.7+)
+## Cleanup — `antfarm doctor --sweep-legacy-tmux` (0.6.4+)
 
 Preview matches:
 

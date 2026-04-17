@@ -560,14 +560,14 @@ thanks to the persisted UUID.
 ## Upgrade guidance
 
 Version-specific operational changes live in `UPGRADE.md`. Highlights as
-of v0.7.0:
+of v0.6.4:
 
-- Colony identity is a persisted UUID (#238). Pre-upgrade tmux sessions
-  use the old realpath-based hash and become orphans — sweep them after
-  draining.
-- Autoscaler/runner session names are colony-scoped (#231).
-- Deploy session names are colony-scoped (#235).
-- Doctor `--sweep-legacy-tmux` is the one-time migration tool (#237).
+- Autoscaler/runner session names are colony-scoped (#231, v0.6.3).
+- Deploy session names are colony-scoped (#235, v0.6.4).
+- Doctor `--sweep-legacy-tmux` is the one-time migration tool (#237, v0.6.4).
+- Colony identity is a persisted UUID (#238, trunk — shipping in the
+  next release). Pre-upgrade tmux sessions use the old realpath-based
+  hash and become orphans — sweep them after draining.
 
 Always read the matching section of `UPGRADE.md` before upgrading a live
-colony, especially when moving across the v0.6.2 → v0.6.3 → v0.7.0 line.
+colony, especially when moving across the v0.6.2 → v0.6.3 → v0.6.4 line.
