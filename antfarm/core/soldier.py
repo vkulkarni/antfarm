@@ -517,6 +517,10 @@ class Soldier:
             if is_infra_task(task):
                 continue
             task_id = task.get("id", "")
+            # Skip cancelled tasks — they were purged by cancel_mission_tasks
+            if task.get("cancelled_at"):
+                _emit("merge_skipped", task_id, "reason=cancelled")
+                continue
             # Skip already-merged tasks
             if self._has_merged_attempt(task):
                 _emit("merge_skipped", task_id, "reason=already_merged")

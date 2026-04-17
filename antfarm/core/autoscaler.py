@@ -82,6 +82,7 @@ def compute_desired(
         for t in tasks
         if t["status"] == "done"
         and not t["id"].startswith("review-")
+        and not t.get("cancelled_at")
         and not has_verdict(t)
         and not has_merged_attempt(t)
     ]

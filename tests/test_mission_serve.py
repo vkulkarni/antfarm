@@ -128,7 +128,9 @@ def test_cancel_mission_terminal_state(client):
     _create_mission(client)
     r = client.post("/missions/mission-001/cancel")
     assert r.status_code == 200
-    assert r.json() == {"ok": True}
+    data = r.json()
+    assert data["ok"] is True
+    assert "cancelled_tasks" in data
 
     mission = client.get("/missions/mission-001").json()
     assert mission["status"] == "cancelled"
@@ -142,7 +144,7 @@ def test_cancel_mission_idempotent(client):
 
     r2 = client.post("/missions/mission-001/cancel")
     assert r2.status_code == 200
-    assert r2.json() == {"ok": True}
+    assert r2.json() == {"ok": True, "cancelled_tasks": []}
 
 
 def test_carry_with_mission_id_appends_to_task_ids(client):
@@ -196,6 +198,188 @@ def test_get_mission_report_returns_report(client):
     data = r.json()
     assert data["mission_id"] == "mission-001"
     assert data["total_tasks"] == 5
+
+
+# ---------------------------------------------------------------------------
+# GitHubBackend preflight
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# cancel_mission purge tests (#265)
+# ---------------------------------------------------------------------------
+
+
+def _forage(client, worker_id: str = "worker-1"):
+    """Pull the next available task for a worker."""
+    return client.post("/tasks/pull", json={"worker_id": worker_id})
+
+
+def _register_worker(client, worker_id: str = "worker-1"):
+    client.post(
+        "/workers/register",
+        json={
+            "worker_id": worker_id,
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp/ws",
+            "registered_at": "2024-01-01T00:00:00+00:00",
+            "last_heartbeat": "2024-01-01T00:00:00+00:00",
+        },
+    )
+
+
+def test_cancel_mission_moves_ready_tasks_to_done(client, tmp_path):
+    """Cancelling a mission moves all ready tasks to done/ with cancellation metadata."""
+    _create_mission(client)
+    _carry(client, task_id="task-001", mission_id="mission-001")
+    _carry(client, task_id="task-002", mission_id="mission-001")
+
+    r = client.post("/missions/mission-001/cancel")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert sorted(data["cancelled_tasks"]) == ["task-001", "task-002"]
+
+    for tid in ("task-001", "task-002"):
+        task = client.get(f"/tasks/{tid}").json()
+        assert task["status"] == "done", f"{tid} should be done"
+        assert task["cancelled_at"] is not None, f"{tid} missing cancelled_at"
+        assert task["cancelled_reason"] == "mission cancelled"
+        assert task["current_attempt"] is None
+        # Confirm trail entry with action_type=cancel
+        cancel_entries = [e for e in task.get("trail", []) if e.get("action_type") == "cancel"]
+        assert cancel_entries, f"{tid} has no cancel trail entry"
+
+
+def test_cancel_mission_moves_blocked_tasks_to_done(client):
+    """Cancelling a mission also moves blocked tasks to done/."""
+    _create_mission(client)
+    _carry(client, task_id="task-blocked", mission_id="mission-001")
+    # Block the task
+    client.post("/tasks/task-blocked/block", json={"reason": "external dep"})
+
+    r = client.post("/missions/mission-001/cancel")
+    assert r.status_code == 200
+    assert "task-blocked" in r.json()["cancelled_tasks"]
+
+    task = client.get("/tasks/task-blocked").json()
+    assert task["status"] == "done"
+    assert task["cancelled_at"] is not None
+
+
+def test_cancel_mission_supersedes_active_attempt(client):
+    """Cancelling a mission supersedes any active attempt on each task."""
+    _create_mission(client)
+    _carry(client, task_id="task-active", mission_id="mission-001")
+    _register_worker(client)
+    forage_r = _forage(client)
+    assert forage_r.status_code == 200
+    attempt_id = forage_r.json()["current_attempt"]
+    assert attempt_id is not None
+
+    r = client.post("/missions/mission-001/cancel")
+    assert r.status_code == 200
+    assert "task-active" in r.json()["cancelled_tasks"]
+
+    task = client.get("/tasks/task-active").json()
+    assert task["status"] == "done"
+    assert task["current_attempt"] is None
+    assert task["cancelled_at"] is not None
+
+    # The attempt should be SUPERSEDED
+    superseded = [a for a in task["attempts"] if a["attempt_id"] == attempt_id]
+    assert superseded, "original attempt not found"
+    assert superseded[0]["status"] == "superseded"
+    assert superseded[0]["completed_at"] is not None
+
+
+def test_cancel_mission_leaves_unrelated_mission_tasks_alone(client):
+    """Cancelling mission-A does not affect tasks belonging to mission-B."""
+    _create_mission(client, mission_id="mission-A")
+    _create_mission(client, mission_id="mission-B")
+    _carry(client, task_id="task-a", mission_id="mission-A")
+    _carry(client, task_id="task-b", mission_id="mission-B")
+
+    r = client.post("/missions/mission-A/cancel")
+    assert r.status_code == 200
+    assert "task-a" in r.json()["cancelled_tasks"]
+    assert "task-b" not in r.json()["cancelled_tasks"]
+
+    # mission-B task untouched
+    task_b = client.get("/tasks/task-b").json()
+    assert task_b["status"] == "ready"
+    assert task_b.get("cancelled_at") is None
+
+
+def test_cancel_mission_excludes_cancelled_task_from_merge_queue(tmp_path):
+    """After cancel, Soldier.get_merge_queue() returns empty list for cancelled tasks."""
+    from fastapi.testclient import TestClient
+
+    from antfarm.core.backends.file import FileBackend
+    from antfarm.core.colony_client import ColonyClient
+    from antfarm.core.serve import get_app
+    from antfarm.core.soldier import Soldier
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend)
+    http_client = TestClient(app, raise_server_exceptions=True)
+    colony_client = ColonyClient("http://testserver", client=http_client)
+
+    # Create mission + task
+    http_client.post("/missions", json={"mission_id": "mission-001", "spec": "test"})
+    http_client.post(
+        "/tasks",
+        json={"id": "task-001", "title": "t", "spec": "s", "mission_id": "mission-001"},
+    ).raise_for_status()
+
+    # Manually move task to done/ with a branch so it looks merge-eligible
+    colony_client.register_worker("w1", "node-1", "generic", "/tmp/ws")
+    task = colony_client.forage("w1")
+    assert task is not None
+    colony_client.harvest("task-001", task["current_attempt"], "http://pr/1", "feat/task-001")
+
+    # Confirm it looks merge-eligible before cancel
+    soldier = Soldier(
+        colony_url="http://testserver",
+        repo_path=str(tmp_path),
+        client=http_client,
+    )
+    queue_before = soldier.get_merge_queue()
+    assert any(t["id"] == "task-001" for t in queue_before)
+
+    # Cancel mission
+    http_client.post("/missions/mission-001/cancel")
+
+    # Now the task should be excluded from the merge queue
+    queue_after = soldier.get_merge_queue()
+    assert not any(t["id"] == "task-001" for t in queue_after)
+
+
+def test_cancel_mission_idempotent_on_already_cancelled(client):
+    """Second cancel call on an already-cancelled mission returns ok with empty list."""
+    _create_mission(client)
+    _carry(client, task_id="task-001", mission_id="mission-001")
+
+    r1 = client.post("/missions/mission-001/cancel")
+    assert r1.status_code == 200
+
+    r2 = client.post("/missions/mission-001/cancel")
+    assert r2.status_code == 200
+    assert r2.json() == {"ok": True, "cancelled_tasks": []}
+
+
+def test_cancel_mission_returns_payload_with_cancelled_task_count(client):
+    """Cancelling returns ok=True and the list of cancelled task IDs."""
+    _create_mission(client)
+    _carry(client, task_id="task-001", mission_id="mission-001")
+    _carry(client, task_id="task-002", mission_id="mission-001")
+
+    r = client.post("/missions/mission-001/cancel")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert len(data["cancelled_tasks"]) == 2
 
 
 # ---------------------------------------------------------------------------

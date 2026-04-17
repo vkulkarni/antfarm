@@ -990,3 +990,6 @@ class GitHubBackend(TaskBackend):
 
     def update_mission(self, mission_id: str, updates: dict) -> None:
         raise NotImplementedError(_GITHUB_BACKEND_MSG)
+
+    def cancel_mission_tasks(self, mission_id: str, reason: str) -> list[str]:
+        raise NotImplementedError(_GITHUB_BACKEND_MSG)
