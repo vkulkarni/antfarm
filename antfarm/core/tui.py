@@ -39,6 +39,7 @@ class PipelineSnapshot:
     merge_ready: list[dict] = field(default_factory=list)
     recently_merged: list[dict] = field(default_factory=list)
     review_tasks: dict = field(default_factory=dict)
+    warnings: list[dict] = field(default_factory=list)
 
 
 class AntfarmTUI:
@@ -155,10 +156,12 @@ class AntfarmTUI:
             missions = []
 
         snap = self._classify_tasks(tasks)
+        snap.warnings = full.get("warnings", [])
 
         layout = Layout()
         missions_size = max(5, min(len(missions) + 4, 10)) if missions else 5
-        layout.split_column(
+        warnings_size = len(snap.warnings) + 2 if snap.warnings else 0
+        column_slices = [
             Layout(name="header", size=10),
             Layout(name="missions", size=missions_size),
             Layout(name="workers", size=max(5, len(workers) + 5)),
@@ -169,7 +172,16 @@ class AntfarmTUI:
             Layout(name="merge_ready", size=6),
             Layout(name="merged", size=6),
             Layout(name="activity", size=8),
-        )
+        ]
+        if snap.warnings:
+            column_slices.insert(0, Layout(name="warnings", size=warnings_size))
+        layout.split_column(*column_slices)
+
+        # Warnings panel — only present when there are warnings
+        if snap.warnings:
+            layout["warnings"].update(
+                self._render_warnings(snap.warnings)
+            )
 
         # Header: banner (left) + colony summary (right) side by side
         layout["header"].split_row(
@@ -895,6 +907,19 @@ class AntfarmTUI:
         self._add_overflow_hint(table, len(tasks), max_shown)
 
         return table
+
+    def _render_warnings(self, warnings: list[dict]) -> Panel:
+        """Render a red panel listing all colony-level warnings with hints."""
+        text = Text()
+        for i, w in enumerate(warnings):
+            message = w.get("message", "")
+            hint = w.get("hint", "")
+            text.append(message, style="bold red")
+            if hint:
+                text.append(f"\n  \u2192 {hint}", style="red")
+            if i < len(warnings) - 1:
+                text.append("\n")
+        return Panel(text, title="[bold red]\u26a0 Warnings[/bold red]", border_style="red")
 
     def _get_worker_type(self, worker: dict) -> str:
         """Determine worker type (builder/reviewer) from agent_type or touches."""

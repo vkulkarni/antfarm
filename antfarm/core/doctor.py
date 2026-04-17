@@ -76,6 +76,7 @@ def run_doctor(
     findings.extend(check_stale_workers(backend, config, fix))
     findings.extend(check_stuck_workers(backend, config, fix))
     findings.extend(check_stale_tasks(backend, config, fix))
+    findings.extend(check_no_reviewer_capacity(backend, config))
     findings.extend(check_stale_guards(backend, config, fix))
     findings.extend(check_workspace_conflicts(backend))
     findings.extend(check_orphan_workspaces(config, fix))
@@ -541,6 +542,49 @@ def _recover_stale_task(
     tmp_path.write_text(json.dumps(data, indent=2))
     tmp_path.replace(ready_path)
     task_file.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Check 5b: No reviewer capacity
+# ---------------------------------------------------------------------------
+
+
+def check_no_reviewer_capacity(backend, config: dict) -> list[Finding]:  # noqa: ARG001
+    """Warn when ready review tasks exist but no registered worker has the review capability.
+
+    This detects the common operator error where doctor requeued a review task
+    but no reviewer worker is running (e.g. autoscaler off, no standalone
+    reviewer started). The task silently sits in ready forever without this check.
+
+    No auto-fix: Antfarm never spawns workers on the operator's behalf.
+
+    Args:
+        backend: TaskBackend instance.
+        config: Doctor config dict (unused; kept for consistent signature).
+
+    Returns:
+        List of findings (at most one).
+    """
+    from antfarm.core.warnings import detect_no_reviewer_capacity
+
+    try:
+        tasks = backend.list_tasks()
+        workers = backend.list_workers() if hasattr(backend, "list_workers") else []
+    except Exception:
+        return []
+
+    warning = detect_no_reviewer_capacity(tasks, workers)
+    if warning is None:
+        return []
+
+    return [
+        Finding(
+            severity="warning",
+            check="no_reviewer_capacity",
+            message=warning["message"],
+            auto_fixable=False,
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

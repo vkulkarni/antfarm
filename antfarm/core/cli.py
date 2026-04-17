@@ -588,6 +588,9 @@ _WATCHED_FIELDS = (
 
 def _render_scout(status: dict, prev: dict | None) -> None:
     """Render a status table, highlighting changes vs prev snapshot."""
+    # Pop warnings before the table loop so they don't render as rows.
+    warnings = status.pop("warnings", [])
+
     click.echo(f"{'Field':<25} {'Value'}")
     click.echo("-" * 40)
     for key, value in status.items():
@@ -600,6 +603,13 @@ def _render_scout(status: dict, prev: dict | None) -> None:
                 elif value < prev_val:
                     value_str = click.style(value_str, fg="red")
         click.echo(f"{key:<25} {value_str}")
+
+    if warnings:
+        click.echo("")
+        for w in warnings:
+            msg = w.get("message", "")
+            hint = w.get("hint", "")
+            click.secho(f"\u26a0  {msg} \u2014 {hint}", fg="red")
 
 
 def _format_event(event: dict) -> str:

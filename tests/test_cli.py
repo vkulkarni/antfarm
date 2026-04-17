@@ -1057,3 +1057,63 @@ def test_plan_carry_resolves_index_deps():
     # Task B's depends_on should reference Task A's actual ID
     task_a_id = carried_payloads[0]["id"]
     assert carried_payloads[1]["depends_on"] == [task_a_id]
+
+
+# ---------------------------------------------------------------------------
+# _render_scout warnings
+# ---------------------------------------------------------------------------
+
+
+def test_render_scout_prints_warnings():
+    """_render_scout emits warning lines in red when warnings are present in the status dict."""
+    from antfarm.core.cli import _render_scout
+
+    status = {
+        "tasks": {"ready": 1, "active": 0, "done": 0},
+        "workers": 0,
+        "nodes": 0,
+        "soldier": "not started",
+        "warnings": [
+            {
+                "code": "no_reviewer_capacity",
+                "message": "1 review task(s) ready but no worker has 'review' capability",
+                "hint": "Start one: antfarm worker start --agent reviewer",
+                "count": 1,
+            }
+        ],
+    }
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        with runner.isolation(input=None, color=False):
+            _render_scout(status, None)
+        # After the call, 'warnings' should have been popped from status
+        assert "warnings" not in status
+
+    # Invoke via CLI echo captures — simplest is to capture via a Click echo wrapper
+    # by calling the function inside a runner context that captures output.
+    output_lines: list[str] = []
+
+    def capturing_echo(*args, **kwargs):
+        msg = args[0] if args else ""
+        output_lines.append(str(msg))
+
+    with patch("antfarm.core.cli.click.echo", side_effect=capturing_echo), patch(
+        "antfarm.core.cli.click.secho", side_effect=capturing_echo
+    ):
+        status2 = {
+            "tasks": {"ready": 1, "active": 0, "done": 0},
+            "warnings": [
+                {
+                    "code": "no_reviewer_capacity",
+                    "message": "m",
+                    "hint": "h",
+                    "count": 1,
+                }
+            ],
+        }
+        _render_scout(status2, None)
+
+    combined = "\n".join(output_lines)
+    assert "h" in combined
+    assert "m" in combined

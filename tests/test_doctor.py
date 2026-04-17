@@ -1615,3 +1615,80 @@ def test_doctor_dry_run_does_not_emit_stale_guard_event(setup, clear_events):
     run_doctor(backend, config, fix=False)
 
     assert _find_event(clear_events, "stale_guard_cleared") is None
+
+
+# ---------------------------------------------------------------------------
+# check_no_reviewer_capacity tests
+# ---------------------------------------------------------------------------
+
+
+def _make_review_task(task_id: str = "review-1") -> dict:
+    """Make a task that requires the 'review' capability."""
+    now = datetime.now(UTC).isoformat()
+    return {
+        "id": task_id,
+        "title": f"Review {task_id}",
+        "spec": "Review this PR",
+        "complexity": "S",
+        "priority": 5,
+        "depends_on": [],
+        "touches": [],
+        "capabilities_required": ["review"],
+        "created_at": now,
+        "updated_at": now,
+        "created_by": "test",
+    }
+
+
+def _make_reviewer_worker(worker_id: str = "reviewer-1") -> dict:
+    """Make a worker dict with the 'review' capability."""
+    now = datetime.now(UTC).isoformat()
+    return {
+        "worker_id": worker_id,
+        "node_id": "node-1",
+        "agent_type": "reviewer",
+        "workspace_root": "/tmp/ws-review",
+        "capabilities": ["review"],
+        "status": "idle",
+        "registered_at": now,
+        "last_heartbeat": now,
+    }
+
+
+def test_check_no_reviewer_capacity_fires(setup):
+    """Ready review task + zero reviewer workers → one warning finding."""
+    backend, config = setup
+    backend.carry(_make_review_task("review-001"))
+
+    findings = run_doctor(backend, config)
+
+    capacity_findings = [f for f in findings if f.check == "no_reviewer_capacity"]
+    assert len(capacity_findings) == 1
+    f = capacity_findings[0]
+    assert f.severity == "warning"
+    assert f.auto_fixable is False
+    assert "review" in f.message.lower()
+
+
+def test_check_no_reviewer_capacity_silent_when_reviewer_present(setup):
+    """Ready review task + a registered reviewer worker → no capacity finding."""
+    backend, config = setup
+    backend.carry(_make_review_task("review-001"))
+    backend.register_worker(_make_reviewer_worker("local/reviewer-1"))
+
+    findings = run_doctor(backend, config)
+
+    capacity_findings = [f for f in findings if f.check == "no_reviewer_capacity"]
+    assert len(capacity_findings) == 0
+
+
+def test_check_no_reviewer_capacity_silent_when_no_ready_review_tasks(setup):
+    """No ready review tasks → no capacity finding, even without reviewer workers."""
+    backend, config = setup
+    # Regular task (no capabilities_required) and no workers
+    backend.carry(_make_task("task-regular"))
+
+    findings = run_doctor(backend, config)
+
+    capacity_findings = [f for f in findings if f.check == "no_reviewer_capacity"]
+    assert len(capacity_findings) == 0
