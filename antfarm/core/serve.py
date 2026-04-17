@@ -48,13 +48,25 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _emit_event(event_type: str, task_id: str, detail: str = "") -> None:
-    """Append an event to the SSE event bus."""
+def _emit_event(
+    event_type: str, task_id: str, detail: str = "", actor: str = "colony"
+) -> None:
+    """Append an event to the SSE event bus.
+
+    Args:
+        event_type: Short event name (e.g. "harvested", "merged", "plan_created").
+        task_id: Task ID the event relates to ("" if not task-scoped).
+        detail: Free-form human-readable detail string.
+        actor: Subsystem that produced the event ("colony", "queen", "autoscaler",
+            "soldier", "doctor", "worker", "runner"). Defaults to "colony", which
+            is correct for events emitted from inside colony HTTP handlers.
+    """
     global _event_counter
     _event_counter += 1
     _event_queue.append(
         {
             "id": _event_counter,
+            "actor": actor,
             "type": event_type,
             "task_id": task_id,
             "detail": detail,
