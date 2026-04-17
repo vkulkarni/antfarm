@@ -29,6 +29,21 @@ from antfarm.core.workspace import WorkspaceManager
 logger = logging.getLogger(__name__)
 
 
+def _emit(event_type: str, task_id: str, detail: str = "") -> None:
+    """Emit an SSE event tagged with actor='worker'.
+
+    Lazy-imports ``_emit_event`` to avoid a circular import at module load
+    time (serve.py transitively imports this module) and to keep the worker
+    runtime importable in contexts where the FastAPI server module cannot be
+    loaded.
+    """
+    try:
+        from antfarm.core.serve import _emit_event
+    except Exception:
+        return
+    _emit_event(event_type, task_id, detail, actor="worker")
+
+
 # ---------------------------------------------------------------------------
 # Failure classification
 # ---------------------------------------------------------------------------
@@ -334,6 +349,7 @@ class WorkerRuntime:
         attempt_id = task["current_attempt"]
         self._last_task_id = task_id
         logger.info("task claimed task_id=%s attempt_id=%s", task_id, attempt_id)
+        _emit("task_claimed", task_id, task.get("title", ""))
 
         with contextlib.suppress(Exception):
             self.colony.trail(
@@ -342,6 +358,7 @@ class WorkerRuntime:
 
         workspace = self.workspace_mgr.create(task_id, attempt_id)
         logger.info("workspace created path=%s", workspace)
+        _emit("workspace_created", task_id, workspace)
 
         with contextlib.suppress(Exception):
             self.colony.trail(
@@ -350,6 +367,7 @@ class WorkerRuntime:
 
         self._start_heartbeat_loop()
         try:
+            _emit("agent_launched", task_id, self.agent_type)
             result = self._launch_agent(task, workspace)
         finally:
             self._stop_heartbeat_loop()
