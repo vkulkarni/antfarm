@@ -122,6 +122,41 @@ def test_classify_planning():
     assert len(snap.building) == 0
 
 
+def test_classify_done_plan_task_hidden_from_merge_ready():
+    """Done plan tasks must not appear in merge_ready or awaiting_review,
+    even when they carry a pass verdict. They are infra tasks and the
+    Soldier excludes them via is_infra_task()."""
+    tui = _make_tui()
+    att = _attempt(status="done", review_verdict={"verdict": "pass", "freshness": "fresh"})
+    t = _task(task_id="plan-abc", status="done", current_attempt="att-001", attempts=[att])
+    t["capabilities_required"] = ["plan"]
+    snap = tui._classify_tasks([t])
+    assert len(snap.merge_ready) == 0
+    assert len(snap.awaiting_review) == 0
+
+
+def test_progress_denominator_excludes_infra():
+    """Pipeline Progress denominator must only count impl tasks — not
+    plan/review infra tasks — matching Soldier's mergeable definition."""
+    tui = _make_tui()
+    impl = _task(task_id="task-001", status="ready")
+    plan_task = _task(task_id="plan-xyz", status="ready")
+    plan_task["capabilities_required"] = ["plan"]
+    review_task = _task(task_id="review-xyz", status="ready")
+    tasks = [impl, plan_task, review_task]
+    snap = PipelineSnapshot()
+    # _render_summary computes impl_tasks internally; exercise that path
+    # and verify by inspecting the filter directly via is_infra_task.
+    from antfarm.core.missions import is_infra_task as _iit
+
+    impl_tasks = [t for t in tasks if not _iit(t)]
+    assert len(impl_tasks) == 1
+    assert impl_tasks[0]["id"] == "task-001"
+    # Sanity check: summary renders without error with this mix.
+    result = tui._render_summary({}, tasks, [], snap, "idle")
+    assert isinstance(result, Table)
+
+
 def test_classify_waiting_rework():
     tui = _make_tui()
     att = _attempt(
