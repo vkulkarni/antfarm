@@ -9,6 +9,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 - Per-worker current-action visibility: `POST /workers/{id}/activity`, TUI Activity column with elapsed time, and doctor `check_stuck_workers` warning for workers idle on an action > 5 min. (#239)
 
+### Fixed
+- TUI now shows actionable guidance when the colony is unreachable, including the attempted URL and commands to start/redirect. (#246)
+
 ### Changed
 - `deploy.py` tmux session names are now colony-scoped with an 8-char hash of `(realpath(fleet_config) | colony_url)`. **Breaking:** pre-upgrade deploy sessions won't be found by `deploy status` — kill them manually via `tmux kill-session` and redeploy. (#235)
 
