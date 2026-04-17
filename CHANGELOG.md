@@ -6,6 +6,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-04-17
+
+Efficiency pass (P1–P6): eliminates the ~40% of mission wall-clock that was being lost to avoidable rebuilds, empty-queue worker exits, and stale merge scheduling. All changes are deterministic (no AI).
+
+### Added
+- **Builder branches from unmerged dep branch** — when a task has exactly one unmerged dependency, its worktree now bases on the dep's PR branch instead of `origin/<integration>`, eliminating merge-base drift rebuilds. Zero / multi-dep cases fall back to the integration branch. (#291)
+- **Soldier event-driven merge trigger** — Soldier subscribes to the `/events` SSE stream and reacts to `review_approved` / `harvested` / `merge_requested` within ~1s; fixed polling remains as a fallback on connection error. (#289)
+- **Soldier merge diagnostic events** — emits `merge_attempted`, `merge_skipped`, and `merge_failed` with stable reason codes (`dep_unmerged`, `no_pr`, `superseded`, `needs_changes`, `merge_conflict`, `test_failed`, `rebase_failed`, `rebase_retry_merge_failed`, `checkout_failed`, `push_failed`) so operators can trace why a done task hasn't merged. (#293)
+- **Configurable worker empty-poll backoff** — `antfarm worker start` accepts `--poll-interval` and `--max-empty-polls`; workers now sleep and re-poll instead of exiting on first empty forage, with role-based defaults (reviewer=10, builder=5, planner=0). Closes #272. (#290)
+
+### Changed
+- **Soldier rebases before kickback** — on merge conflict, Soldier attempts a deterministic `git rebase origin/<integration>` and `--force-with-lease` push before a single merge retry; genuine rebase conflicts still kick back. (#292)
+- **Skip re-review on pure-rebase reharvest** — when a reharvested attempt has a byte-identical code diff (tests pathspec-excluded, `--ignore-all-space` normalized) to the reviewed prior attempt, the prior `pass` verdict carries forward instead of running a fresh ~3-minute review. `needs_changes` never carries forward; any git failure falls through to the safe re-ready path. (#294)
+
+### Fixed
+- **#284: Soldier kicks back on `needs_changes` verdicts** — `require_review=True` now flows through `serve.py::_start_soldier_thread` to the Soldier constructor, so `run_once_with_review` (not `run_once`) is the loop being scheduled and `needs_changes` reliably converts into a kickback within one tick. Regression test added. (#292)
+
 ## [0.6.6] - 2026-04-17
 
 ### Added
