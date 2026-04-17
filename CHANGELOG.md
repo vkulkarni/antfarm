@@ -17,6 +17,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - TUI now shows actionable guidance when the colony is unreachable, including the attempted URL and commands to start/redirect. (#246)
 
 ### Changed
+- The `colony hash: ...` startup log now fires once per server startup (FastAPI startup event) instead of on every `get_app()` call, reducing noise in test suites. (#249)
 - `deploy.py` tmux session names are now colony-scoped with an 8-char hash of `(realpath(fleet_config) | colony_url)`. **Breaking:** pre-upgrade deploy sessions won't be found by `deploy status` — kill them manually via `tmux kill-session` and redeploy. (#235)
 
 ## [0.6.3] - 2026-04-16

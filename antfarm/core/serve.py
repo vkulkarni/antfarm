@@ -382,24 +382,28 @@ def get_app(
         pr_ops = GhPROps(cwd=repo_path) if repo_path else NullPROps()
         _backend = FileBackend(root=data_dir, pr_ops=pr_ops)
 
-    # Log the colony hash so operators can correlate tmux session names
-    # (auto-<hash>-*, runner-<hash>-*) back to this colony's data_dir.
-    try:
-        from antfarm.core.process_manager import colony_hash
-
-        logger.info(
-            "colony hash: %s (data_dir: %s)",
-            colony_hash(data_dir),
-            os.path.realpath(data_dir),
-        )
-    except Exception:  # noqa: BLE001 — logging must never break startup
-        pass
-
     # Fallback so downstream uses (Queen, etc.) still see a repo_path string.
     if repo_path is None:
         repo_path = "."
 
-    app = FastAPI(title="Antfarm Colony")
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _lifespan(application: FastAPI):  # noqa: ARG001
+        # Log colony hash once per server startup so operators can correlate
+        # tmux session names (auto-<hash>-*, runner-<hash>-*) to this data_dir.
+        # Fires only when uvicorn actually starts — not on every get_app() call,
+        # which would spam test suite logs.
+        try:
+            from antfarm.core.process_manager import colony_hash
+
+            resolved = os.path.realpath(data_dir)
+            logger.info("colony hash: %s (data_dir: %s)", colony_hash(data_dir), resolved)
+        except ImportError:
+            pass
+        yield
+
+    app = FastAPI(title="Antfarm Colony", lifespan=_lifespan)
 
     if auth_secret:
         from antfarm.core.auth import create_auth_middleware
