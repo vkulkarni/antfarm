@@ -8,11 +8,15 @@ and colony interactions are fully exercised without mocking.
 from __future__ import annotations
 
 import contextlib
+import json
 import subprocess
+import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from antfarm.core import soldier as soldier_module
 from antfarm.core.backends.file import FileBackend
 from antfarm.core.colony_client import ColonyClient
 from antfarm.core.serve import get_app
@@ -1601,3 +1605,231 @@ def test_soldier_does_not_re_emit_colony_event_types(soldier_env, clear_events):
             assert e["actor"] != "soldier", (
                 f"soldier must not re-emit colony-owned event {e['type']}: {e}"
             )
+
+
+# ---------------------------------------------------------------------------
+# P5: event-driven merge trigger — _wait_for_event tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeStreamResponse:
+    """Minimal stand-in for an httpx streaming Response used with a context manager."""
+
+    def __init__(self, lines: list[str], *, raise_on_enter: Exception | None = None):
+        self._lines = lines
+        self._raise_on_enter = raise_on_enter
+
+    def __enter__(self):
+        if self._raise_on_enter is not None:
+            raise self._raise_on_enter
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def raise_for_status(self):
+        return None
+
+    def iter_lines(self):
+        yield from self._lines
+
+
+class _FakeHttpxClient:
+    """Minimal httpx.Client replacement with a scripted stream() response."""
+
+    def __init__(
+        self,
+        lines: list[str] | None = None,
+        *,
+        stream_exc: Exception | None = None,
+        enter_exc: Exception | None = None,
+    ):
+        self._lines = lines or []
+        self._stream_exc = stream_exc
+        self._enter_exc = enter_exc
+        self.stream_calls: list[tuple[str, str, dict]] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def stream(self, method: str, url: str, params: dict | None = None, **kwargs):
+        self.stream_calls.append((method, url, params or {}))
+        if self._stream_exc is not None:
+            raise self._stream_exc
+        return _FakeStreamResponse(self._lines, raise_on_enter=self._enter_exc)
+
+
+def _make_soldier_for_event_tests(poll_interval: float = 5.0) -> Soldier:
+    """Construct a Soldier with a usable colony_url but no real HTTP."""
+    return Soldier(
+        colony_url="http://fake-colony:7433",
+        repo_path="/tmp/not-used",
+        integration_branch="dev",
+        poll_interval=poll_interval,
+    )
+
+
+def test_wait_for_event_wakes_on_harvested_under_one_second(monkeypatch):
+    """A wake event (harvested) must cause _wait_for_event to return quickly."""
+    soldier = _make_soldier_for_event_tests(poll_interval=5.0)
+
+    wake = {
+        "id": 1,
+        "actor": "colony",
+        "type": "harvested",
+        "task_id": "task-1",
+        "detail": "",
+        "ts": "now",
+    }
+    lines = [f"data: {json.dumps(wake)}", ""]
+    fake_client = _FakeHttpxClient(lines=lines)
+
+    monkeypatch.setattr(
+        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
+    )
+
+    # If sleep is called here we fail — wake path must not sleep.
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(soldier_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    start = time.monotonic()
+    woken = soldier._wait_for_event(timeout=5.0)
+    elapsed = time.monotonic() - start
+
+    assert woken is True
+    assert elapsed < 1.0, f"expected fast wake, took {elapsed:.2f}s"
+    assert soldier._event_cursor == 1
+    assert sleep_calls == [], "wake path must not call time.sleep"
+
+
+def test_wait_for_event_ignores_unrelated_events_until_timeout(monkeypatch):
+    """Non-wake events advance the cursor but do not cause an early return."""
+    soldier = _make_soldier_for_event_tests(poll_interval=5.0)
+
+    unrelated = {
+        "id": 7,
+        "actor": "worker",
+        "type": "random_event",
+        "task_id": "task-x",
+        "detail": "",
+        "ts": "now",
+    }
+    # Provide exactly one non-wake event then let the fake stream end,
+    # simulating server-side timeout.
+    lines = [f"data: {json.dumps(unrelated)}", ""]
+    fake_client = _FakeHttpxClient(lines=lines)
+    monkeypatch.setattr(
+        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
+    )
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(soldier_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    woken = soldier._wait_for_event(timeout=5.0)
+
+    assert woken is False
+    # Cursor advanced even though no wake happened.
+    assert soldier._event_cursor == 7
+    # Clean end-of-stream means a server-side timeout path — no fallback sleep.
+    assert sleep_calls == []
+
+
+def test_wait_for_event_timeout_returns_false_without_crashing(monkeypatch):
+    """Empty stream (server timeout) returns False — loop continues normally."""
+    soldier = _make_soldier_for_event_tests(poll_interval=5.0)
+
+    fake_client = _FakeHttpxClient(lines=[])
+    monkeypatch.setattr(
+        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
+    )
+    monkeypatch.setattr(soldier_module.time, "sleep", lambda s: None)
+
+    woken = soldier._wait_for_event(timeout=5.0)
+    assert woken is False
+    assert soldier._event_cursor == 0
+
+
+def test_wait_for_event_connection_error_falls_back_to_sleep(monkeypatch):
+    """On httpx errors, log WARN + time.sleep(poll_interval); no exception escapes."""
+    soldier = _make_soldier_for_event_tests(poll_interval=5.0)
+
+    fake_client = _FakeHttpxClient(stream_exc=httpx.ConnectError("boom"))
+    monkeypatch.setattr(
+        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
+    )
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(soldier_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    woken = soldier._wait_for_event(timeout=5.0)
+
+    assert woken is False
+    assert sleep_calls == [5.0], "fallback must sleep exactly poll_interval once"
+
+
+def test_wait_for_event_json_parse_error_falls_back_to_sleep(monkeypatch):
+    """Malformed SSE payload triggers the WARN + sleep fallback."""
+    soldier = _make_soldier_for_event_tests(poll_interval=3.0)
+
+    # "data: not-json" will fail json.loads inside the helper.
+    lines = ["data: not-json", ""]
+    fake_client = _FakeHttpxClient(lines=lines)
+    monkeypatch.setattr(
+        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
+    )
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(soldier_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    woken = soldier._wait_for_event(timeout=3.0)
+
+    assert woken is False
+    assert sleep_calls == [3.0]
+
+
+def test_wait_for_event_in_process_soldier_uses_plain_sleep(tmp_path, monkeypatch):
+    """Soldier built via from_backend has no colony_url — must plain-sleep, not SSE."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    soldier = Soldier.from_backend(
+        backend=backend,
+        repo_path=str(tmp_path),
+        integration_branch="dev",
+        poll_interval=2.0,
+    )
+
+    # If httpx.Client is ever invoked, fail.
+    def _no_client(*a, **kw):
+        raise AssertionError("in-process soldier must not open SSE")
+
+    monkeypatch.setattr(soldier_module.httpx, "Client", _no_client)
+
+    sleep_calls: list[float] = []
+    monkeypatch.setattr(soldier_module.time, "sleep", lambda s: sleep_calls.append(s))
+
+    woken = soldier._wait_for_event(timeout=2.0)
+
+    assert woken is False
+    assert sleep_calls == [2.0]
+
+
+def test_wait_for_event_passes_cursor_and_timeout_to_server(monkeypatch):
+    """The helper must use the current cursor and propagate timeout to /events."""
+    soldier = _make_soldier_for_event_tests(poll_interval=4.0)
+    soldier._event_cursor = 42
+
+    fake_client = _FakeHttpxClient(lines=[])
+    monkeypatch.setattr(
+        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
+    )
+    monkeypatch.setattr(soldier_module.time, "sleep", lambda s: None)
+
+    soldier._wait_for_event(timeout=4.0)
+
+    assert len(fake_client.stream_calls) == 1
+    method, url, params = fake_client.stream_calls[0]
+    assert method == "GET"
+    assert url.endswith("/events")
+    assert params == {"after": 42, "timeout": 4.0}
