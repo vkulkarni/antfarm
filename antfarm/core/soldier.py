@@ -24,6 +24,7 @@ from enum import StrEnum
 
 from antfarm.core.backends.base import TaskBackend
 from antfarm.core.colony_client import ColonyClient
+from antfarm.core.missions import is_infra_task
 from antfarm.core.models import ReviewVerdict
 from antfarm.core.review_pack import extract_verdict_from_review_task
 
@@ -126,11 +127,7 @@ class Soldier:
             if task.get("status") != "done":
                 continue
             task_id = task.get("id", "")
-            if task_id.startswith("review-"):
-                continue
-            # Skip plan tasks — they produce tasks, not code
-            caps_req = set(task.get("capabilities_required", []))
-            if "plan" in caps_req:
+            if is_infra_task(task):
                 continue
             if self._has_merged_attempt(task):
                 continue
@@ -160,7 +157,7 @@ class Soldier:
         for task in all_tasks:
             if task.get("status") != "done":
                 continue
-            if task.get("id", "").startswith("review-"):
+            if is_infra_task(task):
                 continue
             if self._has_merged_attempt(task):
                 continue
@@ -244,16 +241,12 @@ class Soldier:
             # (parent was re-attempted after this review was created).
             # Re-ready the review task instead of consuming its stale
             # verdict against the new attempt.
-            existing_sha = self._extract_attempt_sha_from_spec(
-                review_task.get("spec", "")
-            )
+            existing_sha = self._extract_attempt_sha_from_spec(review_task.get("spec", ""))
             current_sha = self._current_attempt_sha(task)
             if existing_sha and current_sha and existing_sha != current_sha:
                 try:
                     new_spec = self._build_review_spec(task)
-                    self.colony.rereview(
-                        review_task_id, new_spec, task.get("touches", [])
-                    )
+                    self.colony.rereview(review_task_id, new_spec, task.get("touches", []))
                     logger.info(
                         "re-readied review task %s for new attempt "
                         "(sha %s -> %s) from run_once_with_review",
@@ -275,9 +268,7 @@ class Soldier:
                 # Review task exhausted its retry budget without producing a
                 # parseable verdict. Kick back the *original* task with a
                 # clear reason so the build can be reattempted.
-                self.kickback_with_cascade(
-                    task_id, "review task completed without a ReviewVerdict"
-                )
+                self.kickback_with_cascade(task_id, "review task completed without a ReviewVerdict")
                 results.append((task_id, MergeResult.FAILED))
                 continue
             if review_status != "done":
@@ -289,9 +280,7 @@ class Soldier:
             review_verdict = extract_verdict_from_review_task(review_task)
             if review_verdict is None:
                 # Review done but no verdict — treat as failure
-                self.kickback_with_cascade(
-                    task_id, "review task completed without a ReviewVerdict"
-                )
+                self.kickback_with_cascade(task_id, "review task completed without a ReviewVerdict")
                 results.append((task_id, MergeResult.FAILED))
                 continue
 
@@ -413,7 +402,10 @@ class Soldier:
             # Create temp branch from integration branch
             r = subprocess.run(
                 [
-                    "git", "checkout", "-b", temp_branch,
+                    "git",
+                    "checkout",
+                    "-b",
+                    temp_branch,
                     f"origin/{self.integration_branch}",
                 ],
                 cwd=self.repo_path,
@@ -472,9 +464,7 @@ class Soldier:
                 check=False,
             )
             if r.returncode != 0:
-                self.last_failure_reason = (
-                    f"ff-only merge failed: {r.stderr.decode().strip()}"
-                )
+                self.last_failure_reason = f"ff-only merge failed: {r.stderr.decode().strip()}"
                 return MergeResult.FAILED
 
             # Push to origin
@@ -485,9 +475,7 @@ class Soldier:
                 check=False,
             )
             if r.returncode != 0:
-                self.last_failure_reason = (
-                    f"push failed: {r.stderr.decode().strip()}"
-                )
+                self.last_failure_reason = f"push failed: {r.stderr.decode().strip()}"
                 return MergeResult.FAILED
 
             return MergeResult.MERGED
@@ -601,9 +589,7 @@ class Soldier:
     @staticmethod
     def _has_merged_attempt(task: dict) -> bool:
         """Return True if the task has at least one attempt with status MERGED."""
-        return any(
-            attempt.get("status") == "merged" for attempt in task.get("attempts", [])
-        )
+        return any(attempt.get("status") == "merged" for attempt in task.get("attempts", []))
 
     # ------------------------------------------------------------------
     # v0.5.2+ Artifact and review helpers
@@ -657,9 +643,7 @@ class Soldier:
         if not target_sha:
             return True  # no freshness data — allow (backward compat)
 
-        target_branch = artifact_dict.get(
-            "target_branch", self.integration_branch
-        )
+        target_branch = artifact_dict.get("target_branch", self.integration_branch)
         try:
             r = subprocess.run(
                 ["git", "rev-parse", f"origin/{target_branch}"],
@@ -718,7 +702,7 @@ class Soldier:
         for raw in spec.splitlines():
             line = raw.strip()
             if line.startswith(marker):
-                return line[len(marker):].strip()
+                return line[len(marker) :].strip()
         return ""
 
     def _current_attempt_sha(self, task: dict) -> str:
@@ -812,9 +796,7 @@ class Soldier:
         existing = self.colony.get_task(review_task_id)
         if existing is not None:
             # Compare embedded SHA on existing review task vs current attempt
-            existing_sha = self._extract_attempt_sha_from_spec(
-                existing.get("spec", "")
-            )
+            existing_sha = self._extract_attempt_sha_from_spec(existing.get("spec", ""))
             current_sha = self._current_attempt_sha(task)
             if not existing_sha:
                 # Legacy review task predates the Attempt-SHA marker.
@@ -945,9 +927,7 @@ class _BackendAdapter:
     def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
         self._backend.kickback(task_id, reason, max_attempts=max_attempts)
 
-    def store_review_verdict(
-        self, task_id: str, attempt_id: str, verdict: dict
-    ) -> None:
+    def store_review_verdict(self, task_id: str, attempt_id: str, verdict: dict) -> None:
         self._backend.store_review_verdict(task_id, attempt_id, verdict)
 
     def get_mission(self, mission_id: str) -> dict | None:
