@@ -116,6 +116,7 @@ class AntfarmTUI:
         banner.append("      ", style="dim")
         banner.append(line2, style="bold dark_orange")
         from antfarm.core import __version__
+
         banner.append(f"\n v{__version__}", style="bold bright_white")
         layout["header"]["banner"].update(Panel(banner))
 
@@ -180,8 +181,7 @@ class AntfarmTUI:
             Panel(
                 self._render_awaiting_review(snap.awaiting_review),
                 title=(
-                    f"[bold magenta]Awaiting Review"
-                    f" ({len(snap.awaiting_review)})[/bold magenta]"
+                    f"[bold magenta]Awaiting Review ({len(snap.awaiting_review)})[/bold magenta]"
                 ),
             )
         )
@@ -202,10 +202,7 @@ class AntfarmTUI:
         layout["merged"].update(
             Panel(
                 self._render_recently_merged(snap.recently_merged),
-                title=(
-                    f"[bold green]Recently Merged"
-                    f" ({len(snap.recently_merged)})[/bold green]"
-                ),
+                title=(f"[bold green]Recently Merged ({len(snap.recently_merged)})[/bold green]"),
             )
         )
 
@@ -267,9 +264,7 @@ class AntfarmTUI:
 
     def _is_kicked_back(self, task: dict) -> bool:
         """Check if task has a superseded attempt (was kicked back)."""
-        return any(
-            attempt.get("status") == "superseded" for attempt in task.get("attempts", [])
-        )
+        return any(attempt.get("status") == "superseded" for attempt in task.get("attempts", []))
 
     def _get_verdict(self, task: dict) -> dict | None:
         """Get review verdict from current attempt."""
@@ -283,9 +278,7 @@ class AntfarmTUI:
 
     def _has_merged_attempt(self, task: dict) -> bool:
         """Check if any attempt has status=merged."""
-        return any(
-            attempt.get("status") == "merged" for attempt in task.get("attempts", [])
-        )
+        return any(attempt.get("status") == "merged" for attempt in task.get("attempts", []))
 
     def _get_worker_for_task(self, task: dict) -> str:
         """Get worker_id from current attempt."""
@@ -688,9 +681,7 @@ class AntfarmTUI:
         self._add_overflow_hint(table, len(tasks), max_shown)
         return table
 
-    def _render_awaiting_review(
-        self, tasks: list[dict], max_shown: int = 8
-    ) -> Table:
+    def _render_awaiting_review(self, tasks: list[dict], max_shown: int = 8) -> Table:
         """Render tasks awaiting review."""
         table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
         table.add_column("ID", max_width=20, no_wrap=True)
@@ -803,6 +794,31 @@ class AntfarmTUI:
             return "reviewer"
         return "builder"
 
+    def _format_activity_cell(self, worker: dict, stuck_ttl: int = 300) -> Text:
+        """Format the Activity column cell for a worker row.
+
+        Returns a Rich Text object rendering '<action[:40]> (<N>s)' when the
+        worker has a current_action, dim em-dash when it does not, and red
+        when the elapsed time exceeds stuck_ttl.
+        """
+        action = worker.get("current_action")
+        action_at = worker.get("current_action_at")
+        if not action or not action_at:
+            return Text("—", style="dim")
+
+        try:
+            start = datetime.fromisoformat(action_at)
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=UTC)
+            elapsed = int((datetime.now(UTC) - start).total_seconds())
+        except (ValueError, TypeError):
+            return Text(str(action)[:40], style="dim")
+
+        truncated = action[:40]
+        label = f"{truncated} ({elapsed}s)"
+        style = "red" if elapsed > stuck_ttl else ""
+        return Text(label, style=style)
+
     def _render_workers(self, workers: list, soldier_status: str = "unknown") -> Table:
         """Render worker list with type column, including Soldier."""
         table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
@@ -810,6 +826,7 @@ class AntfarmTUI:
         table.add_column("Node", max_width=15, no_wrap=True)
         table.add_column("Status", max_width=10, no_wrap=True)
         table.add_column("Type", max_width=10, no_wrap=True)
+        table.add_column("Activity", max_width=50, no_wrap=True)
         table.add_column("Rate Limit", max_width=20, no_wrap=True)
 
         # Soldier row (virtual — it's a thread, not a registered worker)
@@ -821,10 +838,11 @@ class AntfarmTUI:
                 Text(soldier_status, style=s_style),
                 Text("soldier", style="bold"),
                 Text("—", style="dim"),
+                Text("—", style="dim"),
             )
 
         if not workers and soldier_status == "disabled":
-            table.add_row("[dim]\u2014[/dim]", "[dim]no workers[/dim]", "", "", "")
+            table.add_row("[dim]\u2014[/dim]", "[dim]no workers[/dim]", "", "", "", "")
             return table
 
         for worker in workers:
@@ -857,11 +875,14 @@ class AntfarmTUI:
             else:
                 type_text = Text("builder", style="yellow")
 
+            activity_text = self._format_activity_cell(worker)
+
             table.add_row(
                 Text(worker_id[:20], style="cyan"),
                 Text(node_id[:13], style="dim"),
                 status_text,
                 type_text,
+                activity_text,
                 rate_text,
             )
 

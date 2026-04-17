@@ -125,6 +125,34 @@ def test_worker_roundtrip():
     assert Worker.from_dict(worker.to_dict()) == worker
 
 
+def test_worker_roundtrip_with_activity_fields():
+    worker = _make_worker()
+    worker.current_action = "Running: Bash"
+    worker.current_action_at = "2026-04-16T10:05:00+00:00"
+    d = worker.to_dict()
+    assert d["current_action"] == "Running: Bash"
+    assert d["current_action_at"] == "2026-04-16T10:05:00+00:00"
+    assert Worker.from_dict(d) == worker
+
+
+def test_worker_roundtrip_missing_activity_fields():
+    """Pre-upgrade worker JSON without current_action* still loads with None defaults."""
+    data = {
+        "worker_id": "w-1",
+        "node_id": "node-1",
+        "agent_type": "engineer",
+        "workspace_root": "/tmp/ws",
+        "status": "active",
+        "capabilities": [],
+        "registered_at": "2026-04-04T08:00:00Z",
+        "last_heartbeat": "2026-04-04T10:00:00Z",
+        "cooldown_until": None,
+    }
+    worker = Worker.from_dict(data)
+    assert worker.current_action is None
+    assert worker.current_action_at is None
+
+
 def test_node_roundtrip():
     node = _make_node()
     assert Node.from_dict(node.to_dict()) == node

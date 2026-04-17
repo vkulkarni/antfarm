@@ -96,9 +96,7 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
-    def kickback(
-        self, task_id: str, reason: str, max_attempts: int = 3
-    ) -> None:
+    def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
         """Transition task to READY (or BLOCKED if attempts exhausted).
 
         Sets current_attempt to None. Next pull() creates a fresh attempt.
@@ -134,9 +132,7 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
-    def store_review_verdict(
-        self, task_id: str, attempt_id: str, verdict: dict
-    ) -> None:
+    def store_review_verdict(self, task_id: str, attempt_id: str, verdict: dict) -> None:
         """Store a ReviewVerdict on the task's current attempt.
 
         Args:
@@ -421,6 +417,21 @@ class TaskBackend(ABC):
         Args:
             worker_id: ID of the worker sending the heartbeat.
             status: Status dict to persist (e.g. current task, state).
+        """
+        ...
+
+    @abstractmethod
+    def update_worker_activity(self, worker_id: str, action: str | None) -> None:
+        """Set current_action / current_action_at on the worker file.
+
+        action=None or empty string clears the activity. Server stamps timestamp.
+        Long actions are trimmed to a bounded length. This does not touch
+        ``last_heartbeat``. Unknown workers are a silent no-op so pre-tool-use
+        hooks firing before registration cannot disrupt the control plane.
+
+        Args:
+            worker_id: ID of the worker whose activity is being updated.
+            action: Short description of what the worker is doing, or None to clear.
         """
         ...
 

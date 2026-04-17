@@ -382,6 +382,77 @@ def test_heartbeat_updates(backend: FileBackend) -> None:
 
 
 # ---------------------------------------------------------------------------
+# update_worker_activity (#239)
+# ---------------------------------------------------------------------------
+
+
+def _register_test_worker(backend: FileBackend, worker_id: str = "worker-1") -> None:
+    now = datetime.now(UTC).isoformat()
+    backend.register_worker(
+        {
+            "worker_id": worker_id,
+            "node_id": "node-1",
+            "agent_type": "engineer",
+            "workspace_root": "/tmp/ws",
+            "registered_at": now,
+            "last_heartbeat": now,
+        }
+    )
+
+
+def test_update_worker_activity_sets_fields(backend: FileBackend) -> None:
+    _register_test_worker(backend)
+    backend.update_worker_activity("worker-1", "Running: Bash")
+    data = json.loads(backend._worker_path("worker-1").read_text())
+    assert data["current_action"] == "Running: Bash"
+    assert data["current_action_at"] is not None
+
+
+def test_update_worker_activity_clear_with_none(backend: FileBackend) -> None:
+    _register_test_worker(backend)
+    backend.update_worker_activity("worker-1", "Running: Bash")
+    backend.update_worker_activity("worker-1", None)
+    data = json.loads(backend._worker_path("worker-1").read_text())
+    assert data["current_action"] is None
+    assert data["current_action_at"] is None
+
+
+def test_update_worker_activity_clear_with_empty_string(backend: FileBackend) -> None:
+    _register_test_worker(backend)
+    backend.update_worker_activity("worker-1", "Running: Bash")
+    backend.update_worker_activity("worker-1", "")
+    data = json.loads(backend._worker_path("worker-1").read_text())
+    assert data["current_action"] is None
+    assert data["current_action_at"] is None
+
+
+def test_update_worker_activity_trims_long(backend: FileBackend) -> None:
+    _register_test_worker(backend)
+    long_action = "x" * 500
+    backend.update_worker_activity("worker-1", long_action)
+    data = json.loads(backend._worker_path("worker-1").read_text())
+    assert len(data["current_action"]) == 200
+    assert data["current_action"] == "x" * 200
+
+
+def test_update_worker_activity_missing_worker_noop(backend: FileBackend) -> None:
+    # No worker registered — must not raise, must not create file.
+    backend.update_worker_activity("ghost-worker", "Running: Bash")
+    assert not backend._worker_path("ghost-worker").exists()
+
+
+def test_update_worker_activity_does_not_bump_heartbeat(backend: FileBackend) -> None:
+    _register_test_worker(backend)
+    original = json.loads(backend._worker_path("worker-1").read_text())
+    original_hb = original["last_heartbeat"]
+    # Give the clock room so timestamps would differ if heartbeat were bumped.
+    time.sleep(0.01)
+    backend.update_worker_activity("worker-1", "Running: Bash")
+    after = json.loads(backend._worker_path("worker-1").read_text())
+    assert after["last_heartbeat"] == original_hb
+
+
+# ---------------------------------------------------------------------------
 # Bug fix regression tests
 # ---------------------------------------------------------------------------
 
@@ -629,17 +700,19 @@ def test_pull_returns_none_for_rate_limited_worker(backend: FileBackend) -> None
 
     # Register the worker with a future cooldown
     future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
-    backend.register_worker({
-        "worker_id": "worker-rl",
-        "node_id": "node-1",
-        "agent_type": "claude-code",
-        "workspace_root": "/tmp/ws",
-        "capabilities": [],
-        "status": "idle",
-        "registered_at": datetime.now(UTC).isoformat(),
-        "last_heartbeat": datetime.now(UTC).isoformat(),
-        "cooldown_until": future,
-    })
+    backend.register_worker(
+        {
+            "worker_id": "worker-rl",
+            "node_id": "node-1",
+            "agent_type": "claude-code",
+            "workspace_root": "/tmp/ws",
+            "capabilities": [],
+            "status": "idle",
+            "registered_at": datetime.now(UTC).isoformat(),
+            "last_heartbeat": datetime.now(UTC).isoformat(),
+            "cooldown_until": future,
+        }
+    )
 
     result = backend.pull("worker-rl")
     assert result is None
@@ -652,17 +725,19 @@ def test_pull_succeeds_after_cooldown_expires(backend: FileBackend) -> None:
     backend.carry(_make_task("task-1"))
 
     past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
-    backend.register_worker({
-        "worker_id": "worker-past",
-        "node_id": "node-1",
-        "agent_type": "claude-code",
-        "workspace_root": "/tmp/ws",
-        "capabilities": [],
-        "status": "idle",
-        "registered_at": datetime.now(UTC).isoformat(),
-        "last_heartbeat": datetime.now(UTC).isoformat(),
-        "cooldown_until": past,
-    })
+    backend.register_worker(
+        {
+            "worker_id": "worker-past",
+            "node_id": "node-1",
+            "agent_type": "claude-code",
+            "workspace_root": "/tmp/ws",
+            "capabilities": [],
+            "status": "idle",
+            "registered_at": datetime.now(UTC).isoformat(),
+            "last_heartbeat": datetime.now(UTC).isoformat(),
+            "cooldown_until": past,
+        }
+    )
 
     result = backend.pull("worker-past")
     assert result is not None
@@ -685,16 +760,18 @@ def test_list_workers_returns_all(backend: FileBackend) -> None:
 
     now = datetime.now(UTC).isoformat()
     for i in range(3):
-        backend.register_worker({
-            "worker_id": f"worker-{i}",
-            "node_id": "node-1",
-            "agent_type": "claude-code",
-            "workspace_root": f"/tmp/ws-{i}",
-            "capabilities": [],
-            "status": "idle",
-            "registered_at": now,
-            "last_heartbeat": now,
-        })
+        backend.register_worker(
+            {
+                "worker_id": f"worker-{i}",
+                "node_id": "node-1",
+                "agent_type": "claude-code",
+                "workspace_root": f"/tmp/ws-{i}",
+                "capabilities": [],
+                "status": "idle",
+                "registered_at": now,
+                "last_heartbeat": now,
+            }
+        )
 
     workers = backend.list_workers()
     assert len(workers) == 3
@@ -765,8 +842,15 @@ def test_old_state_loads_with_new_lifecycle(tmp_path: Path) -> None:
     ready_dir = data_dir / "tasks" / "ready"
     ready_dir.mkdir(parents=True)
     # Create minimal required dirs
-    for d in ["tasks/active", "tasks/done", "tasks/paused", "tasks/blocked",
-              "workers", "nodes", "guards"]:
+    for d in [
+        "tasks/active",
+        "tasks/done",
+        "tasks/paused",
+        "tasks/blocked",
+        "workers",
+        "nodes",
+        "guards",
+    ]:
         (data_dir / d).mkdir(parents=True, exist_ok=True)
 
     old_task = {
@@ -798,16 +882,18 @@ def test_old_state_loads_with_new_lifecycle(tmp_path: Path) -> None:
     assert tasks[0]["id"] == "task-old"
 
     # Should be pullable
-    backend.register_worker({
-        "worker_id": "w1",
-        "node_id": "n1",
-        "agent_type": "generic",
-        "workspace_root": "/tmp",
-        "capabilities": [],
-        "status": "idle",
-        "registered_at": "2026-01-01T00:00:00Z",
-        "last_heartbeat": "2026-01-01T00:00:00Z",
-    })
+    backend.register_worker(
+        {
+            "worker_id": "w1",
+            "node_id": "n1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp",
+            "capabilities": [],
+            "status": "idle",
+            "registered_at": "2026-01-01T00:00:00Z",
+            "last_heartbeat": "2026-01-01T00:00:00Z",
+        }
+    )
     result = backend.pull("w1")
     assert result is not None
     assert result["id"] == "task-old"
@@ -879,9 +965,7 @@ def _kickback_cycle(backend: FileBackend, task_id: str) -> None:
     backend.kickback(task_id, reason="tests failed", max_attempts=3)
 
 
-def test_kickback_blocks_after_max_attempts(
-    backend: FileBackend, tmp_path: Path
-) -> None:
+def test_kickback_blocks_after_max_attempts(backend: FileBackend, tmp_path: Path) -> None:
     """After max_attempts kickbacks, task transitions to blocked/."""
     backend.carry(_make_task("task-1"))
 
@@ -896,17 +980,13 @@ def test_kickback_blocks_after_max_attempts(
     pulled = backend.pull("worker-1")
     assert pulled is not None
     attempt_id = pulled["current_attempt"]
-    backend.mark_harvested(
-        "task-1", attempt_id, pr="pr", branch="branch"
-    )
+    backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
     backend.kickback("task-1", reason="tests failed again", max_attempts=3)
 
     task = backend.get_task("task-1")
     assert task is not None
     assert task["status"] == TaskStatus.BLOCKED.value
-    blocked_file = (
-        tmp_path / ".antfarm" / "tasks" / "blocked" / "task-1.json"
-    )
+    blocked_file = tmp_path / ".antfarm" / "tasks" / "blocked" / "task-1.json"
     assert blocked_file.exists()
 
 
@@ -974,15 +1054,11 @@ def test_unblock_does_not_reset_attempt_counter(
     attempt_id = pulled["current_attempt"]
     backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
     backend.kickback("task-1", reason="fail", max_attempts=1)
-    assert (
-        backend.get_task("task-1")["status"] == TaskStatus.BLOCKED.value
-    )
+    assert backend.get_task("task-1")["status"] == TaskStatus.BLOCKED.value
 
     # Unblock it
     backend.unblock_task("task-1")
-    assert (
-        backend.get_task("task-1")["status"] == TaskStatus.READY.value
-    )
+    assert backend.get_task("task-1")["status"] == TaskStatus.READY.value
 
     # Another cycle should block again since attempts still counted
     pulled = backend.pull("worker-1")
@@ -990,9 +1066,7 @@ def test_unblock_does_not_reset_attempt_counter(
     attempt_id = pulled["current_attempt"]
     backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
     backend.kickback("task-1", reason="fail again", max_attempts=1)
-    assert (
-        backend.get_task("task-1")["status"] == TaskStatus.BLOCKED.value
-    )
+    assert backend.get_task("task-1")["status"] == TaskStatus.BLOCKED.value
 
 
 # ---------------------------------------------------------------------------
@@ -1285,4 +1359,3 @@ def test_kickback_does_not_hold_lock_during_pr_close(tmp_path: Path) -> None:
     backend.kickback("task-1", reason="tests failed")
 
     assert probe.acquired, "kickback held self._lock during PR close (deadlock risk)"
-
