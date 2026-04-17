@@ -1242,3 +1242,208 @@ def test_queen_context_written_in_correct_data_dir(env, tmp_path):
     # The context file must exist under the custom data_dir
     expected = _os.path.join(data_dir, "missions", f"{mission['mission_id']}_context.md")
     assert _os.path.isfile(expected)
+
+
+# ---------------------------------------------------------------------------
+# Activity-feed lifecycle events (#191)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def event_bus():
+    """Reset the SSE event queue around each event-emission test."""
+    from antfarm.core import serve as serve_mod
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+    yield serve_mod._event_queue
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+
+def _find_events(event_queue, *, type_: str, actor: str = "queen") -> list[dict]:
+    return [e for e in event_queue if e["type"] == type_ and e["actor"] == actor]
+
+
+def test_queen_emits_mission_created_on_first_advance(env, event_bus):
+    """First _advance on a fresh mission should emit mission_created (actor=queen)."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend, spec="Build an activity feed panel")
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    events = _find_events(event_bus, type_="mission_created")
+    assert len(events) == 1
+    assert events[0]["task_id"] == ""
+    assert mission["mission_id"] in events[0]["detail"]
+
+
+def test_queen_emits_mission_created_only_once_per_mission(env, event_bus):
+    """Second _advance before harvest must NOT re-emit mission_created."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # plan task still ready — no-op
+
+    assert len(_find_events(event_bus, type_="mission_created")) == 1
+
+
+def test_queen_emits_plan_task_created(env, event_bus):
+    """Creating the plan task emits plan_task_created with the plan task id."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    events = _find_events(event_bus, type_="plan_task_created")
+    assert len(events) == 1
+    assert events[0]["task_id"] == f"plan-{mission['mission_id']}"
+    assert mission["mission_id"] in events[0]["detail"]
+
+
+def test_queen_emits_plan_approved_on_review_pass(env, event_bus):
+    """When a plan review verdict is pass, plan_approved is emitted."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # → REVIEWING_PLAN
+
+    review_task_id = f"review-plan-{mission['mission_id']}"
+    _set_review_verdict_on_task(backend, review_task_id, _make_review_verdict("pass"))
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # review=pass → BUILDING
+
+    events = _find_events(event_bus, type_="plan_approved")
+    assert len(events) == 1
+    assert events[0]["task_id"] == f"plan-{mission['mission_id']}"
+    assert mission["mission_id"] in events[0]["detail"]
+
+
+def test_queen_does_not_emit_plan_approved_on_needs_changes(env, event_bus):
+    """needs_changes must not trigger plan_approved."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    review_task_id = f"review-plan-{mission['mission_id']}"
+    _set_review_verdict_on_task(
+        backend, review_task_id, _make_review_verdict("needs_changes", "redo")
+    )
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    assert _find_events(event_bus, type_="plan_approved") == []
+
+
+def test_queen_emits_tasks_seeded_with_count(env, event_bus):
+    """_spawn_child_tasks emits tasks_seeded with count in detail."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"], task_count=3)
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # spawns children → BUILDING
+
+    events = _find_events(event_bus, type_="tasks_seeded")
+    assert len(events) == 1
+    assert events[0]["task_id"] == ""
+    assert "count=3" in events[0]["detail"]
+    assert mission["mission_id"] in events[0]["detail"]
+
+
+def test_queen_emits_mission_complete_on_complete_transition(env, event_bus):
+    """Mission transitioning to COMPLETE emits mission_complete."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # → BUILDING
+
+    # Mark both child tasks merged.
+    slug = queen._mission_slug(mission["mission_id"])
+    for i in range(2):
+        child_id = f"task-{slug}-{i + 1:02d}"
+        child = backend.get_task(child_id)
+        child["status"] = "done"
+        child["current_attempt"] = f"att-c{i}"
+        child["attempts"] = [
+            {
+                "attempt_id": f"att-c{i}",
+                "worker_id": "w",
+                "status": "merged",
+                "branch": f"feat/{child_id}",
+                "pr": f"https://example.com/pr/{i}",
+                "started_at": _now_iso(),
+                "completed_at": _now_iso(),
+                "artifact": {},
+            }
+        ]
+        _force_task_state(backend, child_id, child)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    assert backend.get_mission(mission["mission_id"])["status"] == "complete"
+
+    events = _find_events(event_bus, type_="mission_complete")
+    assert len(events) == 1
+    assert events[0]["task_id"] == ""
+    assert mission["mission_id"] in events[0]["detail"]
+
+
+def test_queen_does_not_emit_mission_complete_on_failed_transition(env, event_bus):
+    """Terminal=FAILED should not emit mission_complete."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+
+    plan_task = backend.get_task(m["plan_task_id"])
+    plan_task["status"] = "blocked"
+    plan_task["attempts"] = [{"attempt_id": f"att-{i}", "status": "superseded"} for i in range(3)]
+    _force_task_state(backend, m["plan_task_id"], plan_task)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    assert backend.get_mission(mission["mission_id"])["status"] == "failed"
+    assert _find_events(event_bus, type_="mission_complete") == []
