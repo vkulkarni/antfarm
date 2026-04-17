@@ -8,6 +8,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 - Per-worker current-action visibility: `POST /workers/{id}/activity`, TUI Activity column with elapsed time, and doctor `check_stuck_workers` warning for workers idle on an action > 5 min. (#239)
+- `antfarm doctor --sweep-legacy-tmux` flag (with `--yes`) to clean pre-#231/#235 tmux sessions host-wide. Requires interactive confirmation by default. (#237)
+- Colony startup now logs `colony hash: <8hex> (data_dir: <realpath>)` so operators can correlate tmux session names to a colony. (#237)
+- `UPGRADE.md` — migration notes for session-name format changes in #231 and #235. (#237)
 
 ### Fixed
 - TUI now shows actionable guidance when the colony is unreachable, including the attempted URL and commands to start/redirect. (#246)

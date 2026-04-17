@@ -301,6 +301,33 @@ class TestAdoptExistingWorkers:
         assert len(r.managed) == 0
         assert r._counter == 0
 
+    def test_runner_adopt_ignores_legacy_sessions(self, tmp_path):
+        """Pre-#231 `runner-builder-1` sessions must NOT be adopted after upgrade.
+
+        Uses a real TmuxProcessManager with the Runner's current hashed prefix;
+        the legacy name lacks the hash token so ``list_managed()`` filters it
+        out before it reaches ``_adopt_existing_workers``.
+        """
+        from antfarm.core.process_manager import TmuxProcessManager, colony_hash
+
+        r = _make_runner(tmp_path)
+        prefix = f"runner-{colony_hash(r.state_dir)}-"
+        r._pm = TmuxProcessManager(prefix=prefix, state_dir=r.state_dir)
+        r._prefix = prefix
+
+        list_result = MagicMock()
+        list_result.returncode = 0
+        list_result.stdout = "runner-builder-1\nrunner-planner-2\nrunner-deadbeef-reviewer-3\n"
+
+        with (
+            patch("antfarm.core.process_manager.shutil.which", return_value="/usr/bin/tmux"),
+            patch("antfarm.core.process_manager.subprocess.run", return_value=list_result),
+        ):
+            r._adopt_existing_workers()
+
+        assert r.managed == {}
+        assert r._counter == 0
+
 
 class TestStalePidsDirSweep:
     def test_stale_pids_dir_swept_on_run(self, tmp_path):
