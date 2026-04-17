@@ -1502,3 +1502,116 @@ def test_sweep_legacy_matches_user_sessions_by_design():
     assert len(findings) == 1
     assert findings[0].check == "legacy_tmux_session"
     assert "auto-save-5" in findings[0].message
+
+
+# ---------------------------------------------------------------------------
+# Doctor activity-feed events (#191)
+#
+# Doctor emits SSE events to serve._event_queue when fix=True actually
+# applies a repair:
+#   stale_worker_recovered, stale_task_recovered, stale_guard_cleared
+# all with actor="doctor". Dry-run (fix=False) must not emit.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def clear_events():
+    """Clear the SSE event queue before each event-assertion test."""
+    from antfarm.core import serve
+
+    serve._event_queue.clear()
+    yield serve._event_queue
+
+
+def _find_event(queue, event_type: str) -> dict | None:
+    for e in queue:
+        if e["type"] == event_type:
+            return e
+    return None
+
+
+def test_doctor_emits_stale_worker_recovered_on_fix(setup, clear_events):
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-dead"))
+
+    data_dir = Path(config["data_dir"])
+    worker_file = data_dir / "workers" / "worker-dead.json"
+    _backdate(worker_file, seconds=600)
+
+    run_doctor(backend, config, fix=True)
+
+    ev = _find_event(clear_events, "stale_worker_recovered")
+    assert ev is not None
+    assert ev["actor"] == "doctor"
+    assert ev["task_id"] == ""
+    assert "worker-dead" in ev["detail"]
+
+
+def test_doctor_dry_run_does_not_emit_stale_worker_event(setup, clear_events):
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-dead"))
+
+    data_dir = Path(config["data_dir"])
+    worker_file = data_dir / "workers" / "worker-dead.json"
+    _backdate(worker_file, seconds=600)
+
+    run_doctor(backend, config, fix=False)
+
+    assert _find_event(clear_events, "stale_worker_recovered") is None
+
+
+def test_doctor_emits_stale_task_recovered_on_fix(setup, clear_events):
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-dead"))
+    backend.carry(_make_task("task-stale"))
+    backend.pull("worker-dead")
+    backend.deregister_worker("worker-dead")
+
+    run_doctor(backend, config, fix=True)
+
+    ev = _find_event(clear_events, "stale_task_recovered")
+    assert ev is not None
+    assert ev["actor"] == "doctor"
+    assert ev["task_id"] == "task-stale"
+
+
+def test_doctor_dry_run_does_not_emit_stale_task_event(setup, clear_events):
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-dead"))
+    backend.carry(_make_task("task-stale"))
+    backend.pull("worker-dead")
+    backend.deregister_worker("worker-dead")
+
+    run_doctor(backend, config, fix=False)
+
+    assert _find_event(clear_events, "stale_task_recovered") is None
+
+
+def test_doctor_emits_stale_guard_cleared_on_fix(setup, clear_events):
+    backend, config = setup
+    backend.guard("resource/lock", "worker-gone")
+
+    data_dir = Path(config["data_dir"])
+    guard_file = data_dir / "guards" / "resource__lock.lock"
+    _backdate(guard_file, seconds=600)
+
+    run_doctor(backend, config, fix=True)
+
+    ev = _find_event(clear_events, "stale_guard_cleared")
+    assert ev is not None
+    assert ev["actor"] == "doctor"
+    assert ev["task_id"] == ""
+    assert "resource/lock" in ev["detail"]
+
+
+def test_doctor_dry_run_does_not_emit_stale_guard_event(setup, clear_events):
+    backend, config = setup
+    backend.guard("resource/lock", "worker-gone")
+
+    data_dir = Path(config["data_dir"])
+    guard_file = data_dir / "guards" / "resource__lock.lock"
+    _backdate(guard_file, seconds=600)
+
+    run_doctor(backend, config, fix=False)
+
+    assert _find_event(clear_events, "stale_guard_cleared") is None

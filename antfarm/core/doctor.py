@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from antfarm.core.serve import _emit_event
+
 # Matches legacy (pre-#231/#235) tmux session names. A hash slot is exactly
 # 8 lowercase hex chars followed by a dash; the negative lookahead ensures
 # the token after the prefix is NOT a hash. Regressions in PRs #234 (#231)
@@ -317,6 +319,12 @@ def check_stale_workers(backend, config: dict, fix: bool = False) -> list[Findin
                 if fix:
                     backend.deregister_worker(worker_id)
                     f.fixed = True
+                    _emit_event(
+                        "stale_worker_recovered",
+                        "",
+                        f"worker={worker_id}",
+                        actor="doctor",
+                    )
                 findings.append(f)
         except FileNotFoundError:
             # File disappeared between glob and stat
@@ -475,6 +483,12 @@ def check_stale_tasks(backend, config: dict, fix: bool = False) -> list[Finding]
             if fix:
                 _recover_stale_task(data_dir, task_file, data, current_attempt_id)
                 f.fixed = True
+                _emit_event(
+                    "stale_task_recovered",
+                    task_id,
+                    f"worker={worker_id}",
+                    actor="doctor",
+                )
             findings.append(f)
 
     return findings
@@ -593,6 +607,12 @@ def check_stale_guards(backend, config: dict, fix: bool = False) -> list[Finding
         if fix:
             guard_file.unlink(missing_ok=True)
             f.fixed = True
+            _emit_event(
+                "stale_guard_cleared",
+                "",
+                f"resource={resource}",
+                actor="doctor",
+            )
         findings.append(f)
 
     return findings
