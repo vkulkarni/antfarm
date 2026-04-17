@@ -51,22 +51,22 @@ No manual intervention between `mission create` and `mission complete`. The kick
 
 <!-- asciicast: record after rewrite lands, link here -->
 
-### Adding a second machine
+### Adding a second node
 
 ```
-# on machine-2 (same trusted network, same repo cloned)
+# on node-2 / mac-mini-2 (same trusted network, same repo cloned)
 $ antfarm runner --colony-url http://lead:7433 --repo-path ~/projects/rate-limiter
-[runner] node=machine-2  listening on 127.0.0.1:7434  max-workers=4
+[runner] node=node-2 (mac-mini-2)  listening on 127.0.0.1:7434  max-workers=4
 [runner] registered with colony a4f2c1e8
 
 # back on the lead, scout --watch picks it up:
-14:21:03  colony      node registered: machine-2  (capacity=4)
-14:21:04  autoscaler  scaling builders 3 -> 5  (2 placed on machine-2)
-14:21:11  worker      machine-2/builder-1 claimed task-004
-14:21:11  worker      machine-2/builder-2 claimed task-005
+14:21:03  colony      node registered: node-2 (mac-mini-2)  (capacity=4)
+14:21:04  autoscaler  scaling builders 3 -> 5  (2 placed on node-2)
+14:21:11  worker      node-2/builder-1 claimed task-004
+14:21:11  worker      node-2/builder-2 claimed task-005
 ```
 
-Same mission, two machines. The autoscaler sees the new runner's capacity and places additional builders there; workers draw from the shared queue over HTTP.
+Same mission, two nodes. The autoscaler sees the new runner's capacity and places additional builders there; workers draw from the shared queue over HTTP.
 
 ---
 
@@ -141,29 +141,46 @@ A spec file is a Markdown document describing the change you want: goal, accepta
 ## Architecture
 
 ```
-                  ┌─────────────────────────────────────┐
-                  │          colony (HTTP API)          │
-                  │   queen · soldier · doctor · autoscaler
-                  └──────────────┬──────────────────────┘
-                                 │
-                ┌────────────────┼───────────────────┐
-                │                │                   │
-          FileBackend      Runner(s)            Worker pool
-          (.antfarm/)      (tmux panes)         builders + reviewers
-                                                     │
-                                                  adapters
-                                          (claude-code / codex / aider)
+  spec.md ──▶ Queen ──▶ ┌─────────────────┐
+                        │    task queue   │◀── review tasks  (Soldier)
+                        │  (FileBackend)  │◀── kickbacks     (Soldier)
+                        └────────┬────────┘
+                                 │ forage (HTTP, any node, any task type)
+         ┌───────────────────────┼─────────────────────────┐
+         ▼                       ▼                         ▼
+  ┌ node-1 (mac-mini-1) ┐ ┌ node-1 (mac-mini-1) ┐ ┌ node-2 (mac-mini-2) ┐
+  │       Builder       │ │       Builder       │ │      Reviewer       │
+  │     claude-code     │ │        codex        │ │     claude-code     │
+  │    worktree → PR    │ │    worktree → PR    │ │    reads PR diff    │
+  └──────────┬──────────┘ └──────────┬──────────┘ └──────────┬──────────┘
+             │                       │                       │
+             │  git push + open PR   │                  verdict: pass /
+             ▼                       ▼                  needs_changes
+                ┌───────────────────────┐                    │
+                │        GitHub         │                    │
+                │     pull requests     │                    │
+                └───────────┬───────────┘                    │
+                            │                                │
+                            ▼                                ▼
+                        ┌─────────────────────────────────────┐
+                        │              Soldier                │
+                        │  · spawns review tasks              │
+                        │  · rebase + run tests               │
+                        │  · fast-forward OR kickback         │
+                        └──────────────────┬──────────────────┘
+                                           │ pass + clean rebase + green
+                                           ▼
+                                   integration branch
 ```
 
-- **Colony server** — FastAPI process that holds the task queue and runs the in-process daemons.
 - **Queen** — mission planner: spec → task graph.
-- **Soldier** — deterministic merge gate: rebase, test, fast-forward or kickback.
+- **Task queue** — FileBackend under `.antfarm/`; atomic JSON store. Builders and reviewers forage from the same queue over HTTP.
+- **Builder / Reviewer** — worker sessions wrapping a coding agent (claude-code, codex, aider). Heterogeneous across nodes — any mix, any machine.
+- **Soldier** — deterministic gate. Spawns review tasks, then rebase + test + fast-forward to integration, or kickback to `ready/` for a fresh attempt. No AI in the gate.
 - **Autoscaler** — sizes builder and reviewer pools against queue depth.
-- **Runner** — launches worker sessions (tmux locally, SSH + tmux for multi-node).
+- **Runner** — launches worker sessions on each node (tmux locally, SSH + tmux for multi-node).
 - **Doctor** — pre-flight checks and stale-state recovery.
-- **Workers** — builder or reviewer sessions wrapping a coding agent.
-- **Adapters** — per-agent glue: prompts, hooks, heartbeat.
-- **FileBackend** — atomic JSON task store under `.antfarm/`.
+- **Colony** — FastAPI process hosting the queue and running queen/soldier/doctor/autoscaler in-process.
 
 Deeper reading: [docs/SPEC.md](docs/SPEC.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), [AGENTS.md](AGENTS.md).
 
