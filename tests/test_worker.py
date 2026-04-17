@@ -1543,3 +1543,212 @@ def test_agent_launched_detail_reflects_agent_type(tmp_path, http_client, tc):
     launched = [e for e in _worker_events() if e["type"] == "agent_launched"]
     assert len(launched) == 1
     assert launched[0]["detail"] == "codex"
+
+
+# ---------------------------------------------------------------------------
+# Configurable empty-poll backoff (#272)
+# ---------------------------------------------------------------------------
+
+
+def _make_runtime_with_polls(
+    tmp_path, http_client, name, capabilities, *, max_empty_polls=None, poll_interval=30.0
+):
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name=name,
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        poll_interval=poll_interval,
+        max_empty_polls=max_empty_polls,
+        capabilities=capabilities,
+        client=http_client,
+    )
+    rt.workspace_mgr.create = MagicMock(return_value=str(tmp_path / "ws"))
+    return rt
+
+
+def test_first_empty_does_not_exit(tmp_path, http_client):
+    """With max_empty_polls=2, a single empty forage sleeps and re-polls."""
+    rt = _make_runtime_with_polls(
+        tmp_path, http_client, "w-first", capabilities=[], max_empty_polls=2
+    )
+
+    call_count = [0]
+
+    def fake_forage(worker_id):
+        call_count[0] += 1
+        return None
+
+    rt.colony.forage = fake_forage
+    rt.run()
+
+    # 1 initial + 2 retries = 3 total forage calls before exit
+    assert call_count[0] == 3
+
+
+def test_exits_after_max_empty_polls(tmp_path, http_client):
+    """With max_empty_polls=2, worker exits after the threshold is reached."""
+    rt = _make_runtime_with_polls(
+        tmp_path, http_client, "w-max", capabilities=[], max_empty_polls=2
+    )
+
+    call_count = [0]
+
+    def fake_forage(worker_id):
+        call_count[0] += 1
+        return None
+
+    rt.colony.forage = fake_forage
+    rt.run()
+
+    # After 3 empties (1 initial + 2 retries) the loop exits — not 4+.
+    assert call_count[0] == 3
+
+
+def test_successful_forage_resets_empty_counter(tmp_path, http_client):
+    """A task mid-sequence resets the empty counter so polling continues after."""
+    rt = _make_runtime_with_polls(
+        tmp_path, http_client, "w-reset", capabilities=[], max_empty_polls=2
+    )
+
+    sequence = [None, {"id": "t1", "current_attempt": "a1"}, None, None, None]
+    idx = [0]
+
+    def fake_forage(worker_id):
+        value = sequence[idx[0]] if idx[0] < len(sequence) else None
+        idx[0] += 1
+        return value
+
+    rt.colony.forage = fake_forage
+
+    # Short-circuit _process_one_task for the single non-empty to avoid
+    # running the full agent pipeline.
+    original_process = rt._process_one_task
+
+    def fake_process_one_task():
+        task = rt.colony.forage(rt.worker_id)
+        if task is None:
+            return False
+        rt._last_task_id = task["id"]
+        return True
+
+    rt._process_one_task = fake_process_one_task
+
+    rt.run()
+
+    # Sequence: empty, task (resets counter), empty, empty, empty-exit.
+    # The second empty-run block counts up to 3 empties (1+2 retries) before exit.
+    # Total forage calls = len(sequence) = 5.
+    assert idx[0] == 5
+    del original_process
+
+
+def test_exit_still_deregisters(tmp_path, http_client):
+    """Even when the loop exits on empty queue, deregister_worker runs."""
+    rt = _make_runtime_with_polls(
+        tmp_path, http_client, "w-dereg", capabilities=[], max_empty_polls=1
+    )
+
+    deregistered = []
+
+    rt.colony.forage = lambda worker_id: None
+    original_dereg = rt.colony.deregister_worker
+
+    def tracking_dereg(worker_id):
+        deregistered.append(worker_id)
+        return original_dereg(worker_id)
+
+    rt.colony.deregister_worker = tracking_dereg
+    rt.run()
+
+    assert deregistered == [rt.worker_id]
+
+
+def test_poll_interval_honored(tmp_path, http_client, monkeypatch):
+    """time.sleep is called with the configured poll_interval, not 30."""
+    import threading as _threading
+
+    import antfarm.core.worker as worker_mod
+
+    rt = _make_runtime_with_polls(
+        tmp_path,
+        http_client,
+        "w-pi",
+        capabilities=[],
+        max_empty_polls=2,
+        poll_interval=7.5,
+    )
+    rt.colony.forage = lambda worker_id: None
+
+    # Only capture sleeps from the main run thread. Background heartbeat
+    # threads spawned by unrelated test fixtures can share this module's
+    # monkeypatched time.sleep and would otherwise pollute our capture.
+    sleeps: list[float] = []
+    main_tid = _threading.get_ident()
+
+    def capture(s):
+        if _threading.get_ident() == main_tid:
+            sleeps.append(s)
+
+    monkeypatch.setattr(worker_mod.time, "sleep", capture)
+    rt.run()
+
+    # 1 initial forage (empty) + 2 retries = 2 sleeps before exit,
+    # each at the configured poll_interval.
+    assert sleeps == [7.5, 7.5]
+
+
+def test_max_empty_polls_zero_exits_immediately(tmp_path, http_client):
+    """max_empty_polls=0 preserves the exit-on-first-empty opt-in."""
+    rt = _make_runtime_with_polls(
+        tmp_path, http_client, "w-zero", capabilities=[], max_empty_polls=0
+    )
+
+    call_count = [0]
+
+    def fake_forage(worker_id):
+        call_count[0] += 1
+        return None
+
+    rt.colony.forage = fake_forage
+    rt.run()
+
+    assert call_count[0] == 1
+
+
+def test_role_defaults_preserved_when_unset(tmp_path, http_client):
+    """max_empty_polls=None keeps reviewer=10, builder=5, planner=0."""
+    reviewer = _make_runtime_with_polls(
+        tmp_path, http_client, "r1", capabilities=["review"], max_empty_polls=None
+    )
+    builder = _make_runtime_with_polls(
+        tmp_path, http_client, "b1", capabilities=[], max_empty_polls=None
+    )
+    planner = _make_runtime_with_polls(
+        tmp_path, http_client, "p1", capabilities=["plan"], max_empty_polls=None
+    )
+
+    assert reviewer._max_idle_polls == 10
+    assert builder._max_idle_polls == 5
+    assert planner._max_idle_polls == 0
+
+
+def test_invalid_poll_interval_raises(tmp_path, http_client):
+    """poll_interval <= 0 raises ValueError in __init__."""
+    with pytest.raises(ValueError, match="poll_interval"):
+        WorkerRuntime(
+            colony_url="http://test",
+            node_id="node-1",
+            name="bad",
+            agent_type="generic",
+            workspace_root=str(tmp_path / "workspaces"),
+            repo_path=str(tmp_path),
+            integration_branch="main",
+            heartbeat_interval=999.0,
+            poll_interval=0,
+            client=http_client,
+        )
