@@ -368,6 +368,41 @@ def test_cli_doctor_sweep_yes_bypasses_prompt(tmp_path: Path):
     assert mock_sweep.call_args_list[1].kwargs["confirmed"] is True
 
 
+def test_cli_doctor_sweep_and_fix_are_mutually_exclusive():
+    """--fix + --sweep-legacy-tmux is rejected because they have different safety profiles."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["doctor", "--fix", "--sweep-legacy-tmux", "--yes"])
+    assert result.exit_code == 2
+    assert "cannot be combined" in result.output
+
+
+def test_cli_doctor_sweep_prints_colony_hash_before_preview(tmp_path: Path):
+    """--sweep-legacy-tmux prints the colony hash before the session preview."""
+    from antfarm.core.doctor import Finding
+
+    runner = CliRunner()
+
+    preview = [
+        Finding(
+            severity="info",
+            check="legacy_tmux_session",
+            message="Legacy session: auto-builder-3",
+            auto_fixable=True,
+        ),
+    ]
+
+    with patch("antfarm.core.doctor.sweep_legacy_tmux_sessions") as mock_sweep:
+        mock_sweep.return_value = preview
+        result = runner.invoke(
+            main,
+            ["doctor", "--sweep-legacy-tmux", "--data-dir", str(tmp_path)],
+            input="n\n",
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Colony hash:" in result.output
+
+
 # ---------------------------------------------------------------------------
 # join
 # ---------------------------------------------------------------------------

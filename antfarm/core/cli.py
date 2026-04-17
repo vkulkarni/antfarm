@@ -10,6 +10,7 @@ Colony URL resolution: every command that talks to the colony accepts
 from __future__ import annotations
 
 import json
+import sys
 import time
 
 import click
@@ -718,10 +719,28 @@ def scent(task_id: str, poll_interval: float, colony_url: str, token: str | None
 )
 def doctor(fix: bool, data_dir: str, sweep_legacy_tmux: bool, yes: bool):
     """Run pre-flight diagnostics on the colony data directory."""
+    import os
+
     from antfarm.core.backends.file import FileBackend
     from antfarm.core.doctor import run_doctor, sweep_legacy_tmux_sessions
 
+    if sweep_legacy_tmux and fix:
+        click.echo(
+            "Error: --fix and --sweep-legacy-tmux have different safety profiles and "
+            "cannot be combined. Run them separately.",
+            err=True,
+        )
+        sys.exit(2)
+
     if sweep_legacy_tmux:
+        from antfarm.core.process_manager import colony_hash
+
+        h = colony_hash(data_dir)
+        real = os.path.realpath(data_dir)
+        click.echo(f"Colony hash: {h} (data_dir: {real})")
+        click.echo(
+            "Legacy sessions (no hash) will be killed; all hashed sessions will be untouched."
+        )
         # Dry-run preview first so the operator sees exactly what will die.
         preview = sweep_legacy_tmux_sessions({"data_dir": data_dir}, confirmed=False)
         if not preview:

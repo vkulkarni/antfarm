@@ -41,6 +41,18 @@ Or compute manually:
 python3 -c "from antfarm.core.process_manager import colony_hash; print(colony_hash('.antfarm'))"
 ```
 
+## Before you sweep: drain in-flight legacy workers
+
+Killing a tmux session kills whatever is running inside it. If a legacy worker is mid-task when you sweep, its attempt is lost and the task has to be kicked back for re-forage.
+
+**Safe order of operations:**
+
+1. Stop scheduling new work onto the legacy colony (pause your queen / stop submitting missions).
+2. Wait for in-flight attempts to harvest their PRs. Watch `antfarm scout --tui` until the Building and Review panels are empty, or run `tmux ls` and inspect the legacy sessions manually.
+3. Then run the sweep.
+
+Harvested-but-not-merged work survives (it's already a PR in git). Un-harvested attempts are lost and the task will need a kickback. If you can't drain safely, prefer manual `tmux kill-session -t <name>` targeted at specific idle sessions.
+
 ## Cleanup — manual (any version)
 
 List legacy sessions:
