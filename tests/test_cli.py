@@ -922,6 +922,39 @@ def test_worker_start_explicit_name_overrides():
     assert captured_kwargs["name"] == "my-worker"
 
 
+def test_worker_start_poll_flags_flow_through():
+    """--poll-interval and --max-empty-polls are passed to WorkerRuntime."""
+    runner = CliRunner()
+    captured_kwargs = {}
+
+    def fake_worker_runtime(**kwargs):
+        captured_kwargs.update(kwargs)
+        return MagicMock()
+
+    with patch("antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime):
+        result = runner.invoke(
+            main,
+            [
+                "worker",
+                "start",
+                "--agent",
+                "claude-code",
+                "--node",
+                "n1",
+                "--poll-interval",
+                "5",
+                "--max-empty-polls",
+                "3",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured_kwargs["poll_interval"] == 5.0
+    assert captured_kwargs["max_empty_polls"] == 3
+
+
 # ---------------------------------------------------------------------------
 # plan --carry dependency resolution (#93)
 # ---------------------------------------------------------------------------

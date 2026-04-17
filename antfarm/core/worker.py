@@ -230,6 +230,13 @@ class WorkerRuntime:
         repo_path: Path to the git repository used as the worktree source.
         integration_branch: Branch new worktrees are created from.
         heartbeat_interval: Seconds between heartbeat posts (default 30).
+        poll_interval: Seconds to sleep between empty forage polls (default 30).
+            Must be > 0; non-positive values raise ValueError.
+        max_empty_polls: Max consecutive empty forages before the worker exits.
+            When None (default), the role-based default applies:
+            reviewer=10, builder=5, planner=0 (exit on first empty). An explicit
+            integer overrides the role default; 0 preserves the original
+            "exit immediately on first empty" semantics as an opt-in.
         client: Optional httpx.Client for dependency injection in tests.
         token: Optional bearer token for colony authentication.
     """
@@ -244,15 +251,22 @@ class WorkerRuntime:
         repo_path: str,
         integration_branch: str = "main",
         heartbeat_interval: float = 30.0,
+        poll_interval: float = 30.0,
+        max_empty_polls: int | None = None,
         capabilities: list[str] | None = None,
         client: httpx.Client | None = None,
         token: str | None = None,
     ):
+        if poll_interval <= 0:
+            raise ValueError(
+                f"poll_interval must be > 0, got {poll_interval}"
+            )
         self.worker_id = f"{node_id}/{name}"
         self.node_id = node_id
         self.agent_type = agent_type
         self.workspace_root = workspace_root
         self.heartbeat_interval = heartbeat_interval
+        self.poll_interval = poll_interval
         self.capabilities = capabilities or []
         self._token = token
         self._data_dir = os.environ.get("ANTFARM_DATA_DIR", ".antfarm")
@@ -263,16 +277,21 @@ class WorkerRuntime:
         if "review" in caps:
             # Reviewers wait up to 5min for builders to harvest review tasks.
             self._role = "reviewer"
-            self._max_idle_polls = 10  # 10 * 30s = 5min
+            role_max_idle_polls = 10  # 10 * 30s = 5min
         elif "plan" in caps:
             # Planners produce one batch of child tasks and exit promptly.
             self._role = "planner"
-            self._max_idle_polls = 0
+            role_max_idle_polls = 0
         else:
             # Builders wait up to 2.5min so they outlast a typical planner run
             # and don't race the planner when started together (#144).
             self._role = "builder"
-            self._max_idle_polls = 5  # 5 * 30s = 2.5min
+            role_max_idle_polls = 5  # 5 * 30s = 2.5min
+
+        # Explicit CLI override wins over role default; None preserves it (#272).
+        self._max_idle_polls = (
+            role_max_idle_polls if max_empty_polls is None else max_empty_polls
+        )
 
         self.colony = ColonyClient(colony_url, client=client, token=token)
         self.workspace_mgr = WorkspaceManager(workspace_root, repo_path, integration_branch)
@@ -315,7 +334,7 @@ class WorkerRuntime:
                     idle_polls += 1
                     logger.debug("queue empty, polling (%d/%d) worker_id=%s role=%s",
                                  idle_polls, max_idle_polls, self.worker_id, self._role)
-                    time.sleep(30)
+                    time.sleep(self.poll_interval)
                 else:
                     idle_polls = 0  # reset on successful forage
         finally:

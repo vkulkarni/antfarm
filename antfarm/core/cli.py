@@ -409,6 +409,23 @@ def worker():
 @click.option(
     "--capabilities", default=None, help="Comma-separated worker capabilities (e.g. gpu,docker)."
 )  # noqa: E501
+@click.option(
+    "--poll-interval",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="Seconds to sleep between empty forage polls.",
+)
+@click.option(
+    "--max-empty-polls",
+    type=int,
+    default=None,
+    help=(
+        "Max consecutive empty forages before exit. "
+        "Unset = role-based default (reviewer=10, builder=5, planner=0). "
+        "0 = exit on first empty."
+    ),
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def worker_start(
@@ -420,6 +437,8 @@ def worker_start(
     repo_path: str,
     integration_branch: str,
     capabilities: str | None,
+    poll_interval: float,
+    max_empty_polls: int | None,
     colony_url: str,
     token: str | None,
 ):
@@ -445,6 +464,8 @@ def worker_start(
         workspace_root=ws_root,
         repo_path=repo_path,
         integration_branch=integration_branch,
+        poll_interval=poll_interval,
+        max_empty_polls=max_empty_polls,
         capabilities=caps,
         token=token,
     )
