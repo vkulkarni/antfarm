@@ -41,18 +41,81 @@ logger = logging.getLogger(__name__)
 WAKE_EVENT_TYPES: frozenset[str] = frozenset({"harvested", "kickback", "merged"})
 
 
+# ---------------------------------------------------------------------------
+# Merge diagnostic event vocabulary (v0.6.7)
+#
+# Soldier emits three diagnostic event types to the SSE bus so operators can
+# answer "why is this task still sitting in done/?" without reading soldier
+# logs. All are emitted with actor="soldier" via ``_emit``.
+#
+# - merge_attempted: Fires at the top of ``attempt_merge`` once per call.
+#   Detail format: ``attempt=<attempt_id> branch=<pr-branch>``. Canonical
+#   name going forward; ``merge_started`` is dual-emitted for backward
+#   compatibility during 0.6.x. (TODO: drop ``merge_started`` in 0.7.0.)
+#
+# - merge_skipped: Fires whenever Soldier evaluates a done, non-merged,
+#   non-infra task and chooses NOT to merge this tick. Detail format:
+#   ``reason=<short-code>``. Reason codes come from ``_MERGE_SKIP_REASONS``
+#   below — short, stable strings operators can grep.
+#
+# - merge_failed: Fires once per ``attempt_merge`` call that returns FAILED,
+#   BEFORE the caller invokes ``kickback_with_cascade``. Detail format:
+#   ``reason=<short-code>: <human message>`` where ``<short-code>`` is one of
+#   ``_MERGE_FAILED_REASONS``.
+#
+# Emit failures are best-effort: a broken event bus MUST NEVER break merge
+# logic. Failures below the ``_emit`` surface are swallowed and logged at
+# DEBUG.
+# ---------------------------------------------------------------------------
+
+_MERGE_SKIP_REASONS = frozenset(
+    {
+        "dep_unmerged",        # a dependency has not yet merged
+        "no_pr",               # current attempt has no branch/PR
+        "review_pending",      # review task was just created this tick
+        "review_in_progress",  # review task exists but is not done yet
+        "review_stale_sha",    # review verdict is for an older attempt SHA
+        "needs_changes",       # review verdict is not 'pass'
+        "already_merged",      # current_attempt is already MERGED
+        "superseded",          # current_attempt is None (post-kickback)
+    }
+)
+
+_MERGE_FAILED_REASONS = frozenset(
+    {
+        "merge_conflict",   # git merge reported a conflict
+        "test_failed",      # test_command returned non-zero
+        "rebase_failed",    # rebase/fast-forward failed
+        "push_failed",      # git push origin failed
+        "no_pr",            # current attempt has no branch
+        "fetch_failed",     # git fetch origin failed
+        "checkout_failed",  # could not checkout integration branch / temp
+        "unknown",          # catch-all for unclassified failures
+    }
+)
+
+
 def _emit(event_type: str, task_id: str, detail: str = "") -> None:
     """Emit an SSE event tagged with actor='soldier'.
 
     Lazy-imports ``_emit_event`` to avoid a circular import at module load
     time (serve.py imports Soldier) and to keep soldier importable in
     contexts where the FastAPI server module cannot be loaded.
+
+    Best-effort: ANY failure inside the emit pipeline is swallowed and
+    logged at DEBUG. A broken event bus MUST NEVER break merge logic.
     """
     try:
         from antfarm.core.serve import _emit_event
     except Exception:
+        logger.debug("soldier _emit: could not import _emit_event", exc_info=True)
         return
-    _emit_event(event_type, task_id, detail, actor="soldier")
+    try:
+        _emit_event(event_type, task_id, detail, actor="soldier")
+    except Exception:
+        logger.debug(
+            "soldier _emit: _emit_event(%s) raised", event_type, exc_info=True
+        )
 
 
 class MergeResult(StrEnum):
@@ -185,6 +248,10 @@ class Soldier:
 
         Like get_merge_queue() but does NOT gate on review verdict,
         since run_once_with_review() handles that itself.
+
+        Emits ``merge_skipped`` (actor=soldier) for done, non-infra tasks
+        filtered out here — see the reason-code vocabulary near the top of
+        this module.
         """
         all_tasks = self.colony.list_tasks()
 
@@ -199,12 +266,20 @@ class Soldier:
                 continue
             if is_infra_task(task):
                 continue
+            task_id = task.get("id", "")
             if self._has_merged_attempt(task):
+                _emit("merge_skipped", task_id, "reason=already_merged")
+                continue
+            # Post-kickback tasks have no current_attempt.
+            if not task.get("current_attempt"):
+                _emit("merge_skipped", task_id, "reason=superseded")
                 continue
             if not self._get_attempt_branch(task):
+                _emit("merge_skipped", task_id, "reason=no_pr")
                 continue
             deps = task.get("depends_on") or []
             if not all(dep in merged_task_ids for dep in deps):
+                _emit("merge_skipped", task_id, "reason=dep_unmerged")
                 continue
             eligible.append(task)
 
@@ -260,6 +335,8 @@ class Soldier:
                         self.kickback_with_cascade(task_id, self.last_failure_reason)
                     results.append((task_id, result))
                 else:
+                    # Diagnostic skip before kickback: needs_changes verdict.
+                    _emit("merge_skipped", task_id, "reason=needs_changes")
                     self.kickback_with_cascade(task_id, f"review failed: {reason}")
                     results.append((task_id, MergeResult.FAILED))
                 continue
@@ -273,6 +350,7 @@ class Soldier:
                     logger.info("created review task %s for %s", created_id, task_id)
                 else:
                     logger.warning("failed to create review task for %s", task_id)
+                _emit("merge_skipped", task_id, "reason=review_pending")
                 results.append((task_id, MergeResult.NEEDS_REVIEW))
                 continue
 
@@ -299,6 +377,7 @@ class Soldier:
                         "failed to re-review %s from run_once_with_review",
                         review_task_id,
                     )
+                _emit("merge_skipped", task_id, "reason=review_stale_sha")
                 results.append((task_id, MergeResult.NEEDS_REVIEW))
                 continue
 
@@ -313,6 +392,7 @@ class Soldier:
                 continue
             if review_status != "done":
                 # Still in progress (ready/active/kicked-back awaiting retry)
+                _emit("merge_skipped", task_id, "reason=review_in_progress")
                 results.append((task_id, MergeResult.NEEDS_REVIEW))
                 continue
 
@@ -342,6 +422,8 @@ class Soldier:
                     self.kickback_with_cascade(task_id, self.last_failure_reason)
                 results.append((task_id, result))
             else:
+                # Diagnostic skip before kickback: needs_changes verdict.
+                _emit("merge_skipped", task_id, "reason=needs_changes")
                 self.kickback_with_cascade(task_id, f"review failed: {reason}")
                 results.append((task_id, MergeResult.FAILED))
 
@@ -367,26 +449,37 @@ class Soldier:
                 merged_task_ids.add(t["id"])
 
         # Filter to done tasks with a branch and satisfied deps
-        # Exclude infra tasks (review tasks, etc.) — they are informational
+        # Exclude infra tasks (review tasks, etc.) — they are informational.
+        # Emit merge_skipped with a reason code at every decision point so
+        # operators can grep the SSE bus to answer "why didn't this merge?"
         eligible = []
         for task in all_tasks:
             if task.get("status") != "done":
                 continue
             if is_infra_task(task):
                 continue
+            task_id = task.get("id", "")
             # Skip already-merged tasks
             if self._has_merged_attempt(task):
+                _emit("merge_skipped", task_id, "reason=already_merged")
+                continue
+            # Post-kickback tasks have current_attempt=None.
+            if not task.get("current_attempt"):
+                _emit("merge_skipped", task_id, "reason=superseded")
                 continue
             if not self._get_attempt_branch(task):
+                _emit("merge_skipped", task_id, "reason=no_pr")
                 continue
             # Check all dependencies are merged
             deps = task.get("depends_on") or []
             if not all(dep in merged_task_ids for dep in deps):
+                _emit("merge_skipped", task_id, "reason=dep_unmerged")
                 continue
             # When review is required, gate on passing + fresh verdict
             if self.require_review:
                 passed, _reason = self.check_review_verdict(task)
                 if not passed:
+                    _emit("merge_skipped", task_id, "reason=needs_changes")
                     continue
             eligible.append(task)
 
@@ -422,12 +515,25 @@ class Soldier:
             MergeResult.MERGED on success, MergeResult.FAILED on any failure.
         """
         task_id = task.get("id", "")
+        attempt_id = task.get("current_attempt") or ""
         branch = self._get_attempt_branch(task)
         if not branch:
             self.last_failure_reason = "no branch on current attempt"
-            _emit("merge_failed", task_id, self.last_failure_reason)
+            # Fire merge_attempted so operators see soldier evaluated this
+            # task; then merge_failed with the normalized reason code.
+            _emit("merge_attempted", task_id, f"attempt={attempt_id} branch=")
+            _emit("merge_started", task_id, "")  # dual-emit for 0.6.x back-compat
+            _emit(
+                "merge_failed",
+                task_id,
+                f"reason=no_pr: {self.last_failure_reason}",
+            )
             return MergeResult.FAILED
 
+        # Canonical diagnostic event (new in 0.6.7).
+        attempt_detail = f"attempt={attempt_id} branch={branch}"
+        _emit("merge_attempted", task_id, attempt_detail)
+        # Dual-emit legacy event for 0.6.x back-compat. TODO: remove in 0.7.0.
         _emit("merge_started", task_id, branch)
 
         temp_branch = "antfarm/temp-merge"
@@ -441,7 +547,11 @@ class Soldier:
             )
             if r.returncode != 0:
                 self.last_failure_reason = f"git fetch failed: {r.stderr.decode().strip()}"
-                _emit("merge_failed", task_id, self.last_failure_reason)
+                _emit(
+                    "merge_failed",
+                    task_id,
+                    f"reason=fetch_failed: {self.last_failure_reason}",
+                )
                 return MergeResult.FAILED
 
             # Create temp branch from integration branch
@@ -461,7 +571,11 @@ class Soldier:
                 self.last_failure_reason = (
                     f"could not create temp branch: {r.stderr.decode().strip()}"
                 )
-                _emit("merge_failed", task_id, self.last_failure_reason)
+                _emit(
+                    "merge_failed",
+                    task_id,
+                    f"reason=checkout_failed: {self.last_failure_reason}",
+                )
                 return MergeResult.FAILED
 
             # Merge task branch (no-ff to preserve history)
@@ -475,7 +589,11 @@ class Soldier:
                 self.last_failure_reason = (
                     f"merge conflict merging {branch}: {r.stderr.decode().strip()}"
                 )
-                _emit("merge_failed", task_id, self.last_failure_reason)
+                _emit(
+                    "merge_failed",
+                    task_id,
+                    f"reason=merge_conflict: {self.last_failure_reason}",
+                )
                 return MergeResult.FAILED
 
             # Run tests
@@ -489,7 +607,11 @@ class Soldier:
                 self.last_failure_reason = (
                     f"tests failed: {r.stdout.decode().strip()} {r.stderr.decode().strip()}"
                 ).strip()
-                _emit("merge_failed", task_id, self.last_failure_reason)
+                _emit(
+                    "merge_failed",
+                    task_id,
+                    f"reason=test_failed: {self.last_failure_reason}",
+                )
                 return MergeResult.FAILED
 
             # Fast-forward integration branch
@@ -503,7 +625,11 @@ class Soldier:
                 self.last_failure_reason = (
                     f"could not checkout {self.integration_branch}: {r.stderr.decode().strip()}"
                 )
-                _emit("merge_failed", task_id, self.last_failure_reason)
+                _emit(
+                    "merge_failed",
+                    task_id,
+                    f"reason=checkout_failed: {self.last_failure_reason}",
+                )
                 return MergeResult.FAILED
 
             r = subprocess.run(
@@ -514,7 +640,11 @@ class Soldier:
             )
             if r.returncode != 0:
                 self.last_failure_reason = f"ff-only merge failed: {r.stderr.decode().strip()}"
-                _emit("merge_failed", task_id, self.last_failure_reason)
+                _emit(
+                    "merge_failed",
+                    task_id,
+                    f"reason=rebase_failed: {self.last_failure_reason}",
+                )
                 return MergeResult.FAILED
 
             # Push to origin
@@ -526,7 +656,11 @@ class Soldier:
             )
             if r.returncode != 0:
                 self.last_failure_reason = f"push failed: {r.stderr.decode().strip()}"
-                _emit("merge_failed", task_id, self.last_failure_reason)
+                _emit(
+                    "merge_failed",
+                    task_id,
+                    f"reason=push_failed: {self.last_failure_reason}",
+                )
                 return MergeResult.FAILED
 
             _emit("merge_succeeded", task_id, branch)
