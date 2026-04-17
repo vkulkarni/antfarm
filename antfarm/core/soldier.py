@@ -18,10 +18,13 @@ Policy:
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import subprocess
 import time
 from enum import StrEnum
+
+import httpx
 
 from antfarm.core.backends.base import TaskBackend
 from antfarm.core.colony_client import ColonyClient
@@ -30,6 +33,12 @@ from antfarm.core.models import ReviewVerdict
 from antfarm.core.review_pack import extract_verdict_from_review_task
 
 logger = logging.getLogger(__name__)
+
+# Event types that should wake the Soldier's run loop immediately.
+# - harvested: a task moved to done/ — may be merge-eligible now
+# - kickback: a task regressed — may unblock cascade or free scheduling
+# - merged: a dependency was merged — dependents may now be eligible
+WAKE_EVENT_TYPES: frozenset[str] = frozenset({"harvested", "kickback", "merged"})
 
 
 def _emit(event_type: str, task_id: str, detail: str = "") -> None:
@@ -79,6 +88,7 @@ class Soldier:
         client=None,
     ):
         self.colony = ColonyClient(colony_url, client=client)
+        self.colony_url = colony_url
         self.repo_path = repo_path
         self.integration_branch = integration_branch
         self.test_command = test_command or ["pytest", "-x", "-q"]
@@ -86,19 +96,27 @@ class Soldier:
         self.require_review = require_review
         self.poll_external_merges = poll_external_merges
         self.last_failure_reason = ""
+        # Event cursor for /events SSE stream. In-memory only; never persists.
+        self._event_cursor: int = 0
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Main soldier loop. Runs indefinitely until interrupted."""
+        """Main soldier loop. Runs indefinitely until interrupted.
+
+        Between ticks, the loop waits on the colony's /events SSE stream
+        so it can wake immediately on ``harvested``/``kickback``/``merged``
+        events. On any connection failure the loop falls back to the
+        legacy polling behaviour (``time.sleep(self.poll_interval)``).
+        """
         while True:
             if self.require_review:
                 self.process_done_tasks()
             queue = self.get_merge_queue()
             if not queue:
-                time.sleep(self.poll_interval)
+                self._wait_for_event(timeout=self.poll_interval)
                 continue
             for task in queue:
                 if self._reconcile_external_merge(task):
@@ -556,6 +574,67 @@ class Soldier:
     # Private helpers
     # ------------------------------------------------------------------
 
+    def _wait_for_event(self, timeout: float) -> bool:
+        """Wait on the colony's /events SSE stream for a wake event.
+
+        Opens a streaming GET against ``/events?after=<cursor>&timeout=<timeout>``
+        and consumes SSE ``data:`` lines. Returns early as soon as an event with
+        ``type`` in :data:`WAKE_EVENT_TYPES` arrives. Other event types advance
+        the cursor but do not cause an early return.
+
+        Args:
+            timeout: Maximum seconds to wait for a wake event. Matches the
+                colony server's ``timeout`` query contract.
+
+        Returns:
+            True if woken by a relevant event; False on timeout or fallback.
+
+        Fallback behaviour:
+            If this Soldier was constructed via :meth:`from_backend` (in-process;
+            ``colony_url`` is empty) the SSE path is skipped and the method
+            does a plain ``time.sleep(timeout)``. On any connection, read, or
+            parse error the method logs a warning, does ``time.sleep(timeout)``,
+            and returns False. The polling path is always available as a
+            safety net.
+        """
+        # In-process Soldier (from_backend) has no meaningful colony_url.
+        # Skip SSE entirely and preserve the original polling behaviour.
+        if not self.colony_url:
+            time.sleep(timeout)
+            return False
+
+        url = f"{self.colony_url.rstrip('/')}/events"
+        params = {"after": self._event_cursor, "timeout": timeout}
+        # Read timeout slightly larger than server-side timeout so the server
+        # closes the stream first (graceful), not the client.
+        client_timeout = httpx.Timeout(timeout + 5.0, connect=5.0)
+        try:
+            with (
+                httpx.Client(timeout=client_timeout) as client,
+                client.stream("GET", url, params=params) as resp,
+            ):
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[len("data:") :].strip()
+                    if not payload:
+                        continue
+                    event = json.loads(payload)
+                    event_id = event.get("id", 0)
+                    if isinstance(event_id, int) and event_id > self._event_cursor:
+                        self._event_cursor = event_id
+                    if event.get("type") in WAKE_EVENT_TYPES:
+                        return True
+                # Stream closed cleanly (server-side timeout). Act as a tick.
+                return False
+        except Exception as exc:
+            logger.warning(
+                "soldier event wait failed (%s); falling back to poll sleep", exc
+            )
+            time.sleep(timeout)
+            return False
+
     def _cleanup(self) -> None:
         """Restore repo to a clean state after a merge attempt (success or failure).
 
@@ -972,6 +1051,7 @@ class Soldier:
         """
         instance = cls.__new__(cls)
         instance.colony = _BackendAdapter(backend)
+        instance.colony_url = ""  # in-process: sentinel disables SSE wait
         instance.repo_path = repo_path
         instance.integration_branch = integration_branch
         instance.test_command = test_command or ["pytest", "-x", "-q"]
@@ -979,6 +1059,7 @@ class Soldier:
         instance.require_review = require_review
         instance.poll_external_merges = poll_external_merges
         instance.last_failure_reason = ""
+        instance._event_cursor = 0
         return instance
 
 
