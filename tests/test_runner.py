@@ -57,6 +57,14 @@ class TestRunnerDefaults:
         r = _make_runner(tmp_path)
         assert r._pm is not None
 
+    def test_runner_uses_hashed_prefix(self, tmp_path):
+        """Runner's ProcessManager prefix is ``runner-{colony_hash(state_dir)}-`` (#231)."""
+        from antfarm.core.process_manager import colony_hash
+
+        r = _make_runner(tmp_path)
+        expected = f"runner-{colony_hash(r.state_dir)}-"
+        assert r._prefix == expected
+
 
 class TestDesiredState:
     def test_apply_desired_state(self, tmp_path):
@@ -224,7 +232,8 @@ class TestStartWorker:
         log_path = call_args[0][2]
         role = call_args[1].get("role") or call_args[0][3]
 
-        assert name.startswith("runner-builder-")
+        assert name.startswith(r._prefix)
+        assert name.endswith("-builder-1")
         assert "antfarm" in cmd[0]
         assert "--type" in cmd
         assert "builder" in cmd

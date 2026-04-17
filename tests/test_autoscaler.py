@@ -73,6 +73,21 @@ def _mock_pm() -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
+# Colony-hashed prefix (#231)
+# ---------------------------------------------------------------------------
+
+
+def test_autoscaler_uses_hashed_prefix(tmp_path):
+    """Autoscaler's ProcessManager prefix is ``auto-{colony_hash(data_dir)}-``."""
+    from antfarm.core.process_manager import colony_hash
+
+    data_dir = str(tmp_path / ".antfarm")
+    a = _make_autoscaler(data_dir=data_dir)
+    expected = f"auto-{colony_hash(data_dir)}-"
+    assert a._prefix == expected
+
+
+# ---------------------------------------------------------------------------
 # _compute_desired tests
 # ---------------------------------------------------------------------------
 
@@ -492,7 +507,8 @@ class TestStartWorker:
         cmd = start_call[0][1]
         role = start_call[1].get("role") or start_call[0][3]
 
-        assert name.startswith("auto-builder-")
+        assert name.startswith(a._prefix)
+        assert name.endswith("-builder-1")
         assert "antfarm" in cmd
         assert "--type" in cmd
         idx = cmd.index("--type")
@@ -532,7 +548,7 @@ class TestStartWorker:
         # The second name was registered
         names = list(a.managed.keys())
         assert len(names) == 1
-        assert names[0] == "auto-builder-2"
+        assert names[0] == f"{a._prefix}builder-2"
 
     @patch("antfarm.core.autoscaler.os.makedirs")
     def test_start_worker_both_attempts_fail_skips_gracefully(self, mock_makedirs):

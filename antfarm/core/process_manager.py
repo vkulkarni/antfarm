@@ -9,6 +9,7 @@ Use get_process_manager() to get the right implementation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -22,9 +23,26 @@ from datetime import UTC, datetime
 logger = logging.getLogger(__name__)
 
 # Session name format: {prefix}{role}-{counter}
-# e.g., "auto-builder-3" or "runner-planner-1"
+# e.g., "auto-a1b2c3d4-builder-3" or "runner-a1b2c3d4-planner-1"
 # Shared constant so adoption parsing stays in sync with naming.
 SESSION_NAME_SEP = "-"
+
+
+def colony_hash(data_dir: str) -> str:
+    """Stable 8-char hex hash for this colony's tmux session prefix.
+
+    Resolves symlinks so ``data_dir``, ``./data_dir``, and the corresponding
+    absolute path collapse to the same hash. Operators who physically move
+    the directory get a new prefix — acceptable, since a move implies restart.
+
+    Args:
+        data_dir: Colony data directory (``.antfarm/`` path or Runner state dir).
+
+    Returns:
+        First 8 hex chars of SHA-256 over the resolved realpath.
+    """
+    real = os.path.realpath(data_dir)
+    return hashlib.sha256(real.encode("utf-8")).hexdigest()[:8]
 
 
 def parse_session_name(name: str, prefix: str) -> tuple[str, int] | None:

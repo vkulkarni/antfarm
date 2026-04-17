@@ -6,6 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- Tmux session names now include an 8-char SHA-256 hash of the colony's resolved `data_dir` (format: `auto-{hash}-{role}-{N}` for autoscaler, `runner-{hash}-{role}-{N}` for Runner). This scopes orphan detection to the current colony so peer colonies on the same host are ignored. Doctor's `check_orphan_tmux_sessions` is restored to `warning` severity with `auto_fixable=True`, and `antfarm doctor --fix` now safely `tmux kill-session`s own orphans. Backwards-compat caveat: tmux sessions spawned by pre-upgrade builds lack the hash prefix and become unmanaged — operators should `tmux kill-session -t <name>` them after upgrading. (#231)
+
 ### Fixed
 - `register_worker` tolerates stale prior registrations — overwrites worker files whose heartbeat has expired instead of returning 409, preventing autoscaler crashes on colony restart (#194)
 
