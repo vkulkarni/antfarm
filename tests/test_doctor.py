@@ -1385,3 +1385,120 @@ def test_run_doctor_sweep_legacy_tmux_flag_invokes_sweep():
     legacy = [f for f in findings if f.check == "legacy_tmux_session"]
     assert len(legacy) == 1
     assert legacy[0].fixed is True
+
+
+# ---------------------------------------------------------------------------
+# Defensive subprocess hardening (issue #211)
+# ---------------------------------------------------------------------------
+
+
+def test_check_orphan_tmux_sessions_returns_empty_on_subprocess_timeout():
+    """tmux list-sessions hanging (TimeoutExpired) → [] rather than crashing."""
+    import subprocess
+    from unittest.mock import patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch(
+            "antfarm.core.doctor.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["tmux"], timeout=5),
+        ),
+    ):
+        assert check_orphan_tmux_sessions({"data_dir": "/x"}) == []
+
+
+def test_check_orphan_tmux_sessions_returns_empty_on_oserror():
+    """tmux binary unavailable (OSError from subprocess) → [] rather than crashing."""
+    from unittest.mock import patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", side_effect=OSError("boom")),
+    ):
+        assert check_orphan_tmux_sessions({"data_dir": "/x"}) == []
+
+
+def test_sweep_legacy_returns_empty_on_subprocess_error():
+    """sweep_legacy_tmux_sessions: SubprocessError from list-sessions → [] (no crash)."""
+    import subprocess
+    from unittest.mock import patch
+
+    from antfarm.core.doctor import sweep_legacy_tmux_sessions
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch(
+            "antfarm.core.doctor.subprocess.run",
+            side_effect=subprocess.SubprocessError("boom"),
+        ),
+    ):
+        assert sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=False) == []
+        assert sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=True) == []
+
+
+def test_check_orphan_kill_timeout_does_not_mark_fixed(tmp_path):
+    """Orphan detected, but tmux kill-session hangs → finding.fixed=False with timeout note."""
+    import subprocess
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import check_orphan_tmux_sessions
+    from antfarm.core.process_manager import colony_session_hash
+
+    data_dir = tmp_path / ".antfarm"
+    (data_dir / "processes").mkdir(parents=True)
+
+    h = colony_session_hash(str(data_dir))
+    own_orphan = f"auto-{h}-builder-7"
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = f"{own_orphan}\n"
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["tmux", "list-sessions"]:
+            return list_result
+        if cmd[:2] == ["tmux", "kill-session"]:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=5)
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", side_effect=fake_run),
+    ):
+        findings = check_orphan_tmux_sessions({"data_dir": str(data_dir)}, fix=True)
+
+    assert len(findings) == 1
+    assert findings[0].fixed is False
+    assert "kill timed out" in findings[0].message
+
+
+def test_sweep_legacy_matches_user_sessions_by_design():
+    """Legacy pattern matches user sessions like ``auto-save-5`` by design.
+
+    Interactive confirmation in the CLI is the safety net — the pattern
+    cannot distinguish antfarm's legacy sessions from unrelated user-owned
+    sessions that happen to share the shape. See
+    :func:`antfarm.core.doctor.sweep_legacy_tmux_sessions` for the documented
+    false-positive risk.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import sweep_legacy_tmux_sessions
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = "auto-save-5\n"
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", return_value=list_result),
+    ):
+        findings = sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=False)
+
+    assert len(findings) == 1
+    assert findings[0].check == "legacy_tmux_session"
+    assert "auto-save-5" in findings[0].message

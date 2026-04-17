@@ -254,7 +254,14 @@ class Runner:
             }
 
     def stop(self) -> None:
-        """Stop all managed workers and clean up."""
+        """Shutdown: stop all managed workers.
+
+        Metadata cleanup policy: stop() kills sessions/processes but does NOT
+        remove metadata files. Metadata is cleaned up during the next adoption
+        pass (stale metadata with dead processes gets removed). Same policy as
+        autoscaler.stop() — metadata should outlive the runner process so
+        restart adoption works.
+        """
         self._stopped = True
         with self._lock:
             for name in list(self.managed):

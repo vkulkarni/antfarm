@@ -1124,12 +1124,19 @@ def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]
     if not shutil.which("tmux"):
         return []
 
-    result = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_name}"],
-        capture_output=True,
-        text=True,
-        env={**os.environ, "LC_ALL": "C"},
-    )
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        # tmux binary unreachable or hung — treat as no sessions.
+        # subprocess.TimeoutExpired is a subclass of SubprocessError but is
+        # listed explicitly to match the issue's intent and clarify coverage.
+        return []
     if result.returncode != 0:
         # tmux server not running — no sessions to check
         return []
@@ -1171,12 +1178,20 @@ def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]
             # Session name is already colony-hash-scoped (see #231), so we never
             # kill a peer colony's session — this is what makes the race-tolerant
             # behavior safe to default-on.
-            kill = subprocess.run(
-                ["tmux", "kill-session", "-t", name],
-                capture_output=True,
-                text=True,
-                env={**os.environ, "LC_ALL": "C"},
-            )
+            try:
+                kill = subprocess.run(
+                    ["tmux", "kill-session", "-t", name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env={**os.environ, "LC_ALL": "C"},
+                )
+            except subprocess.TimeoutExpired:
+                # tmux kill-session hung — leave finding unfixed with explicit note.
+                finding.fixed = False
+                finding.message += " — kill timed out"
+                findings.append(finding)
+                continue
             if kill.returncode == 0:
                 finding.fixed = True
             else:
@@ -1245,6 +1260,13 @@ def sweep_legacy_tmux_sessions(
     Run it only after confirming there is no peer colony still using the
     legacy format.
 
+    False-positive risk: the legacy pattern matches any session named
+    ``auto-<word>-<int>`` (and ``runner-<word>-<int>``, ``antfarm-...-<int>``)
+    where ``<word>`` is not an 8-char hex token. A user-owned tmux session
+    such as ``auto-save-5`` will match by design. Safety relies on the
+    interactive gate in the CLI (``--yes`` confirmation or operator prompt)
+    rather than on pattern precision; never call this function unattended.
+
     Args:
         config: Doctor config dict (unused; signature mirrors other checks).
         confirmed: When True, kill each match. Default False (dry-run preview).
@@ -1257,12 +1279,17 @@ def sweep_legacy_tmux_sessions(
         return []
 
     env = {**os.environ, "LC_ALL": "C"}
-    result = subprocess.run(
-        ["tmux", "list-sessions", "-F", "#{session_name}"],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        # tmux binary unreachable or hung — nothing to sweep.
+        return []
     if result.returncode != 0:
         # tmux server not running — nothing to sweep
         return []
