@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import threading
 import uuid
 
 from antfarm.core.process_manager import colony_hash, colony_id, colony_session_hash
+
+
+def _mp_colony_id_worker(data_dir: str, queue: multiprocessing.Queue) -> None:
+    """Top-level worker for multiprocess concurrency test.
+
+    Must be defined at module scope so 'spawn' start method can pickle it.
+    """
+    queue.put(colony_id(data_dir))
 
 
 def test_colony_id_generated_on_first_call(tmp_path):
@@ -92,6 +101,38 @@ def test_colony_id_concurrent_writers(tmp_path):
         t.join()
 
     assert len(set(results)) == 1, results
+    with open(os.path.join(data_dir, "config.json")) as f:
+        cfg = json.load(f)
+    assert cfg["colony_id"] == results[0]
+
+
+def test_colony_id_multiprocess_concurrent_writers(tmp_path):
+    """Racing first-call generations across processes converge on a single id.
+
+    The thread-based test above exercises the in-process ``threading.Lock``
+    path. The actual concurrency contract of ``colony_id`` is ``fcntl.flock``,
+    which is a cross-process primitive. This test exercises that contract by
+    spawning real OS processes that race through generation.
+    """
+    data_dir = str(tmp_path)
+
+    # Use get_context('spawn') explicitly so the test is portable (macOS
+    # defaults to 'spawn' already; Linux defaults to 'fork'). Using an
+    # explicit context avoids mutating global multiprocessing state.
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    processes = [ctx.Process(target=_mp_colony_id_worker, args=(data_dir, queue)) for _ in range(5)]
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join(timeout=30)
+        assert p.exitcode == 0, f"worker exited with {p.exitcode}"
+
+    results = [queue.get(timeout=5) for _ in processes]
+    assert len(results) == 5
+    assert all(results), results
+    assert len(set(results)) == 1, results
+
     with open(os.path.join(data_dir, "config.json")) as f:
         cfg = json.load(f)
     assert cfg["colony_id"] == results[0]

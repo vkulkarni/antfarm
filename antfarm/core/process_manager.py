@@ -137,6 +137,15 @@ def colony_id(data_dir: str) -> str:
                 os.fsync(tmp.fileno())
             os.replace(tmp_name, config_path)
             tmp_name = None  # ownership transferred
+            # Durability: POSIX does not guarantee rename is persisted until the
+            # parent dir is fsynced. Suppress OSError for filesystems that don't
+            # support directory fsync (e.g., Windows).
+            with contextlib.suppress(OSError):
+                dir_fd = os.open(data_dir, os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         finally:
             if tmp_name is not None:
                 with contextlib.suppress(OSError):
