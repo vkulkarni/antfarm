@@ -22,6 +22,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from antfarm.core.missions import is_infra_task
+
 
 @dataclass
 class PipelineSnapshot:
@@ -259,10 +261,10 @@ class AntfarmTUI:
 
             elif status == "done":
                 if self._has_merged_attempt(task):
-                    if not is_review:  # only show impl tasks in merged
+                    if not is_infra_task(task):  # only show impl tasks in merged
                         snap.recently_merged.append(task)
-                elif is_review:
-                    # Done review tasks are just containers — hide them
+                elif is_infra_task(task):
+                    # Done infra tasks (plan/review) are just containers — hide them
                     snap.review_tasks[task_id] = task
                 else:
                     verdict = self._get_verdict(task)
@@ -426,8 +428,8 @@ class AntfarmTUI:
         else:
             table.add_row("Reviews", Text(review_text, style="dim"))
 
-        # Progress bar — only count implementation tasks, not review tasks
-        impl_tasks = [t for t in tasks if not t.get("id", "").startswith("review-")]
+        # Progress bar — only count implementation tasks, not infra (plan/review) tasks
+        impl_tasks = [t for t in tasks if not is_infra_task(t)]
         total = len(impl_tasks)
         merged = len(snap.recently_merged)
         if total > 0:
