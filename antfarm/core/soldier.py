@@ -362,6 +362,64 @@ class Soldier:
             existing_sha = self._extract_attempt_sha_from_spec(review_task.get("spec", ""))
             current_sha = self._current_attempt_sha(task)
             if existing_sha and current_sha and existing_sha != current_sha:
+                # Pure-rebase fast-path: if the prior attempt had a pass
+                # verdict AND the non-test diffs against the integration
+                # merge-base are byte-identical, carry the verdict forward
+                # onto the new attempt and skip re-review entirely. On any
+                # git failure, or if the diffs differ, or if the prior
+                # verdict is not a pass, fall through to the safe re-ready
+                # path below.
+                prior_verdict = self._find_prior_pass_verdict(task, existing_sha)
+                if prior_verdict is not None and self._diffs_equivalent_after_rebase(
+                    task, existing_sha, current_sha
+                ):
+                    # Carry the verdict forward with reviewed_commit_sha
+                    # updated to the new attempt's head so the downstream
+                    # freshness check in ``check_review_verdict`` passes.
+                    # We have already verified the non-test code diffs are
+                    # byte-identical, so this update is safe.
+                    carried = dict(prior_verdict)
+                    carried["reviewed_commit_sha"] = current_sha
+                    try:
+                        self.colony.store_review_verdict(
+                            task_id, attempt_id, carried
+                        )
+                    except Exception:
+                        logger.exception(
+                            "failed to carry forward verdict for %s; "
+                            "falling through to re-review",
+                            task_id,
+                        )
+                    else:
+                        logger.info(
+                            "carrying forward pass verdict on pure-rebase "
+                            "reharvest: task=%s old_sha=%s new_sha=%s",
+                            task_id,
+                            existing_sha[:12],
+                            current_sha[:12],
+                        )
+                        task_updated = self.colony.get_task(task_id)
+                        if task_updated is None:
+                            results.append((task_id, MergeResult.FAILED))
+                            continue
+                        passed, reason = self.check_review_verdict(task_updated)
+                        if passed:
+                            result = self.attempt_merge(task_updated)
+                            if result == MergeResult.MERGED:
+                                self.colony.mark_merged(task_id, attempt_id)
+                            else:
+                                self.kickback_with_cascade(
+                                    task_id, self.last_failure_reason
+                                )
+                            results.append((task_id, result))
+                        else:
+                            _emit("merge_skipped", task_id, "reason=needs_changes")
+                            self.kickback_with_cascade(
+                                task_id, f"review failed: {reason}"
+                            )
+                            results.append((task_id, MergeResult.FAILED))
+                        continue
+
                 try:
                     new_spec = self._build_review_spec(task)
                     self.colony.rereview(review_task_id, new_spec, task.get("touches", []))
@@ -1247,6 +1305,112 @@ class Soldier:
             if sha:
                 return sha
         return self._get_attempt_branch(task) or ""
+
+    @staticmethod
+    def _find_prior_pass_verdict(task: dict, prior_sha: str) -> dict | None:
+        """Return a prior attempt's pass verdict, or None.
+
+        Scans ``task['attempts']`` for attempts other than the current one
+        whose stored ``review_verdict`` has ``verdict == 'pass'``. Prefers
+        a verdict whose ``reviewed_commit_sha`` matches ``prior_sha``
+        (the SHA embedded in the stale review task's spec), so the
+        fast-path only carries forward a verdict we are confident was
+        recorded against the old attempt's code. If no SHA-matched pass
+        verdict exists, returns None — the caller falls through to the
+        safe re-review path.
+        """
+        current_attempt_id = task.get("current_attempt")
+        best: dict | None = None
+        for a in task.get("attempts", []):
+            if a.get("attempt_id") == current_attempt_id:
+                continue
+            v = a.get("review_verdict")
+            if not v or v.get("verdict") != "pass":
+                continue
+            reviewed_sha = v.get("reviewed_commit_sha") or ""
+            if prior_sha and reviewed_sha and Soldier._sha_match(reviewed_sha, prior_sha):
+                return v
+            if best is None:
+                best = v
+        # Only return a non-SHA-matched verdict if we had no SHA to check
+        # against at all — otherwise stay safe and re-review.
+        if not prior_sha:
+            return best
+        return None
+
+    def _diffs_equivalent_after_rebase(
+        self, task: dict, existing_sha: str, current_sha: str
+    ) -> bool:
+        """Check whether two attempts produce byte-identical non-test diffs.
+
+        Computes ``git diff <merge_base>..<head> --ignore-all-space`` for
+        both ``existing_sha`` and ``current_sha`` against
+        ``origin/<integration_branch>``, with pathspec excludes for
+        ``tests/`` directories and ``test_*.py`` files. Returns True iff
+        both ``git merge-base`` + ``git diff`` invocations succeed AND
+        both stdouts are byte-identical.
+
+        Any subprocess error, non-zero return code, or empty merge-base
+        output causes this method to return False (safe default → the
+        caller re-reviews).
+        """
+        del task  # reserved for future use; repo_path is all we need today
+        if not existing_sha or not current_sha:
+            return False
+
+        try:
+            diff_old = self._diff_against_merge_base(existing_sha)
+            diff_new = self._diff_against_merge_base(current_sha)
+        except Exception:
+            logger.debug(
+                "diff-equivalence check raised; falling through to re-review",
+                exc_info=True,
+            )
+            return False
+
+        if diff_old is None or diff_new is None:
+            return False
+        return diff_old == diff_new
+
+    def _diff_against_merge_base(self, sha: str) -> str | None:
+        """Return ``git diff <merge-base>..<sha>`` (non-test paths) or None.
+
+        Returns None on ANY subprocess error (caller treats as non-equiv).
+        The ``--ignore-all-space`` flag is applied at the ``git diff``
+        layer (not via post-processing) so identical-after-whitespace
+        rebases are recognized as pure-rebase reharvests.
+        """
+        mb = subprocess.run(
+            ["git", "merge-base", sha, f"origin/{self.integration_branch}"],
+            cwd=self.repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if mb.returncode != 0:
+            return None
+        merge_base = mb.stdout.strip()
+        if not merge_base:
+            return None
+
+        diff = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--ignore-all-space",
+                f"{merge_base}..{sha}",
+                "--",
+                ":!**/tests/**",
+                ":!**/test_*.py",
+            ],
+            cwd=self.repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if diff.returncode != 0:
+            return None
+        return diff.stdout
 
     def _build_review_spec(self, task: dict) -> str:
         """Build the review task spec for ``task``'s current attempt."""

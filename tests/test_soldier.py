@@ -2485,3 +2485,383 @@ def test_start_soldier_thread_wires_require_review_true(tmp_path, monkeypatch):
         f"Soldier must be started with require_review=True, "
         f"got kwargs={captured['kwargs']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# P3: carry-forward pass verdict on pure-rebase reharvest (#287)
+# ---------------------------------------------------------------------------
+
+
+def _setup_rebase_reharvest_state(
+    backend: FileBackend,
+    task_id: str,
+    *,
+    old_sha: str,
+    new_sha: str,
+    prior_verdict: dict,
+) -> tuple[str, str]:
+    """Build a state where task has a superseded attempt with ``prior_verdict``
+    and a new current attempt with ``new_sha``. Returns (old_attempt_id,
+    new_attempt_id).
+
+    Sequence: harvest (attempt 1) → inject pass verdict on att-1 → kickback
+    → pull+harvest (attempt 2). The review task for the parent is created
+    against the old SHA so the stale-SHA block fires on the next tick.
+    """
+    import json
+    from pathlib import Path
+
+    _make_done_task_with_mission(backend, task_id, mission_id=None)
+    _set_attempt_artifact_sha(backend, task_id, old_sha)
+
+    # Inject prior pass verdict on the (current, soon-to-be-superseded) attempt.
+    done_path = Path(backend._root) / "tasks" / "done" / f"{task_id}.json"
+    data = json.loads(done_path.read_text())
+    old_attempt_id = data["current_attempt"]
+    for a in data["attempts"]:
+        if a["attempt_id"] == old_attempt_id:
+            a["review_verdict"] = prior_verdict
+            break
+    done_path.write_text(json.dumps(data, indent=2))
+
+    # Create the review task bound to old_sha BEFORE kickback so
+    # Attempt-SHA in its spec is the stale one.
+    soldier_tmp = Soldier.from_backend(backend, repo_path=str(Path(backend._root).parent))
+    parent_task = backend.get_task(task_id)
+    assert soldier_tmp.create_review_task(parent_task) == f"review-{task_id}"
+
+    # Kickback parent → new attempt.
+    backend.kickback(task_id, "pretend cascade")
+    backend.heartbeat(f"w-{task_id}", {"status": "idle"})
+    backend.pull(f"w-{task_id}")
+    pulled = backend.get_task(task_id)
+    new_attempt_id = pulled["current_attempt"]
+    backend.mark_harvested(
+        task_id,
+        new_attempt_id,
+        pr=f"PR-{task_id}-v2",
+        branch=f"feat/{task_id}",
+    )
+    _set_attempt_artifact_sha(backend, task_id, new_sha)
+    return old_attempt_id, new_attempt_id
+
+
+def _pass_verdict(sha: str) -> dict:
+    from antfarm.core.models import ReviewVerdict
+
+    return ReviewVerdict(
+        provider="human",
+        verdict="pass",
+        summary="LGTM",
+        reviewed_commit_sha=sha,
+    ).to_dict()
+
+
+def _needs_changes_verdict(sha: str) -> dict:
+    from antfarm.core.models import ReviewVerdict
+
+    return ReviewVerdict(
+        provider="human",
+        verdict="needs_changes",
+        summary="please fix",
+        findings=["bug"],
+        reviewed_commit_sha=sha,
+    ).to_dict()
+
+
+def test_p3_identical_diff_carries_forward_pass_verdict(tmp_path, monkeypatch):
+    """Pure-rebase reharvest with matching non-test diff + pass verdict:
+    verdict is carried forward onto the new attempt, no rereview fires,
+    attempt_merge is invoked."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+
+    _, new_attempt_id = _setup_rebase_reharvest_state(
+        backend,
+        "task-p3-ok",
+        old_sha=old_sha,
+        new_sha=new_sha,
+        prior_verdict=_pass_verdict(old_sha),
+    )
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+
+    # Force diffs equivalent; stub attempt_merge so no real git runs.
+    monkeypatch.setattr(
+        Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: True
+    )
+    merges: list[tuple[str, str]] = []
+
+    def fake_attempt_merge(self, task):
+        merges.append((task["id"], task["current_attempt"]))
+        return MergeResult.MERGED
+
+    monkeypatch.setattr(Soldier, "attempt_merge", fake_attempt_merge)
+
+    rereview_calls: list[tuple] = []
+    original_rereview = soldier.colony.rereview
+
+    def fake_rereview(review_task_id, spec, touches):
+        rereview_calls.append((review_task_id, spec, touches))
+        return original_rereview(review_task_id, spec, touches)
+
+    monkeypatch.setattr(soldier.colony, "rereview", fake_rereview)
+
+    results = soldier.run_once_with_review()
+
+    assert results == [("task-p3-ok", MergeResult.MERGED)], results
+    assert merges == [("task-p3-ok", new_attempt_id)]
+    # No rereview call on the stale-SHA path.
+    assert rereview_calls == []
+
+    # Carried-forward verdict lives on the new attempt.
+    parent_after = backend.get_task("task-p3-ok")
+    for a in parent_after["attempts"]:
+        if a["attempt_id"] == new_attempt_id:
+            v = a.get("review_verdict")
+            assert v is not None
+            assert v.get("verdict") == "pass"
+            # reviewed_commit_sha is rewritten to the new SHA so the
+            # downstream freshness check passes — the diff-equivalence
+            # helper is what guarantees carrying forward is safe.
+            assert v.get("reviewed_commit_sha") == new_sha
+            break
+
+
+def test_p3_code_change_falls_through_to_rereview(tmp_path, monkeypatch):
+    """When non-test diffs differ between old and new attempts, we must NOT
+    carry forward — re-ready the review task instead."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+
+    _, new_attempt_id = _setup_rebase_reharvest_state(
+        backend,
+        "task-p3-diff",
+        old_sha=old_sha,
+        new_sha=new_sha,
+        prior_verdict=_pass_verdict(old_sha),
+    )
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    monkeypatch.setattr(
+        Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: False
+    )
+
+    def fail_attempt_merge(self, task):  # pragma: no cover - sanity guard
+        raise AssertionError("attempt_merge must NOT run when diffs differ")
+
+    monkeypatch.setattr(Soldier, "attempt_merge", fail_attempt_merge)
+
+    results = soldier.run_once_with_review()
+    assert results == [("task-p3-diff", MergeResult.NEEDS_REVIEW)]
+
+    # Stale review was re-readied; parent's new attempt has NO verdict yet.
+    review_after = backend.get_task("review-task-p3-diff")
+    assert review_after["status"] == "ready"
+    assert review_after["current_attempt"] is None
+
+    parent_after = backend.get_task("task-p3-diff")
+    for a in parent_after["attempts"]:
+        if a["attempt_id"] == new_attempt_id:
+            assert a.get("review_verdict") is None
+
+
+def test_p3_needs_changes_verdict_always_rereviews(tmp_path, monkeypatch):
+    """Even with byte-identical diffs, a needs_changes verdict must never
+    be carried forward — fall through to rereview."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+
+    _, new_attempt_id = _setup_rebase_reharvest_state(
+        backend,
+        "task-p3-nc",
+        old_sha=old_sha,
+        new_sha=new_sha,
+        prior_verdict=_needs_changes_verdict(old_sha),
+    )
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    # Diffs equivalent — carry-forward still must be skipped because verdict
+    # is not 'pass'.
+    monkeypatch.setattr(
+        Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: True
+    )
+
+    def fail_attempt_merge(self, task):  # pragma: no cover - sanity guard
+        raise AssertionError("attempt_merge must NOT run on needs_changes")
+
+    monkeypatch.setattr(Soldier, "attempt_merge", fail_attempt_merge)
+
+    results = soldier.run_once_with_review()
+    assert results == [("task-p3-nc", MergeResult.NEEDS_REVIEW)]
+
+    parent_after = backend.get_task("task-p3-nc")
+    for a in parent_after["attempts"]:
+        if a["attempt_id"] == new_attempt_id:
+            assert a.get("review_verdict") is None
+
+
+def test_p3_test_only_change_follows_pathspec_exclusion(tmp_path, monkeypatch):
+    """Test-file-only change between attempts: the ``:!**/tests/**`` and
+    ``:!**/test_*.py`` pathspec excludes strip test paths from the diff.
+    If the non-test portions are byte-identical, we carry forward the pass
+    verdict — this is intentional per the mission spec (test-only churn
+    should not trigger a full re-review). Verified here by asserting the
+    helper sees identical non-test diffs and the verdict is carried
+    forward without invoking rereview."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+
+    _, new_attempt_id = _setup_rebase_reharvest_state(
+        backend,
+        "task-p3-tests",
+        old_sha=old_sha,
+        new_sha=new_sha,
+        prior_verdict=_pass_verdict(old_sha),
+    )
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+
+    # Simulate pathspec-filtered diff output: both attempts yield identical
+    # NON-test diffs despite a (hidden) tests/ change. The helper returns
+    # the already-excluded diff strings, so they compare equal.
+    non_test_diff = "diff --git a/src/foo.py b/src/foo.py\n@@ -1 +1 @@\n-x\n+y\n"
+    captured_sha: list[str] = []
+
+    def fake_diff(self, sha):
+        captured_sha.append(sha)
+        return non_test_diff
+
+    monkeypatch.setattr(Soldier, "_diff_against_merge_base", fake_diff)
+
+    merges: list[tuple[str, str]] = []
+
+    def fake_attempt_merge(self, task):
+        merges.append((task["id"], task["current_attempt"]))
+        return MergeResult.MERGED
+
+    monkeypatch.setattr(Soldier, "attempt_merge", fake_attempt_merge)
+
+    results = soldier.run_once_with_review()
+    assert results == [("task-p3-tests", MergeResult.MERGED)]
+    assert merges == [("task-p3-tests", new_attempt_id)]
+    # Helper was invoked for both old and new attempt SHAs.
+    assert old_sha in captured_sha
+    assert new_sha in captured_sha
+
+    parent_after = backend.get_task("task-p3-tests")
+    for a in parent_after["attempts"]:
+        if a["attempt_id"] == new_attempt_id:
+            v = a.get("review_verdict")
+            assert v is not None and v.get("verdict") == "pass"
+
+
+def test_p3_git_failure_falls_through_safely(tmp_path, monkeypatch):
+    """Any subprocess failure in the diff check → safe fall-through to
+    rereview. No exception bubbles out of run_once_with_review."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+
+    _, new_attempt_id = _setup_rebase_reharvest_state(
+        backend,
+        "task-p3-gitfail",
+        old_sha=old_sha,
+        new_sha=new_sha,
+        prior_verdict=_pass_verdict(old_sha),
+    )
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+
+    class _FakeCompleted:
+        def __init__(self, returncode=1, stdout="", stderr="boom"):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_subprocess_run(*args, **kwargs):
+        # Only intercept git merge-base / git diff calls from the P3 helper.
+        cmd = args[0] if args else kwargs.get("args", [])
+        if isinstance(cmd, list) and len(cmd) >= 2 and cmd[0] == "git" and cmd[1] in (
+            "merge-base",
+            "diff",
+        ):
+            return _FakeCompleted(returncode=128, stderr="fatal: bad object")
+        # Fallback: raise to ensure nothing else unexpectedly shells out.
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+
+    monkeypatch.setattr(soldier_module.subprocess, "run", fake_subprocess_run)
+
+    def fail_attempt_merge(self, task):  # pragma: no cover - sanity guard
+        raise AssertionError("attempt_merge must NOT run when git fails")
+
+    monkeypatch.setattr(Soldier, "attempt_merge", fail_attempt_merge)
+
+    results = soldier.run_once_with_review()
+    # Safe default: treat like any other stale-sha → re-ready the review.
+    assert results == [("task-p3-gitfail", MergeResult.NEEDS_REVIEW)]
+
+    review_after = backend.get_task("review-task-p3-gitfail")
+    assert review_after["status"] == "ready"
+
+    parent_after = backend.get_task("task-p3-gitfail")
+    for a in parent_after["attempts"]:
+        if a["attempt_id"] == new_attempt_id:
+            assert a.get("review_verdict") is None
+
+
+def test_p3_carry_forward_is_idempotent(tmp_path, monkeypatch):
+    """Re-entering run_once_with_review after a carry-forward is a no-op
+    on the stale-SHA path: the new attempt already has the verdict stored,
+    so the second tick hits the ``verdict_dict is not None`` branch and
+    attempt_merge is called at most once per tick."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+
+    _, new_attempt_id = _setup_rebase_reharvest_state(
+        backend,
+        "task-p3-idem",
+        old_sha=old_sha,
+        new_sha=new_sha,
+        prior_verdict=_pass_verdict(old_sha),
+    )
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    monkeypatch.setattr(
+        Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: True
+    )
+
+    merge_calls: list[str] = []
+
+    def fake_attempt_merge(self, task):
+        merge_calls.append(task["current_attempt"])
+        # First tick: succeed and mark merged.
+        return MergeResult.MERGED
+
+    monkeypatch.setattr(Soldier, "attempt_merge", fake_attempt_merge)
+
+    diff_helper_calls: list[str] = []
+    real_diff_eq = Soldier._diffs_equivalent_after_rebase
+
+    def counting_diff_eq(self, task, existing, current):
+        diff_helper_calls.append(current)
+        return real_diff_eq(self, task, existing, current)
+
+    monkeypatch.setattr(Soldier, "_diffs_equivalent_after_rebase", counting_diff_eq)
+
+    results1 = soldier.run_once_with_review()
+    assert results1 == [("task-p3-idem", MergeResult.MERGED)]
+    assert merge_calls == [new_attempt_id]
+    # Helper was consulted exactly once during the carry-forward.
+    assert len(diff_helper_calls) == 1
+
+    # Second tick: parent now has a merged current attempt → not in queue.
+    results2 = soldier.run_once_with_review()
+    assert results2 == []
+    # attempt_merge must not be called a second time for this task.
+    assert merge_calls == [new_attempt_id]
