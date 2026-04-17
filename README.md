@@ -148,7 +148,7 @@ A spec file is a Markdown document describing the change you want: goal, accepta
                                  │ forage (HTTP, any node, any task type)
          ┌───────────────────────┼─────────────────────────┐
          ▼                       ▼                         ▼
-  ┌── node-1 (mini-1) ──┐ ┌── node-1 (mini-1) ──┐ ┌── node-2 (mini-2) ──┐
+  ┌ node-1 (mac-mini-1) ┐ ┌ node-1 (mac-mini-1) ┐ ┌ node-2 (mac-mini-2) ┐
   │       Builder       │ │       Builder       │ │      Reviewer       │
   │     claude-code     │ │        codex        │ │     claude-code     │
   │    worktree → PR    │ │    worktree → PR    │ │    reads PR diff    │
