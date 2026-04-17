@@ -42,6 +42,7 @@ RETRY_POLICIES: dict[FailureType, dict] = {
     FailureType.BUILD_FAILURE: {"retryable": True, "max_retries": 1, "action": "retry"},
     FailureType.MERGE_CONFLICT: {"retryable": True, "max_retries": 1, "action": "retry"},
     FailureType.INVALID_TASK: {"retryable": False, "max_retries": 0, "action": "escalate"},
+    FailureType.SILENT_FAILURE: {"retryable": False, "max_retries": 0, "action": "escalate"},
 }
 
 
@@ -52,6 +53,12 @@ def classify_failure(returncode: int, stderr: str, stdout: str) -> FailureType:
     come before test checks to prevent generic markers like 'error' or
     'failed' from triggering false test-failure classifications.
     """
+    # 0. Silent failure — returncode 0 but no output at all. Indicates a
+    # misconfigured agent (e.g., missing agent definition, adapter misconfig)
+    # that exits cleanly without doing any work.
+    if returncode == 0 and not stdout.strip() and not stderr.strip():
+        return FailureType.SILENT_FAILURE
+
     combined = (stderr + stdout).lower()
 
     # 1. Timeout (highest priority — clear signal)
@@ -347,13 +354,35 @@ class WorkerRuntime:
         finally:
             self._stop_heartbeat_loop()
 
-        if result.returncode != 0:
-            with contextlib.suppress(Exception):
-                self.colony.trail(
+        is_silent = (
+            result.returncode == 0
+            and not result.stdout.strip()
+            and not result.stderr.strip()
+        )
+
+        if result.returncode != 0 or is_silent:
+            if is_silent:
+                logger.warning(
+                    "silent agent failure detected task_id=%s attempt_id=%s "
+                    "worker_id=%s — returncode=0 with empty stdout+stderr",
                     task_id,
+                    attempt_id,
                     self.worker_id,
-                    f"agent failed (exit {result.returncode})",
                 )
+                with contextlib.suppress(Exception):
+                    self.colony.trail(
+                        task_id,
+                        self.worker_id,
+                        "silent_failure: agent exited 0 with empty stdout+stderr "
+                        "— likely missing agent definition or adapter misconfiguration",
+                    )
+            else:
+                with contextlib.suppress(Exception):
+                    self.colony.trail(
+                        task_id,
+                        self.worker_id,
+                        f"agent failed (exit {result.returncode})",
+                    )
             # Agent failed — classify, record, and trail the failure.
             failure = build_failure_record(
                 task_id=task_id,

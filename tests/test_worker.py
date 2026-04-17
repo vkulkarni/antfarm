@@ -1341,3 +1341,100 @@ def test_reviewer_polls_unchanged(tmp_path, http_client):
 
     # max_idle_polls=10 → one initial attempt + 10 retries = 11 forage calls
     assert call_count[0] == 11
+
+
+# ---------------------------------------------------------------------------
+# #193: Silent agent failure detection (returncode=0 + empty stdout + empty stderr)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_failure_silent_on_empty_output():
+    """returncode 0 with empty stdout AND stderr is classified as SILENT_FAILURE."""
+    from antfarm.core.worker import classify_failure
+
+    assert classify_failure(returncode=0, stderr="", stdout="") == FailureType.SILENT_FAILURE
+    # Whitespace-only counts as empty
+    assert classify_failure(returncode=0, stderr="\n", stdout="  ") == FailureType.SILENT_FAILURE
+    # Regression: returncode 0 with real stdout is NOT silent
+    assert classify_failure(returncode=0, stderr="", stdout="done") != FailureType.SILENT_FAILURE
+
+
+def test_build_failure_record_silent():
+    """Silent classification is non-retryable and escalates."""
+    from antfarm.core.worker import build_failure_record, get_retry_policy
+
+    rec = build_failure_record(
+        task_id="t1", attempt_id="a1", worker_id="w1",
+        returncode=0, stderr="", stdout="",
+    )
+    assert rec.failure_type == FailureType.SILENT_FAILURE
+    assert rec.retryable is False
+    assert rec.recommended_action == "escalate"
+
+    policy = get_retry_policy(FailureType.SILENT_FAILURE)
+    assert policy["retryable"] is False
+    assert policy["action"] == "escalate"
+
+
+def _silent_agent(task, workspace) -> AgentResult:
+    """Monkeypatch: simulates a silently-failing agent (exit 0, no output)."""
+    branch = f"feat/{task['id']}-{task['current_attempt']}"
+    return AgentResult(returncode=0, stdout="", stderr="", branch=branch)
+
+
+def test_process_one_task_silent_failure_trails_warning(tc, runtime):
+    """Silent agent failure emits a human-readable trail warning and FAILURE_RECORD,
+    and does NOT harvest the task."""
+    _carry(tc, task_id="task-silent-001")
+
+    runtime._launch_agent = _silent_agent
+    # Sentinel to confirm harvest is never called on silent failure
+    harvest_called = []
+    original_harvest = runtime.colony.harvest
+
+    def tracking_harvest(*args, **kwargs):
+        harvest_called.append((args, kwargs))
+        return original_harvest(*args, **kwargs)
+
+    runtime.colony.harvest = tracking_harvest
+    runtime.run()
+
+    r = tc.get("/tasks/task-silent-001")
+    task = r.json()
+    messages = [e["message"] for e in task["trail"]]
+
+    # Human-readable warning present
+    assert any(
+        "silent_failure" in m or "empty stdout" in m
+        for m in messages
+    ), f"expected silent_failure trail entry, got: {messages}"
+    # Structured FAILURE_RECORD emitted
+    assert any("[FAILURE_RECORD]" in m for m in messages)
+    # Harvest was NOT called — silent failure takes the failure branch
+    assert harvest_called == []
+
+
+def test_process_one_task_empty_stdout_with_stderr_not_silent(tc, runtime):
+    """Regression: returncode=0 with empty stdout but non-empty stderr is NOT silent —
+    it takes the normal success path."""
+    _carry(tc, task_id="task-warn-001")
+
+    def warning_agent(task, workspace) -> AgentResult:
+        branch = f"feat/{task['id']}-{task['current_attempt']}"
+        return AgentResult(returncode=0, stdout="", stderr="some warning", branch=branch)
+
+    runtime._launch_agent = warning_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+    runtime.run()
+
+    r = tc.get("/tasks/task-warn-001")
+    task = r.json()
+    messages = [e["message"] for e in task["trail"]]
+
+    # Success path — no silent_failure trail
+    assert not any("silent_failure" in m for m in messages)
+    # No FAILURE_RECORD for a success
+    assert not any("[FAILURE_RECORD]" in m for m in messages)
+    # Success trail entries appear
+    assert "agent completed, building artifact" in messages
