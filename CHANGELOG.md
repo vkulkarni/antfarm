@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ### Changed
 - Colony identity is now a persisted UUID stored as `colony_id` in `{data_dir}/config.json`. Tmux session prefixes (`auto-<hash>-*`, `runner-<hash>-*`) derive from this UUID via the new `colony_session_hash()`, making identity stable across `mv`, NFS, and Docker bind-mounts. `colony_hash()` remains as a pure hashing primitive (used by `deploy.py`). **Breaking:** first startup after upgrade generates a new UUID; pre-upgrade tmux sessions use the old realpath-based hash and become orphans — run `antfarm doctor --sweep-legacy-tmux` after draining in-flight work. See UPGRADE.md for the escape hatch to preserve an old hash. (#238)
 
+## [0.6.5] - 2026-04-17
+
+### Fixed
+- TUI: plan/review infra tasks no longer inflate the Merge Ready panel or the Pipeline progress bar — classification now delegates to the canonical `is_infra_task()` helper used by the Soldier. (#267)
+- Soldier: reconcile externally-merged PRs by polling `gh pr view` before attempting a local merge, unblocking downstream dependents when operators merge on GitHub directly. Fail-safe on errors (falls through to normal merge path). (#264)
+
+### Added
+- `antfarm mark-merged <task_id> --attempt-id <att>` CLI: operator escape hatch to mark an attempt as MERGED when a PR was merged outside Antfarm and auto-reconciliation is unavailable. (#264)
+
 ## [0.6.4] - 2026-04-16
 
 ### Added
