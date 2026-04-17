@@ -1,337 +1,194 @@
-<h1 align="center">🐜 ANTFARM</h1>
-<p align="center"><b>Lightweight orchestration for AI coding agents across machines.</b></p>
+# antfarm
 
-Antfarm is a thin, self-hosted coordination layer that lets you distribute coding work across multiple machines running any AI coding agent — Claude Code, Codex, Aider, Cursor, or anything that can run a shell command.
+*Self-hosted coordinator for parallel AI coding agents. Deterministic merges.*
 
-One machine hosts the colony. Workers connect, claim tasks, build, and open PRs. An integrator merges them safely. That's it.
-
-> **Status:** **v0.5.0** — Full autonomous loop: carry, build, review, merge. Memory, conflict prevention, and AI-assisted planning.
+v0.6.7 · Python 3.12+ · MIT
 
 ---
 
-## Why Antfarm?
+Not a framework. Not AGI. Not a cloud service.
 
-You have 2-5 machines. You have an AI coding subscription. You want them all working on your project in parallel.
+A self-hosted coordinator that fans coding tasks across multiple AI agent sessions — on one machine or many — and merges the results through a deterministic gate.
 
-Today, you manually manage each session — SSH in, start the agent, remember what each one is doing, hope they don't conflict, resolve merge hell yourself.
-
-Antfarm gives you:
-
-- **A task queue** — carry work to the colony, workers claim it automatically
-- **Scope-aware scheduling** — avoids assigning overlapping work to different workers
-- **Progress visibility** — see what every worker is doing across every machine
-- **A merge queue** — an integrator that safely merges concurrent changes, resolves trivial conflicts, and escalates real ones
-- **Automated code review** — Soldier creates review tasks, reviewer workers produce verdicts, merge gates on pass + fresh SHA
-- **Repo memory** — learns from outcomes, tracks hotspots, improves scheduling over time
-- **Conflict prevention** — overlap warnings, hotspot-aware scheduling, conflict risk scoring
-- **AI-assisted planning** — decompose specs into tasks with dependencies and scope hints
-- **Failure recovery** — classified failure types, retry policies, stale task recovery
-
-### What Antfarm is not
-
-- Not a framework — it's infrastructure. Bring your own workflow.
-- Not an agent — it doesn't write code. Your AI agents do.
-- Not a cloud service — it runs on your machines, your network, your git.
-- Not magic — it coordinates and integrates; your agents still do the coding.
+Closest neighbor is tmux-orchestrator; unlike CrewAI or AutoGen, antfarm is not a meta-agent framework — the agents are real Claude Code (or Codex/Aider) sessions.
 
 ---
 
-## Key Concepts
-
-| Concept | What it is | Command |
-|---------|-----------|---------|
-| **Colony** | The coordination server — task queue, scheduler, merge queue. One per project. | `antfarm colony` |
-| **Node** | One machine. Registers once. | `antfarm join` |
-| **Worker** | One AI agent session. A node can run many workers. | `antfarm worker start` |
-| **Soldier** | A special worker that merges PRs safely into the integration branch. | `antfarm worker start --agent soldier` |
-| **Carry** | Add a task to the colony's queue. | `antfarm carry` |
-| **Forage** | Claim the next available task. | `antfarm forage` |
-| **Trail** | Progress breadcrumbs left by a worker. | `antfarm trail` |
-| **Harvest** | Mark a task complete — PR is ready. | `antfarm harvest` |
-| **Scout** | See what every worker is doing. | `antfarm scout` |
-| **Guard** | Lock a shared resource (e.g., DB migrations). | `antfarm guard` |
-| **Hatch** | Register a worker without starting the full lifecycle. | `antfarm hatch` |
-
-**Relationship:** Colony → many Nodes → many Workers per Node.
+## What it looks like
 
 ```
-Colony
-├── Node: node-1
-│   ├── Worker: node-1/claude-1    (Claude Code session)
-│   ├── Worker: node-1/codex-1     (Codex session)
-│   └── Worker: node-1/claude-2    (another Claude Code session)
-├── Node: node-2
-│   └── Worker: node-2/claude-1
-└── Node: node-3
-    └── Worker: node-3/aider-1
+$ antfarm colony --autoscaler --max-builders 3 --max-reviewers 1 &
+[colony] listening on :7433  data_dir=.antfarm  colony=a4f2c1e8
+[colony] queen: enabled   soldier: enabled   doctor: enabled   autoscaler: enabled
+
+$ antfarm mission create --spec specs/add-rate-limiter.md
+Mission created: {"mission_id": "add-rate-limiter-7f2", "status": "PLANNING"}
+
+$ antfarm scout --watch
+14:02:11  queen       planning mission add-rate-limiter-7f2
+14:02:34  queen       plan ready: 4 tasks, 1 dep edge
+14:02:34  autoscaler  scaling builders 0 -> 3
+14:02:41  worker      node-1/builder-1 claimed task-001 (token bucket)
+14:02:41  worker      node-1/builder-2 claimed task-002 (config schema)
+14:02:42  worker      node-1/builder-3 claimed task-003 (middleware wiring)
+14:08:19  worker      node-1/builder-2 harvested task-002  PR #412
+14:08:22  soldier     merge_attempted  task-002
+14:08:34  soldier     merged           task-002 -> main
+14:11:47  worker      node-1/builder-1 harvested task-001  PR #411
+14:11:49  autoscaler  scaling reviewers 0 -> 1
+14:11:52  worker      node-1/reviewer-1 claimed review-001
+14:13:05  worker      node-1/reviewer-1 verdict: needs_changes (2 comments)
+14:13:05  soldier     merge_skipped    task-001  reason=needs_changes
+14:13:06  soldier     kickback         task-001 -> ready
+14:13:08  worker      node-1/builder-1 claimed task-001 (attempt 2)
+14:16:41  worker      node-1/builder-1 harvested task-001  PR #411 (force-pushed)
+14:16:43  worker      node-1/reviewer-1 verdict: pass (rebased, diff identical)
+14:16:43  soldier     merged           task-001 -> main
+14:19:02  worker      node-1/builder-3 harvested task-003  PR #413
+14:19:14  soldier     merged           task-003 -> main
+14:19:14  queen       mission add-rate-limiter-7f2 complete (4/4 merged)
 ```
+
+No manual intervention between `mission create` and `mission complete`. The kickback at 14:13 is the Soldier refusing to merge a reviewer `needs_changes`; the builder re-tries attempt 2.
+
+<!-- asciicast: record after rewrite lands, link here -->
 
 ---
 
-## How It Works
+## Who this is for / who it isn't
 
-```
-You carry tasks → Colony queues them → Workers claim and build → Integrator merges safely
+Check yourself against the lists.
 
-┌─────────────────────────────────────────────────────┐
-│              Colony (lead machine)                   │
-│                                                     │
-│  antfarm colony (:7433)                             │
-│  Task queue · Scheduler · Merge queue               │
-│                                                     │
-│  Worker: node-1/claude-1 (also does work)           │
-│  Integrator: node-1/soldier                         │
-│                                                     │
-└──────────────────┬──────────────────────────────────┘
-                   │ HTTP + JSON over private network
-         ┌─────────┼─────────┐
-         ▼                   ▼
-   Node: node-2          Node: node-3
-   Worker: claude-1      Worker: aider-1
-   Worker: codex-1
-```
+**Built for you if:**
+- You have one or more Claude Code / Codex / Aider subscriptions
+- You write specs before code
+- You are OK running a long-lived process on a trusted network
+- You want merges gated by tests, not vibes
 
-### The flow
-
-1. **You carry tasks** — manually, via `antfarm plan`, or from a spec file
-2. **Workers claim tasks** — each worker runs `antfarm worker start`, which registers, claims the next available task, and launches your AI agent
-3. **Workers build** — they branch from the integration branch, implement, test, and harvest
-4. **Reviewer workers review** — the Soldier creates review tasks, reviewer workers produce ReviewVerdicts
-5. **Integrator merges** — merges to a temp branch, runs tests, fast-forwards if green + review passed, kicks back if red
-6. **You ship** — merge the integration branch to main when ready
+**Not for you if:**
+- You want one agent to "just figure it out"
+- You need enterprise auth / SSO (v0.6.x is unauthenticated — private networks only)
+- You want a hosted SaaS
+- You want something that writes code without you writing a spec
 
 ---
 
-## Quick Start
+## Pipeline
+
+```
+spec → Queen (plans) → Builders (code) → Reviewer (verdict) → Soldier (merge gate) → integration branch
+                                                                   ↑
+                                                       Autoscaler sizes the pools
+```
+
+- **Queen** decomposes a spec into a task graph with dependencies.
+- **Builder** claims a task, codes in an isolated worktree, opens a PR.
+- **Reviewer** reads the PR diff and returns pass or needs_changes.
+- **Soldier** rebases, runs tests, fast-forwards or kicks back. Deterministic — no AI in the gate.
+- **Autoscaler** adjusts builder and reviewer pool size to queue depth.
+
+---
+
+## Install and run one mission
 
 ```bash
-# Clone and install (not yet on PyPI)
-git clone https://github.com/antfarm-ai/antfarm.git
-cd antfarm
-pip install -e .
+git clone https://github.com/antfarm-ai/antfarm
+cd antfarm && pip install -e .
+cd /path/to/your/repo
+antfarm doctor                      # pre-flight
+antfarm colony --autoscaler &       # queen, soldier, doctor, autoscaler all in-process
+antfarm mission create --spec specs/my-feature.md
+antfarm scout --tui                 # or: scout --watch for raw event feed
 ```
 
-### On the lead machine
-
-```bash
-# Start the colony
-antfarm colony
-
-# Register this machine
-antfarm join --node node-1
-
-# Carry some tasks to the queue
-antfarm carry --title "Build auth API" \
-             --spec "JWT endpoints: login, logout, /me" \
-             --touches "api,auth,db"
-
-antfarm carry --title "Build user dashboard" \
-             --spec "React page showing user profile and settings" \
-             --touches "frontend"
-
-# Start a worker
-antfarm worker start --agent claude-code --node node-1
-```
-
-### On other machines
-
-```bash
-export ANTFARM_URL=http://node-1:7433
-
-antfarm join --node node-2
-antfarm worker start --agent claude-code --node node-2
-
-# Or run a different agent
-antfarm worker start --agent codex --name codex-1 --node node-2
-```
-
-### Watch the colony
-
-```bash
-antfarm scout
-
-Nodes: 2 online    Workers: 3 active    Tasks: 1 active, 1 ready, 0 done
-
-┌───────────────────┬────────┬─────────────────────┬────────┬──────────┐
-│ Worker            │ Agent  │ Task                │ Status │ Trail    │
-├───────────────────┼────────┼─────────────────────┼────────┼──────────┤
-│ node-1/claude-1   │ claude │ Build auth API      │ active │ 2m ago   │
-│ node-2/claude-1   │ claude │ Build user dashboard│ active │ 30s ago  │
-│ node-2/codex-1    │ codex  │ (idle)              │ idle   │ —        │
-└───────────────────┴────────┴─────────────────────┴────────┴──────────┘
-```
+A spec file is a Markdown document describing the change you want: goal, acceptance criteria, files or modules likely touched. The Queen reads it and produces the task graph. Agent-specific adapters and hook scripts live under [antfarm/adapters/](antfarm/adapters/).
 
 ---
 
-## Agent Support
+## FAQ
 
-Antfarm is designed to work with any AI coding agent that can run shell commands. Workers register with the colony and report via HTTP — if your agent can call `curl`, it can be an Antfarm worker.
+**What does this cost?** Your Claude Max subscription or API usage. Antfarm itself is MIT, no telemetry, no hosted component.
 
-| Agent | Integration | Status |
-|-------|-------------|--------|
-| Claude Code | Agent definitions + hooks | Shipped |
-| Generic (curl) | Shell scripts | Shipped |
-| Codex | CLI wrapper | Planned |
-| Aider | CLI wrapper | Planned |
-| Cursor | Extension | Future |
+**Can I use non-Claude agents?** Shipped: Claude Code reference adapter, Codex, Aider, and a generic curl adapter. Claude Code is the most polished; the others are functional but less exercised.
 
----
+**Do I need more than one machine?** No. The default dev loop runs on a single machine — the autoscaler spawns worker sessions in local tmux panes. Multi-machine is opt-in via `--multi-node`.
 
-## Task Backends
+**What happens on a merge conflict?** The Soldier tries a deterministic rebase and `--force-with-lease` push. Genuine conflicts are kicked back to the builder for a new attempt. The gate never invokes an AI to resolve conflicts.
 
-The backend is pluggable. Antfarm ships a clean `TaskBackend` interface — community can add any task system.
+**Auth?** None in v0.6.x. An optional bearer token is available on the colony HTTP API, but the threat model assumes a trusted private network — run it behind Tailscale, WireGuard, or an SSH tunnel.
 
-| Backend | Status | Notes |
-|---------|--------|-------|
-| **File** (default) | v0.1 | Zero dependencies. Local filesystem. |
-| **Redis** | Planned (v0.2) | Real-time events, blocking pulls, TTL-based presence |
-| **GitHub Issues** | Future | Sync tasks from GitHub Issues |
-| **Jira** | Future | Enterprise task backend |
+**How is this different from tmux-orchestrator?** tmux-orchestrator is single-machine and human-in-the-loop. Antfarm adds mission planning, a deterministic merge gate, autoscaling, multi-machine coordination, and SSE event streams.
 
----
+**What if a worker hangs or crashes?** The Doctor classifies stuck workers and the `--fix` flag recovers them. The autoscaler respawns the pool.
 
-## The Integrator
-
-This is Antfarm's core value. Most multi-agent systems fail at integration — three agents independently produce working code that breaks when combined.
-
-The Integrator (Soldier) is a **deterministic merge gate** — no AI, no LLM. Like CI, it doesn't fix your code; it tells you what's broken. Workers handle the fixes and re-submit.
-
-```
-PR arrives from worker
-  │
-  ├── Merge to temp integration branch (never directly to dev)
-  │
-  ├── Merge conflict? → Kick back to worker
-  │
-  ├── Run full test suite
-  │
-  ├── Green? → Fast-forward integration branch
-  │
-  └── Tests fail? → Kick back to worker with test output
-```
-
-The Integrator respects task dependencies — it won't merge task B until task A is merged, even if B finished first.
-
----
-
-## Networking
-
-Antfarm requires private network connectivity between workers and the colony. It uses HTTP + JSON — debuggable with `curl`, compatible with everything.
-
-| Setup | Works? |
-|-------|--------|
-| Same LAN | Yes |
-| Tailscale (recommended) | Yes |
-| WireGuard / VPN | Yes |
-| SSH tunnel | Yes |
-| Cloud VPC | Yes |
-| Same machine | Yes |
-
-**Tailscale is recommended** because it handles NAT, gives stable hostnames, and works across networks. But any private path works.
-
----
-
-## Multiple Workers Per Machine
-
-A machine with enough RAM can run multiple workers. Each worker is an independent session:
-
-```bash
-# Two Claude Code workers on node-1
-antfarm worker start --agent claude-code --name claude-1
-antfarm worker start --agent claude-code --name claude-2
-
-# Mixed agents on node-2 (e.g., Mac Mini)
-antfarm worker start --agent claude-code --name claude-1
-antfarm worker start --agent codex --name codex-1
-```
-
-Each worker must use a separate git worktree or clone. Antfarm does not share workspaces.
-
----
-
-## Design Principles
-
-1. **Coordination layer, not a framework.** Antfarm manages tasks and merges. Your agents write code.
-2. **Agent-compatible.** Baseline compatibility for any agent; deeper integration via adapters.
-3. **Explicit registration.** Antfarm only knows workers that register. No process scanning, no magic discovery.
-4. **Integration safety is the core value.** The hard problem is safely merging concurrent AI-generated changes.
-5. **Git is the source of truth.** Antfarm adds a thin layer above git — tasks, presence, guards. Code lives in git.
-6. **Pluggable backends.** File by default. Redis, GitHub Issues, Jira via plugins.
-7. **No mandatory infrastructure.** No cloud services, no paid subscriptions, no vendor lock-in.
-
----
-
-## Requirements
-
-- Python 3.12+
-- Git
-- Any AI coding agent
-- Any git remote (GitHub, GitLab, Gitea, etc.)
-- Private network between machines (Tailscale recommended)
+**Does it commit to main directly?** No. The Soldier merges to a configurable integration branch — point it at your `develop` (or equivalent) branch, not `main`.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                antfarm (core)                   │
-│                                                 │
-│  Colony server · Scheduler · Merge queue        │
-│  Memory · Conflict prevention · Planner         │
-│  Review orchestration · Failure taxonomy        │
-│                                                 │
-├─────────────────────────────────────────────────┤
-│                 adapters                        │
-│                                                 │
-│  Claude Code (worker + reviewer) · Codex        │
-│  Generic (curl) · Aider (planned)              │
-│                                                 │
-├─────────────────────────────────────────────────┤
-│                 backends                        │
-│                                                 │
-│  File (default) · GitHub Issues                 │
-└─────────────────────────────────────────────────┘
+                  ┌─────────────────────────────────────┐
+                  │          colony (HTTP API)          │
+                  │   queen · soldier · doctor · autoscaler
+                  └──────────────┬──────────────────────┘
+                                 │
+                ┌────────────────┼───────────────────┐
+                │                │                   │
+          FileBackend      Runner(s)            Worker pool
+          (.antfarm/)      (tmux panes)         builders + reviewers
+                                                     │
+                                                  adapters
+                                          (claude-code / codex / aider)
 ```
 
----
+- **Colony server** — FastAPI process that holds the task queue and runs the in-process daemons.
+- **Queen** — mission planner: spec → task graph.
+- **Soldier** — deterministic merge gate: rebase, test, fast-forward or kickback.
+- **Autoscaler** — sizes builder and reviewer pools against queue depth.
+- **Runner** — launches worker sessions (tmux locally, SSH + tmux for multi-node).
+- **Doctor** — pre-flight checks and stale-state recovery.
+- **Workers** — builder or reviewer sessions wrapping a coding agent.
+- **Adapters** — per-agent glue: prompts, hooks, heartbeat.
+- **FileBackend** — atomic JSON task store under `.antfarm/`.
 
-## Status
-
-**v0.5.0** — Full autonomous loop with review integration, repo memory, conflict prevention, and AI-assisted planning.
-
-### What's new in v0.5
-
-- **Review execution** — Soldier creates review tasks, reviewer workers produce verdicts, merge gates on pass + fresh SHA
-- **Repo memory** — tracks outcomes, hotspots, failure patterns, touch observations
-- **Conflict prevention** — overlap warnings at carry time, hotspot-aware scheduling
-- **AI-assisted planning** — `antfarm plan` decomposes specs into tasks with deps and scope hints
-- **Structured lifecycle** — enriched task/attempt states with transition validation
-- **Failure taxonomy** — classified failure types with retry policies
-- **Operator inbox** — surfaces stale workers, blocked tasks, hotspot overlaps
-
-See the project docs for details:
-
-- [SPEC.md](docs/SPEC.md) — v0.1 product and architecture spec
-- [SPEC_v05.md](docs/SPEC_v05.md) — v0.5 spec (review, memory, planning)
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — system architecture guide
-- [DEVELOPMENT.md](docs/DEVELOPMENT.md) — open-source development workflow
+Deeper reading: [docs/SPEC.md](docs/SPEC.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), [AGENTS.md](AGENTS.md).
 
 ---
 
-## License
+## CLI reference
 
-MIT. See [LICENSE](LICENSE) for details.
+| Command | Purpose | When |
+|---|---|---|
+| `antfarm colony` | Start the coordinator (plus queen/soldier/doctor/autoscaler) | Once per project, long-lived |
+| `antfarm mission create` | Submit a spec as a mission | Start of each feature |
+| `antfarm mission status` | Show mission progress and task states | Checking in |
+| `antfarm scout --tui` | Rich dashboard | Monitoring |
+| `antfarm scout --watch` | Raw SSE event feed | Debugging |
+| `antfarm doctor --fix` | Detect and repair stuck state | Before a run; after a crash |
+| `antfarm inbox` | Items needing operator attention | Daily triage |
+| `antfarm carry` | Add a single task manually | Outside the mission flow |
+| `antfarm worker start` | Start a worker by hand | Debugging a specific agent |
+| `antfarm memory show` | Inspect the repo memory store | Understanding scheduler bias |
+
+Full CLI: `antfarm --help` and `antfarm <command> --help`.
 
 ---
 
-## Contributing
+## Requirements
 
-Antfarm welcomes contributions. For early contributions, please open an issue before starting larger changes.
+- Python 3.12+
+- git
+- tmux (optional; recommended for the autoscaler)
+- an AI coding agent CLI installed locally (Claude Code, Codex, Aider, or a generic command)
+- private network between machines if running multi-node (Tailscale, WireGuard, SSH tunnel)
 
-The most impactful areas:
+---
 
-- **Testing** — real-world multi-machine workflows
-- **Docs** — setup guides for different network configurations
-- **Adapters** — Codex, Aider, Cursor (after core loop is proven)
-- **Backends** — Redis, GitHub Issues, Linear (after core loop is proven)
+## Status and license
+
+v0.6.7 is the efficiency pass on the v0.6 mission pipeline. CI-green on `main`. Breaking changes and upgrade notes live in [CHANGELOG.md](CHANGELOG.md) and [UPGRADE.md](UPGRADE.md).
+
+License: MIT.
+
+Contributing: see [AGENTS.md](AGENTS.md) for project conventions and the PR workflow.
