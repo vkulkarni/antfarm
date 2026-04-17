@@ -1064,7 +1064,11 @@ def deploy(
     integration_branch: str,
     colony_url: str,
 ):
-    """Deploy workers to remote nodes via SSH, or check deploy status."""
+    """Deploy workers to remote nodes via SSH, or check deploy status.
+
+    Session names are scoped by hash(realpath(config) | colony_url). See UPGRADE.md
+    for the full deploy identity model (shared vs isolated namespaces).
+    """
     from antfarm.core.deploy import deploy as run_deploy
     from antfarm.core.deploy import deploy_status
 

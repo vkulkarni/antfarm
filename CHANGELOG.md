@@ -7,6 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- Document deploy identity model in UPGRADE.md — how (realpath config + colony_url) hash determines session ownership, with examples of shared vs isolated namespaces and the localhost-tunnel edge case. (#244)
 - Per-worker current-action visibility: `POST /workers/{id}/activity`, TUI Activity column with elapsed time, and doctor `check_stuck_workers` warning for workers idle on an action > 5 min. (#239)
 - `antfarm doctor --sweep-legacy-tmux` flag (with `--yes`) to clean pre-#231/#235 tmux sessions host-wide. Requires interactive confirmation by default. (#237)
 - Colony startup now logs `colony hash: <8hex> (data_dir: <realpath>)` so operators can correlate tmux session names to a colony. (#237)
