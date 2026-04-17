@@ -32,6 +32,20 @@ from antfarm.core.review_pack import extract_verdict_from_review_task
 logger = logging.getLogger(__name__)
 
 
+def _emit(event_type: str, task_id: str, detail: str = "") -> None:
+    """Emit an SSE event tagged with actor='soldier'.
+
+    Lazy-imports ``_emit_event`` to avoid a circular import at module load
+    time (serve.py imports Soldier) and to keep soldier importable in
+    contexts where the FastAPI server module cannot be loaded.
+    """
+    try:
+        from antfarm.core.serve import _emit_event
+    except Exception:
+        return
+    _emit_event(event_type, task_id, detail, actor="soldier")
+
+
 class MergeResult(StrEnum):
     MERGED = "merged"
     FAILED = "failed"
@@ -389,10 +403,14 @@ class Soldier:
         Returns:
             MergeResult.MERGED on success, MergeResult.FAILED on any failure.
         """
+        task_id = task.get("id", "")
         branch = self._get_attempt_branch(task)
         if not branch:
             self.last_failure_reason = "no branch on current attempt"
+            _emit("merge_failed", task_id, self.last_failure_reason)
             return MergeResult.FAILED
+
+        _emit("merge_started", task_id, branch)
 
         temp_branch = "antfarm/temp-merge"
         try:
@@ -405,6 +423,7 @@ class Soldier:
             )
             if r.returncode != 0:
                 self.last_failure_reason = f"git fetch failed: {r.stderr.decode().strip()}"
+                _emit("merge_failed", task_id, self.last_failure_reason)
                 return MergeResult.FAILED
 
             # Create temp branch from integration branch
@@ -424,6 +443,7 @@ class Soldier:
                 self.last_failure_reason = (
                     f"could not create temp branch: {r.stderr.decode().strip()}"
                 )
+                _emit("merge_failed", task_id, self.last_failure_reason)
                 return MergeResult.FAILED
 
             # Merge task branch (no-ff to preserve history)
@@ -437,6 +457,7 @@ class Soldier:
                 self.last_failure_reason = (
                     f"merge conflict merging {branch}: {r.stderr.decode().strip()}"
                 )
+                _emit("merge_failed", task_id, self.last_failure_reason)
                 return MergeResult.FAILED
 
             # Run tests
@@ -450,6 +471,7 @@ class Soldier:
                 self.last_failure_reason = (
                     f"tests failed: {r.stdout.decode().strip()} {r.stderr.decode().strip()}"
                 ).strip()
+                _emit("merge_failed", task_id, self.last_failure_reason)
                 return MergeResult.FAILED
 
             # Fast-forward integration branch
@@ -463,6 +485,7 @@ class Soldier:
                 self.last_failure_reason = (
                     f"could not checkout {self.integration_branch}: {r.stderr.decode().strip()}"
                 )
+                _emit("merge_failed", task_id, self.last_failure_reason)
                 return MergeResult.FAILED
 
             r = subprocess.run(
@@ -473,6 +496,7 @@ class Soldier:
             )
             if r.returncode != 0:
                 self.last_failure_reason = f"ff-only merge failed: {r.stderr.decode().strip()}"
+                _emit("merge_failed", task_id, self.last_failure_reason)
                 return MergeResult.FAILED
 
             # Push to origin
@@ -484,8 +508,10 @@ class Soldier:
             )
             if r.returncode != 0:
                 self.last_failure_reason = f"push failed: {r.stderr.decode().strip()}"
+                _emit("merge_failed", task_id, self.last_failure_reason)
                 return MergeResult.FAILED
 
+            _emit("merge_succeeded", task_id, branch)
             return MergeResult.MERGED
 
         finally:
@@ -660,6 +686,7 @@ class Soldier:
         with contextlib.suppress(ValueError):
             self.colony.mark_merged(task_id, attempt_id)
         logger.info("reconciled externally-merged PR %s for %s", pr, task_id)
+        _emit("reconciled_external", task_id, f"pr={pr}")
         return True
 
     @staticmethod
