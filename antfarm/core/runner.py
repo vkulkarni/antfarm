@@ -28,6 +28,19 @@ from antfarm.core.process_manager import colony_session_hash, get_process_manage
 logger = logging.getLogger(__name__)
 
 
+def _emit(event_type: str, task_id: str, detail: str = "") -> None:
+    """Emit an SSE event tagged with actor='runner'.
+
+    Lazy import of ``_emit_event`` keeps runner decoupled from FastAPI
+    transitive imports at module load time.
+    """
+    try:
+        from antfarm.core.serve import _emit_event
+    except Exception:
+        return
+    _emit_event(event_type, task_id, detail, actor="runner")
+
+
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
@@ -362,17 +375,21 @@ class Runner:
                 role = mw.role
                 self._pm.cleanup(name)
                 del self.managed[name]
+                _emit("worker_died", "", f"role={role} name={name}")
                 # Only restart if still desired
                 if desired.get(role, 0) > self._count_role(role):
                     self._start_worker(role)
+                    _emit("worker_restarted", "", f"role={role} name={name}")
 
     def _cleanup_exited(self) -> None:
         """Remove managed workers whose processes have exited."""
         for name in list(self.managed):
             if not self._pm.is_alive(name):
+                role = self.managed[name].role
                 logger.info("runner cleaned up exited worker name=%s", name)
                 self._pm.cleanup(name)
                 del self.managed[name]
+                _emit("worker_died", "", f"role={role} name={name}")
 
     def _count_role(self, role: str) -> int:
         """Count alive managed workers of a given role."""
