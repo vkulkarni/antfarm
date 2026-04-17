@@ -370,3 +370,131 @@ class TestStalePidsDirSweep:
             patch("antfarm.core.colony_client.ColonyClient"),
         ):
             r.run()  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# Activity-feed events (#191)
+# ---------------------------------------------------------------------------
+
+
+def _drain_actor_events(actor: str) -> list[dict]:
+    """Return events for a given actor and reset the SSE bus."""
+    import antfarm.core.serve as serve_mod
+
+    events = [dict(e) for e in serve_mod._event_queue if e.get("actor") == actor]
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+    return events
+
+
+def _reset_event_bus() -> None:
+    import antfarm.core.serve as serve_mod
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+
+class TestActivityFeedEvents:
+    def test_cleanup_exited_emits_worker_died(self, tmp_path):
+        """Dead workers detected by _cleanup_exited emit worker_died with actor='runner'."""
+        from antfarm.core.runner import ManagedWorker
+
+        _reset_event_bus()
+        r = _make_runner(tmp_path)
+        pm = _mock_pm()
+        # "dead" exited; "alive" still alive
+        pm.is_alive.side_effect = lambda name: name != "dead-builder-1"
+        r._pm = pm
+        r.managed["dead-builder-1"] = ManagedWorker(
+            name="dead-builder-1", role="builder"
+        )
+        r.managed["alive-reviewer-1"] = ManagedWorker(
+            name="alive-reviewer-1", role="reviewer"
+        )
+
+        r._cleanup_exited()
+
+        events = _drain_actor_events("runner")
+        died = [e for e in events if e["type"] == "worker_died"]
+        assert len(died) == 1
+        assert died[0]["actor"] == "runner"
+        assert "role=builder" in died[0]["detail"]
+        assert "name=dead-builder-1" in died[0]["detail"]
+
+    def test_restart_crashed_emits_worker_died_and_restarted(self, tmp_path):
+        """_restart_crashed emits worker_died and worker_restarted when desired."""
+        from antfarm.core.runner import ManagedWorker
+
+        _reset_event_bus()
+        r = _make_runner(tmp_path)
+        pm = _mock_pm()
+        # The crashed worker reads as not alive; everything else is alive.
+        pm.is_alive.side_effect = lambda name: name != "crashed-builder-1"
+        r._pm = pm
+        r.managed["crashed-builder-1"] = ManagedWorker(
+            name="crashed-builder-1", role="builder"
+        )
+        # Desire one builder so the restart path runs
+        r._desired = DesiredState(generation=1, desired={"builder": 1})
+
+        r._restart_crashed()
+
+        events = _drain_actor_events("runner")
+        died = [e for e in events if e["type"] == "worker_died"]
+        restarted = [e for e in events if e["type"] == "worker_restarted"]
+
+        assert len(died) == 1
+        assert died[0]["actor"] == "runner"
+        assert "role=builder" in died[0]["detail"]
+        assert "name=crashed-builder-1" in died[0]["detail"]
+
+        assert len(restarted) == 1
+        assert restarted[0]["actor"] == "runner"
+        assert "role=builder" in restarted[0]["detail"]
+        # restarted detail names the *original* (dead) worker, not the new one
+        assert "name=crashed-builder-1" in restarted[0]["detail"]
+
+        # ProcessManager.start was called exactly once (the restart)
+        assert pm.start.call_count == 1
+
+    def test_restart_crashed_no_restart_event_when_not_desired(self, tmp_path):
+        """If role is no longer desired, only worker_died fires (no restart)."""
+        from antfarm.core.runner import ManagedWorker
+
+        _reset_event_bus()
+        r = _make_runner(tmp_path)
+        pm = _mock_pm()
+        pm.is_alive.side_effect = lambda name: name != "crashed-builder-1"
+        r._pm = pm
+        r.managed["crashed-builder-1"] = ManagedWorker(
+            name="crashed-builder-1", role="builder"
+        )
+        # Desire zero builders — restart should NOT fire
+        r._desired = DesiredState(generation=1, desired={"builder": 0})
+
+        r._restart_crashed()
+
+        events = _drain_actor_events("runner")
+        died = [e for e in events if e["type"] == "worker_died"]
+        restarted = [e for e in events if e["type"] == "worker_restarted"]
+
+        assert len(died) == 1
+        assert restarted == []
+        assert pm.start.call_count == 0
+
+    def test_cleanup_exited_no_event_when_all_alive(self, tmp_path):
+        """No worker_died events when every managed worker is still alive."""
+        from antfarm.core.runner import ManagedWorker
+
+        _reset_event_bus()
+        r = _make_runner(tmp_path)
+        pm = _mock_pm(alive=True)
+        r._pm = pm
+        r.managed["happy-builder-1"] = ManagedWorker(
+            name="happy-builder-1", role="builder"
+        )
+
+        r._cleanup_exited()
+
+        events = _drain_actor_events("runner")
+        assert [e for e in events if e["type"] == "worker_died"] == []

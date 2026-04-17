@@ -677,3 +677,101 @@ class TestAdoptExisting:
 
         assert a.managed == {}
         assert a._counter == 0
+
+
+# ---------------------------------------------------------------------------
+# Activity-feed events (#191)
+# ---------------------------------------------------------------------------
+
+
+def _drain_actor_events(actor: str) -> list[dict]:
+    """Return events for a given actor and reset the SSE bus."""
+    import antfarm.core.serve as serve_mod
+
+    events = [dict(e) for e in serve_mod._event_queue if e.get("actor") == actor]
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+    return events
+
+
+def _reset_event_bus() -> None:
+    import antfarm.core.serve as serve_mod
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+
+class TestActivityFeedEvents:
+    @patch("antfarm.core.autoscaler.os.makedirs")
+    def test_start_worker_emits_worker_spawned(self, _mock_makedirs):
+        _reset_event_bus()
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm)
+
+        a._start_worker("builder")
+
+        events = _drain_actor_events("autoscaler")
+        spawned = [e for e in events if e["type"] == "worker_spawned"]
+        assert len(spawned) == 1
+        assert spawned[0]["actor"] == "autoscaler"
+        assert "role=builder" in spawned[0]["detail"]
+        assert f"name={a._prefix}builder-1" in spawned[0]["detail"]
+
+    @patch("antfarm.core.autoscaler.os.makedirs")
+    def test_start_worker_no_event_when_start_fails(self, _mock_makedirs):
+        _reset_event_bus()
+        pm = _mock_pm()
+        pm.start.return_value = False  # both attempts fail
+
+        a = _make_autoscaler(_pm=pm)
+        a._start_worker("builder")
+
+        events = _drain_actor_events("autoscaler")
+        assert [e for e in events if e["type"] == "worker_spawned"] == []
+
+    def test_stop_idle_worker_emits_worker_retired(self):
+        _reset_event_bus()
+        pm = _mock_pm()
+        pm.is_alive.return_value = True
+
+        a = _make_autoscaler(_pm=pm, poll_interval=30.0)
+        a.managed["auto-builder-1"] = ManagedWorker(
+            name="auto-builder-1", role="builder", worker_id="local/auto-builder-1"
+        )
+        a.backend.list_workers.return_value = [
+            _worker(
+                "local/auto-builder-1",
+                status="idle",
+                last_heartbeat=_aged_hb(60),
+            ),
+        ]
+
+        stopped = a._stop_idle_worker("builder")
+        assert stopped is True
+
+        events = _drain_actor_events("autoscaler")
+        retired = [e for e in events if e["type"] == "worker_retired"]
+        assert len(retired) == 1
+        assert retired[0]["actor"] == "autoscaler"
+        assert "role=builder" in retired[0]["detail"]
+        assert "name=auto-builder-1" in retired[0]["detail"]
+
+    def test_stop_idle_worker_no_event_when_skipped(self):
+        _reset_event_bus()
+        pm = _mock_pm()
+        pm.is_alive.return_value = True
+
+        a = _make_autoscaler(_pm=pm, poll_interval=30.0)
+        a.managed["auto-builder-1"] = ManagedWorker(
+            name="auto-builder-1", role="builder", worker_id="local/auto-builder-1"
+        )
+        # Active (not idle) — skip
+        a.backend.list_workers.return_value = [
+            _worker("local/auto-builder-1", status="active"),
+        ]
+
+        stopped = a._stop_idle_worker("builder")
+        assert stopped is False
+
+        events = _drain_actor_events("autoscaler")
+        assert [e for e in events if e["type"] == "worker_retired"] == []

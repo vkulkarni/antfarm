@@ -35,6 +35,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _emit(event_type: str, task_id: str, detail: str = "") -> None:
+    """Emit an SSE event tagged with actor='autoscaler'.
+
+    Lazy import of ``_emit_event`` keeps autoscaler decoupled from FastAPI
+    transitive imports at module load time.
+    """
+    try:
+        from antfarm.core.serve import _emit_event
+    except Exception:
+        return
+    _emit_event(event_type, task_id, detail, actor="autoscaler")
+
+
 # ---------------------------------------------------------------------------
 # Standalone helpers — shared by Autoscaler and MultiNodeAutoscaler
 # ---------------------------------------------------------------------------
@@ -311,6 +324,7 @@ class Autoscaler:
             if self._pm.start(name, cmd, log_path, role=role):
                 self.managed[name] = ManagedWorker(name=name, role=role, worker_id=worker_id)
                 logger.info("autoscaler started worker name=%s role=%s", name, role)
+                _emit("worker_spawned", "", f"role={role} name={name}")
                 return
             if attempt == 0:
                 logger.info("start failed for %s, retrying with bumped counter", name)
@@ -356,6 +370,7 @@ class Autoscaler:
             self._pm.stop(name)
             logger.info("autoscaler stopped idle worker name=%s role=%s", name, role)
             del self.managed[name]
+            _emit("worker_retired", "", f"role={role} name={name}")
             return True
         return False
 
