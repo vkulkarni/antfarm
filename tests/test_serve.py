@@ -929,9 +929,8 @@ def test_startup_logs_colony_hash(tmp_path, caplog):
     assert not pre_start_matching, "colony hash log must not fire on get_app(), only on startup"
 
     # Startup fires when TestClient enters its context manager.
-    with caplog.at_level(logging.INFO, logger="antfarm.core.serve"):
-        with TestClient(app):
-            pass
+    with caplog.at_level(logging.INFO, logger="antfarm.core.serve"), TestClient(app):
+        pass
 
     expected_hash = colony_hash(data_dir)
     matching = [
@@ -939,7 +938,9 @@ def test_startup_logs_colony_hash(tmp_path, caplog):
         for r in caplog.records
         if "colony hash:" in r.getMessage() and expected_hash in r.getMessage()
     ]
-    assert matching, f"expected colony hash log on startup, got: {[r.getMessage() for r in caplog.records]}"
+    assert matching, (
+        f"expected colony hash log on startup, got: {[r.getMessage() for r in caplog.records]}"
+    )
     assert os.path.realpath(data_dir) in matching[0].getMessage()
 
 
@@ -956,4 +957,6 @@ def test_get_app_does_not_log_colony_hash(tmp_path, caplog):
         get_app(backend=backend, data_dir=data_dir)
 
     noisy = [r for r in caplog.records if "colony hash:" in r.getMessage()]
-    assert not noisy, f"get_app() must not log colony hash, but got: {[r.getMessage() for r in noisy]}"
+    assert not noisy, (
+        f"get_app() must not log colony hash, but got: {[r.getMessage() for r in noisy]}"
+    )
