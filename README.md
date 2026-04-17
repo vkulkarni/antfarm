@@ -1,6 +1,6 @@
 # antfarm
 
-*Self-hosted coordinator for parallel AI coding agents. Deterministic merges.*
+*Self-hosted coordinator for parallel AI coding agents.*
 
 v0.6.7 · Python 3.12+ · MIT
 
