@@ -24,6 +24,7 @@ import httpx
 
 from antfarm.core.colony_client import ColonyClient
 from antfarm.core.models import FailureRecord, FailureType
+from antfarm.core.serve import _emit_event
 from antfarm.core.workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -334,6 +335,9 @@ class WorkerRuntime:
         attempt_id = task["current_attempt"]
         self._last_task_id = task_id
         logger.info("task claimed task_id=%s attempt_id=%s", task_id, attempt_id)
+        _emit_event(
+            "task_claimed", task_id, task.get("title", ""), actor="worker"
+        )
 
         with contextlib.suppress(Exception):
             self.colony.trail(
@@ -342,12 +346,14 @@ class WorkerRuntime:
 
         workspace = self.workspace_mgr.create(task_id, attempt_id)
         logger.info("workspace created path=%s", workspace)
+        _emit_event("workspace_created", task_id, workspace, actor="worker")
 
         with contextlib.suppress(Exception):
             self.colony.trail(
                 task_id, self.worker_id, "workspace ready, launching agent"
             )
 
+        _emit_event("agent_launched", task_id, self.agent_type, actor="worker")
         self._start_heartbeat_loop()
         try:
             result = self._launch_agent(task, workspace)
