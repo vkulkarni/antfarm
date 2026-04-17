@@ -849,6 +849,69 @@ def test_sse_events_on_harvest(tmp_path):
     assert events[0]["task_id"] == "task-001"
 
 
+def test_emit_event_default_actor_is_colony():
+    """_emit_event defaults actor to 'colony' so legacy emitters keep working."""
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    serve_mod._emit_event("harvested", "task-001", "pr=pr-1 branch=feat/x")
+
+    assert len(serve_mod._event_queue) == 1
+    event = serve_mod._event_queue[0]
+    assert event["actor"] == "colony"
+    assert event["type"] == "harvested"
+    assert event["task_id"] == "task-001"
+
+
+def test_emit_event_custom_actor():
+    """_emit_event honors explicit actor argument."""
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    serve_mod._emit_event("x", "t", "d", actor="queen")
+
+    assert len(serve_mod._event_queue) == 1
+    event = serve_mod._event_queue[0]
+    assert event["actor"] == "queen"
+    assert event["type"] == "x"
+    assert event["task_id"] == "t"
+    assert event["detail"] == "d"
+
+
+def test_sse_payload_includes_actor(tmp_path):
+    """Events streamed via /events include the actor field."""
+    import json as json_mod
+
+    from antfarm.core.backends.file import FileBackend
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    _carry(client)
+    task = _forage(client).json()
+    attempt_id = task["current_attempt"]
+
+    client.post(
+        f"/tasks/{task['id']}/harvest",
+        json={"attempt_id": attempt_id, "pr": "pr-1", "branch": "feat/x"},
+    )
+
+    with client.stream("GET", "/events?after=0&timeout=2") as r:
+        assert r.status_code == 200
+        events = []
+        for line in r.iter_lines():
+            if line.startswith("data: "):
+                events.append(json_mod.loads(line[len("data: ") :]))
+
+    assert len(events) >= 1
+    assert "actor" in events[0]
+    assert events[0]["actor"] == "colony"
+
+
 # ---------------------------------------------------------------------------
 # Doctor daemon thread (#147)
 # ---------------------------------------------------------------------------
