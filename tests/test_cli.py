@@ -560,6 +560,35 @@ def test_cli_harvest_posts_pr():
         assert payload["pr"] == "https://github.com/org/repo/pull/42"
 
 
+def test_mark_merged_command():
+    """mark-merged POSTs to /tasks/{id}/merge with {'attempt_id': ...}."""
+    runner = CliRunner()
+
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mark-merged",
+                "task-001",
+                "--attempt-id",
+                "att-001",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        url = mock_post.call_args.args[0]
+        assert url.endswith("/tasks/task-001/merge")
+        payload = mock_post.call_args.kwargs.get("json")
+        assert payload == {"attempt_id": "att-001"}
+
+
 def test_cli_guard_acquires():
     """Guard POSTs to /guards/{resource}."""
     runner = CliRunner()
