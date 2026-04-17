@@ -22,7 +22,7 @@ $ antfarm colony --autoscaler --max-builders 3 --max-reviewers 1 &
 [colony] queen: enabled   soldier: enabled   doctor: enabled   autoscaler: enabled
 
 $ antfarm mission create --spec specs/add-rate-limiter.md
-Mission created: {"mission_id": "add-rate-limiter-7f2", "status": "PLANNING"}
+Mission created: {'mission_id': 'add-rate-limiter-7f2'}
 
 $ antfarm scout --watch
 14:02:11  queen       planning mission add-rate-limiter-7f2
@@ -121,7 +121,7 @@ A spec file is a Markdown document describing the change you want: goal, accepta
 
 **What if a worker hangs or crashes?** The Doctor classifies stuck workers and the `--fix` flag recovers them. The autoscaler respawns the pool.
 
-**Does it commit to main directly?** No. The Soldier merges to a configurable integration branch — point it at your `develop` (or equivalent) branch, not `main`.
+**Does it commit to main directly?** The Soldier merges to a configurable integration branch (`--integration-branch`, default `main`). Point it at a `develop` branch if you want a manual review gate before `main`.
 
 ---
 
