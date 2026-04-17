@@ -91,7 +91,10 @@ def _start_soldier_thread(backend: TaskBackend, data_dir: str) -> None:
     data_path = Path(data_dir).resolve()
     repo_path = str(data_path.parent) if data_path.name == ".antfarm" else str(data_path)
 
-    soldier = Soldier.from_backend(backend, repo_path=repo_path)
+    # Explicit require_review=True guards against silent regressions like
+    # issue #284 — if the Soldier default ever changes, production still
+    # runs with review enabled.
+    soldier = Soldier.from_backend(backend, repo_path=repo_path, require_review=True)
 
     def _soldier_loop():
         global _soldier_status
