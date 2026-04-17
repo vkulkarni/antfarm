@@ -1334,3 +1334,27 @@ def test_get_done_candidates_skips_review_capability_task(soldier_env):
 
     candidates = soldier._get_done_candidates()
     assert not any(t["id"] == "task-cap-review-2" for t in candidates)
+
+
+def test_get_merge_queue_skips_review_capability_task(soldier_env):
+    """Task with capabilities_required=['review'] but non-'review-' id is
+    excluded from the merge queue via get_merge_queue.
+
+    Exercises the is_infra_task() consolidation in get_merge_queue: previously
+    only ids starting with 'review-' were skipped. Now any task whose
+    capabilities include 'review' is treated as infra and excluded.
+    """
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest_with_caps(
+        cc,
+        repo,
+        "task-cap-review-3",
+        "feat/task-cap-review-3",
+        capabilities_required=["review"],
+    )
+
+    queue = soldier.get_merge_queue()
+    assert not any(t["id"] == "task-cap-review-3" for t in queue)

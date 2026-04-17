@@ -327,12 +327,12 @@ class Soldier:
                 merged_task_ids.add(t["id"])
 
         # Filter to done tasks with a branch and satisfied deps
-        # Exclude review tasks (id starts with "review-") — they are informational
+        # Exclude infra tasks (review tasks, etc.) — they are informational
         eligible = []
         for task in all_tasks:
             if task.get("status") != "done":
                 continue
-            if task.get("id", "").startswith("review-"):
+            if is_infra_task(task):
                 continue
             # Skip already-merged tasks
             if self._has_merged_attempt(task):
