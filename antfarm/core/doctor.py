@@ -1102,6 +1102,7 @@ def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]
         ["tmux", "list-sessions", "-F", "#{session_name}"],
         capture_output=True,
         text=True,
+        env={**os.environ, "LC_ALL": "C"},
     )
     if result.returncode != 0:
         # tmux server not running — no sessions to check
@@ -1141,10 +1142,14 @@ def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]
         )
 
         if fix:
+            # Session name is already colony-hash-scoped (see #231), so we never
+            # kill a peer colony's session — this is what makes the race-tolerant
+            # behavior safe to default-on.
             kill = subprocess.run(
                 ["tmux", "kill-session", "-t", name],
                 capture_output=True,
                 text=True,
+                env={**os.environ, "LC_ALL": "C"},
             )
             if kill.returncode == 0:
                 finding.fixed = True
@@ -1152,6 +1157,9 @@ def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]
                 # Race: session disappeared between list-sessions and kill-session.
                 # tmux emits these strings from cmd-kill-session.c / server.c when
                 # the target is gone or the server has exited. Treat as success.
+                # Note: "session not found" is defensive coverage — we've observed
+                # "can't find session" and "no server running" in tmux 3.x;
+                # "session not found" is added for other tmux versions/ports.
                 stderr_lower = (kill.stderr or "").strip().lower()
                 gone_markers = (
                     "can't find session",
@@ -1162,11 +1170,12 @@ def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]
                     finding.fixed = True
                     finding.message += " (already gone)"
                 else:
-                    detail = (
+                    raw = (
                         kill.stderr.strip().splitlines()[0]
                         if kill.stderr and kill.stderr.strip()
                         else f"returncode={kill.returncode}"
                     )
+                    detail = raw if len(raw) <= 200 else raw[:199] + "…"
                     finding.message += f" — kill failed: {detail}"
                     finding.fixed = False
 
