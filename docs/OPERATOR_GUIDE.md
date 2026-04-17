@@ -530,7 +530,7 @@ Concrete symptoms with concrete fixes.
 
 ```
 .antfarm/
-  config.json                 # colony_id (UUID), repo_path, integration_branch, TTLs
+  config.json                 # repo_path, integration_branch, TTLs (colony_id UUID added in a future release — #238)
   tasks/
     ready/                    # backlog — moving a file IS claiming
     active/                   # claimed tasks
@@ -551,9 +551,12 @@ Tmux session naming:
 - Runner: `runner-<hash>-<role>-<N>`.
 - Deploy: `antfarm-<hash>-<node>-<agent>-<idx>`.
 
-`.antfarm/` is runtime state. Never commit it. If you need to move a
-colony, `mv` the directory — colony identity is stable across moves
-thanks to the persisted UUID.
+`.antfarm/` is runtime state. Never commit it. In v0.6.4, colony
+identity is derived from `realpath(data_dir)`, so `mv`, NFS remount,
+or Docker bind-mount re-pointing will change the tmux session hash
+prefix and orphan existing sessions — drain in-flight work before
+moving. A future release (#238) switches to a persisted UUID that
+survives these operations.
 
 ---
 
