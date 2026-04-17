@@ -1833,3 +1833,313 @@ def test_wait_for_event_passes_cursor_and_timeout_to_server(monkeypatch):
     assert method == "GET"
     assert url.endswith("/events")
     assert params == {"after": 42, "timeout": 4.0}
+
+
+# ---------------------------------------------------------------------------
+# Merge diagnostic events (#287 / P6): merge_attempted, merge_skipped,
+# merge_failed. Each test patches antfarm.core.soldier._emit to capture
+# emissions so soldier internals can be asserted against without coupling to
+# the SSE bus layout.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def captured_emits(monkeypatch):
+    """Capture all calls to antfarm.core.soldier._emit in an ordered list."""
+    from antfarm.core import soldier as soldier_mod
+
+    calls: list[tuple[str, str, str]] = []
+
+    def _fake_emit(event_type: str, task_id: str, detail: str = "") -> None:
+        calls.append((event_type, task_id, detail))
+
+    monkeypatch.setattr(soldier_mod, "_emit", _fake_emit)
+    return calls
+
+
+def _emit_types(calls: list[tuple[str, str, str]]) -> list[str]:
+    return [c[0] for c in calls]
+
+
+def test_attempt_merge_emits_merge_attempted(soldier_env, captured_emits):
+    """attempt_merge emits merge_attempted with attempt_id and branch in the detail."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-att-001", "feat/task-att-001")
+
+    # captured_emits is active via monkeypatch before run_once runs
+    soldier.run_once()
+
+    attempted = [c for c in captured_emits if c[0] == "merge_attempted"]
+    assert len(attempted) == 1
+    _, task_id, detail = attempted[0]
+    assert task_id == "task-att-001"
+    assert "branch=feat/task-att-001" in detail
+    # Attempt id should also appear in the detail string.
+    assert "attempt=" in detail and detail.split("attempt=")[1].split(" ")[0] != ""
+
+
+def test_attempt_merge_dual_emits_merge_started_for_backcompat(soldier_env, captured_emits):
+    """merge_started is still emitted alongside merge_attempted during 0.6.x."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-dual-001", "feat/task-dual-001")
+
+    soldier.run_once()
+
+    types = _emit_types(captured_emits)
+    assert "merge_attempted" in types
+    assert "merge_started" in types
+    # merge_attempted must precede merge_started (order matters for observers).
+    assert types.index("merge_attempted") < types.index("merge_started")
+
+
+def test_get_merge_queue_emits_skipped_for_unmerged_dep(soldier_env, captured_emits):
+    """A done task whose dependency is not yet merged emits merge_skipped
+    with reason=dep_unmerged."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    # Harvest task-a (not merged) and task-b which depends on task-a.
+    _carry_and_harvest(cc, repo, "task-dep-a", "feat/task-dep-a")
+    _carry_and_harvest(
+        cc, repo, "task-dep-b", "feat/task-dep-b", depends_on=["task-dep-a"]
+    )
+
+    # Clear emits from any prior steps, then invoke the filter path.
+    captured_emits.clear()
+    soldier.get_merge_queue()
+
+    skipped = [c for c in captured_emits if c[0] == "merge_skipped"]
+    dep_skipped = [c for c in skipped if c[1] == "task-dep-b"]
+    assert any("reason=dep_unmerged" in c[2] for c in dep_skipped), (
+        f"expected dep_unmerged skip for task-dep-b, got {skipped}"
+    )
+
+
+def test_get_merge_queue_emits_skipped_for_no_pr(soldier_env, captured_emits):
+    """A done task with no current_attempt branch emits reason=no_pr."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    # Harvest normally then surgically clear the branch field so the task
+    # looks like it has no PR.
+    _carry_and_harvest(cc, repo, "task-nopr", "feat/task-nopr")
+    task = cc.get_task("task-nopr")
+    attempt_id = task["current_attempt"]
+    # Overwrite branch via direct backend file mutation (FileBackend).
+    import json
+    from pathlib import Path
+
+    done_dir = Path(soldier_env["tmp_path"]) / ".antfarm" / "tasks" / "done"
+    task_path = done_dir / "task-nopr.json"
+    data = json.loads(task_path.read_text())
+    for att in data["attempts"]:
+        if att["attempt_id"] == attempt_id:
+            att["branch"] = None
+    task_path.write_text(json.dumps(data))
+
+    captured_emits.clear()
+    soldier.get_merge_queue()
+
+    skipped = [c for c in captured_emits if c[0] == "merge_skipped" and c[1] == "task-nopr"]
+    assert any("reason=no_pr" in c[2] for c in skipped), (
+        f"expected no_pr skip for task-nopr, got {skipped}"
+    )
+
+
+def test_run_once_with_review_emits_skipped_needs_changes_before_kickback(
+    soldier_env, captured_emits
+):
+    """A done task with a stored needs_changes verdict emits merge_skipped
+    with reason=needs_changes BEFORE the kickback fires."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-nc-001", "feat/task-nc-001")
+
+    # Store a needs_changes verdict directly on the task via the backend.
+    # Use the HTTP ColonyClient for parity with soldier's access.
+    task = cc.get_task("task-nc-001")
+    attempt_id = task["current_attempt"]
+
+    verdict = {
+        "provider": "claude_code",
+        "verdict": "needs_changes",
+        "summary": "placeholder",
+        "findings": [],
+        "severity": None,
+        "reviewed_commit_sha": "",
+        "reviewer_run_id": None,
+    }
+    cc.store_review_verdict("task-nc-001", attempt_id, verdict)
+
+    # Enable require_review on a fresh soldier sharing the same client.
+    review_soldier = Soldier(
+        colony_url="http://testserver",
+        repo_path=repo,
+        integration_branch="dev",
+        test_command=["true"],
+        poll_interval=0.0,
+        require_review=True,
+        client=soldier._client if hasattr(soldier, "_client") else soldier.colony._client,
+    )
+
+    captured_emits.clear()
+    review_soldier.run_once_with_review()
+
+    # Filter emissions for this task.
+    task_events = [c for c in captured_emits if c[1] == "task-nc-001"]
+    types = [c[0] for c in task_events]
+    assert "merge_skipped" in types, (
+        f"expected merge_skipped before kickback, got {types}"
+    )
+    # Ordering: merge_skipped (with needs_changes reason) must be emitted
+    # BEFORE any subsequent kickback-related event. Kickback itself is
+    # emitted by colony (actor=colony) not by soldier, so just assert that
+    # merge_skipped was recorded with the correct reason.
+    nc_skip = [c for c in task_events if c[0] == "merge_skipped"]
+    assert any("reason=needs_changes" in c[2] for c in nc_skip)
+
+
+def test_run_once_with_review_emits_skipped_review_in_progress(soldier_env, captured_emits):
+    """When a review task exists but is not done yet, soldier emits
+    merge_skipped with reason=review_in_progress."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-rip-001", "feat/task-rip-001")
+
+    # Create a review task that is still in ready status.
+    cc._client.post(
+        "/tasks",
+        json={
+            "id": "review-task-rip-001",
+            "title": "Review: task-rip-001",
+            "spec": (
+                "Review task-rip-001\n"
+                "Attempt-SHA: feat/task-rip-001\n"
+            ),
+            "depends_on": [],
+            "priority": 1,
+            "capabilities_required": ["review"],
+        },
+    ).raise_for_status()
+
+    review_soldier = Soldier(
+        colony_url="http://testserver",
+        repo_path=repo,
+        integration_branch="dev",
+        test_command=["true"],
+        poll_interval=0.0,
+        require_review=True,
+        client=soldier.colony._client,
+    )
+
+    captured_emits.clear()
+    review_soldier.run_once_with_review()
+
+    skipped = [
+        c for c in captured_emits if c[0] == "merge_skipped" and c[1] == "task-rip-001"
+    ]
+    assert any("reason=review_in_progress" in c[2] for c in skipped), (
+        f"expected review_in_progress skip, got {skipped}"
+    )
+
+
+def test_merge_failed_emitted_before_kickback_on_failure(soldier_env, captured_emits):
+    """On a failed attempt_merge, merge_failed must be emitted BEFORE the
+    caller invokes kickback_with_cascade (which itself calls colony.kickback)."""
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    # Soldier whose test_command always fails.
+    failing_soldier = Soldier(
+        colony_url="http://testserver",
+        repo_path=repo,
+        integration_branch="dev",
+        test_command=["false"],
+        poll_interval=0.0,
+        client=soldier_env["soldier"].colony._client,
+    )
+
+    _carry_and_harvest(cc, repo, "task-ord-001", "feat/task-ord-001")
+
+    # Instrument kickback_with_cascade so we know exactly when it runs.
+    kickback_order: list[int] = []
+    original = failing_soldier.kickback_with_cascade
+
+    def _tracking_kickback(*args, **kwargs):
+        kickback_order.append(len(captured_emits))
+        return original(*args, **kwargs)
+
+    failing_soldier.kickback_with_cascade = _tracking_kickback  # type: ignore[assignment]
+
+    captured_emits.clear()
+    failing_soldier.run_once()
+
+    # There must be at least one merge_failed before kickback was invoked.
+    assert kickback_order, "kickback was not invoked"
+    kb_idx = kickback_order[0]
+    pre_kb = captured_emits[:kb_idx]
+    types_pre = [c[0] for c in pre_kb]
+    assert "merge_failed" in types_pre, (
+        f"merge_failed was not emitted before kickback; pre-kickback emits: {pre_kb}"
+    )
+    # Failed detail should carry a normalized reason code.
+    failed = [c for c in pre_kb if c[0] == "merge_failed"]
+    assert any("reason=" in c[2] for c in failed)
+
+
+def test_emit_failure_does_not_break_merge(soldier_env, monkeypatch):
+    """Even if the emit pipeline raises, attempt_merge must still return
+    the correct MergeResult and not propagate the exception. Only the
+    soldier-side ``_emit`` wrapper is targeted here — colony-side
+    ``_emit_event`` is left untouched (colony emits are orthogonal)."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-emfail-001", "feat/task-emfail-001")
+
+    # Patch the soldier-side `_emit` wrapper so every soldier emission
+    # attempt hits the best-effort try/except path. If soldier is not
+    # robust to this, the merge will raise.
+    from antfarm.core import soldier as soldier_mod
+
+    # The real _emit swallows exceptions; to simulate an emit pipeline
+    # failure we instead force _emit_event to raise, but only when called
+    # by the soldier module (i.e. via the soldier._emit wrapper). The
+    # wrapper must catch it.
+    orig_emit = soldier_mod._emit
+
+    def _raising_emit(event_type, task_id, detail=""):
+        # Exercise the soldier _emit import + swallow pathway, then force
+        # a failure inside it by making serve._emit_event raise for this
+        # one call.
+        from antfarm.core import serve as serve_mod
+
+        real = serve_mod._emit_event
+
+        def _boom(*a, **kw):
+            raise RuntimeError("synthetic emit failure")
+
+        serve_mod._emit_event = _boom
+        try:
+            orig_emit(event_type, task_id, detail)
+        finally:
+            serve_mod._emit_event = real
+
+    monkeypatch.setattr(soldier_mod, "_emit", _raising_emit)
+
+    # Must not raise, must still merge cleanly.
+    results = soldier.run_once()
+    assert results == [("task-emfail-001", MergeResult.MERGED)]
