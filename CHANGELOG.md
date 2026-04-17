@@ -6,11 +6,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-04-16
+
 ### Changed
 - Tmux session names now include an 8-char SHA-256 hash of the colony's resolved `data_dir` (format: `auto-{hash}-{role}-{N}` for autoscaler, `runner-{hash}-{role}-{N}` for Runner). This scopes orphan detection to the current colony so peer colonies on the same host are ignored. Doctor's `check_orphan_tmux_sessions` is restored to `warning` severity with `auto_fixable=True`, and `antfarm doctor --fix` now safely `tmux kill-session`s own orphans. Backwards-compat caveat: tmux sessions spawned by pre-upgrade builds lack the hash prefix and become unmanaged — operators should `tmux kill-session -t <name>` them after upgrading. (#231)
 
 ### Fixed
 - `register_worker` tolerates stale prior registrations — overwrites worker files whose heartbeat has expired instead of returning 409, preventing autoscaler crashes on colony restart (#194)
+- Autoscaler no longer reaps workers whose heartbeat is still fresh; prevents healthy builders from being killed mid-task when the reaper loop races with a just-started worker (#220)
+- Soldier re-reviews kicked-back tasks when the attempt SHA changes — previously review tasks persisted forever in `done/` and new attempts got stuck waiting for a review that would never re-run. Attempt-SHA marker embedded in review task spec enables detection (#226)
+- Queen writes the `mission_context` blob at the start of the BUILDING phase and on re-plan. Previously the file was never created and `GET /missions/{id}/context` silently 404'd, losing prompt-cache benefit on every multi-worker mission. Also threads `data_dir`/`repo_path`/`integration_branch` from `config.json` into the Queen so its file writes land where the server reads them (#219)
+- Kickback, rereview, resume, and reassign now close the superseded attempt's PR with a comment. Previously superseded PRs accumulated as open duplicates, noising the PR list and wasting CI minutes. New `PROps` abstraction (`antfarm/core/pr_ops.py`) with `GhPROps` (shells out to `gh pr close`) and `NullPROps` (tests/no-gh default). PR close runs outside the backend lock to prevent subprocess-in-lock deadlocks (#222)
+- Doctor `orphan_tmux_session` severity temporarily downgraded to `info` so `test_healthy_colony_no_findings` doesn't fail on hosts running peer-colony tmux sessions (stopgap). This was superseded by #231 in the same release, which restores `warning` severity via colony-scoped session naming (#229, #230)
+- `antfarm` CLI startup now configures logging so `logger.info`/`logger.warning` actually surface; previously log calls silently no-op'd when the module was imported without calling `setup_logging` (#214)
+- `antfarm.__version__` is now sourced from installed package metadata instead of a hardcoded constant, so editable installs no longer drift from the true version (#213)
 
 ## [0.6.2] - 2026-04-16
 
