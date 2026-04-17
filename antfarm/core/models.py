@@ -91,6 +91,7 @@ class FailureType(StrEnum):
     BUILD_FAILURE = "build_failure"
     INFRA_FAILURE = "infra_failure"
     INVALID_TASK = "invalid_task"
+    SILENT_FAILURE = "silent_failure"
 
 
 # ---------------------------------------------------------------------------
