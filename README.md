@@ -141,29 +141,46 @@ A spec file is a Markdown document describing the change you want: goal, accepta
 ## Architecture
 
 ```
-                  ┌─────────────────────────────────────┐
-                  │          colony (HTTP API)          │
-                  │   queen · soldier · doctor · autoscaler
-                  └──────────────┬──────────────────────┘
-                                 │
-                ┌────────────────┼───────────────────┐
-                │                │                   │
-          FileBackend      Runner(s)            Worker pool
-          (.antfarm/)      (tmux panes)         builders + reviewers
-                                                     │
-                                                  adapters
-                                          (claude-code / codex / aider)
+  spec.md ──▶ Queen ──▶ ┌─────────────────┐
+                        │    task queue   │◀── review tasks  (Soldier)
+                        │  (FileBackend)  │◀── kickbacks     (Soldier)
+                        └────────┬────────┘
+                                 │ forage (HTTP, any node, any task type)
+         ┌───────────────────────┼─────────────────────────┐
+         ▼                       ▼                         ▼
+  ┌── node-1 (mini-1) ──┐ ┌── node-1 (mini-1) ──┐ ┌── node-2 (mini-2) ──┐
+  │       Builder       │ │       Builder       │ │      Reviewer       │
+  │     claude-code     │ │        codex        │ │     claude-code     │
+  │    worktree → PR    │ │    worktree → PR    │ │    reads PR diff    │
+  └──────────┬──────────┘ └──────────┬──────────┘ └──────────┬──────────┘
+             │                       │                       │
+             │  git push + open PR   │                  verdict: pass /
+             ▼                       ▼                  needs_changes
+                ┌───────────────────────┐                    │
+                │        GitHub         │                    │
+                │     pull requests     │                    │
+                └───────────┬───────────┘                    │
+                            │                                │
+                            ▼                                ▼
+                        ┌─────────────────────────────────────┐
+                        │              Soldier                │
+                        │  · spawns review tasks              │
+                        │  · rebase + run tests               │
+                        │  · fast-forward OR kickback         │
+                        └──────────────────┬──────────────────┘
+                                           │ pass + clean rebase + green
+                                           ▼
+                                   integration branch
 ```
 
-- **Colony server** — FastAPI process that holds the task queue and runs the in-process daemons.
 - **Queen** — mission planner: spec → task graph.
-- **Soldier** — deterministic merge gate: rebase, test, fast-forward or kickback.
+- **Task queue** — FileBackend under `.antfarm/`; atomic JSON store. Builders and reviewers forage from the same queue over HTTP.
+- **Builder / Reviewer** — worker sessions wrapping a coding agent (claude-code, codex, aider). Heterogeneous across nodes — any mix, any machine.
+- **Soldier** — deterministic gate. Spawns review tasks, then rebase + test + fast-forward to integration, or kickback to `ready/` for a fresh attempt. No AI in the gate.
 - **Autoscaler** — sizes builder and reviewer pools against queue depth.
-- **Runner** — launches worker sessions (tmux locally, SSH + tmux for multi-node).
+- **Runner** — launches worker sessions on each node (tmux locally, SSH + tmux for multi-node).
 - **Doctor** — pre-flight checks and stale-state recovery.
-- **Workers** — builder or reviewer sessions wrapping a coding agent.
-- **Adapters** — per-agent glue: prompts, hooks, heartbeat.
-- **FileBackend** — atomic JSON task store under `.antfarm/`.
+- **Colony** — FastAPI process hosting the queue and running queen/soldier/doctor/autoscaler in-process.
 
 Deeper reading: [docs/SPEC.md](docs/SPEC.md), [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md), [AGENTS.md](AGENTS.md).
 
