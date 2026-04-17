@@ -1026,3 +1026,75 @@ def test_get_app_does_not_log_colony_hash(tmp_path, caplog):
     assert not noisy, (
         f"get_app() must not log colony id, but got: {[r.getMessage() for r in noisy]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Warnings in /status and /status/full
+# ---------------------------------------------------------------------------
+
+
+def _carry_review_task(client, task_id="review-001"):
+    """Carry a task with capabilities_required=['review']."""
+    return client.post(
+        "/tasks",
+        json={
+            "id": task_id,
+            "title": "Review this",
+            "spec": "Review the PR",
+            "capabilities_required": ["review"],
+        },
+    )
+
+
+def test_status_includes_warnings_when_no_reviewer_capacity(tmp_path):
+    """GET /status and GET /status/full both surface no_reviewer_capacity warning."""
+    from antfarm.core.backends.file import FileBackend
+    from antfarm.core.serve import get_app
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend)
+    test_client = TestClient(app)
+
+    _carry_review_task(test_client)
+
+    r = test_client.get("/status")
+    assert r.status_code == 200
+    data = r.json()
+    assert "warnings" in data
+    codes = [w["code"] for w in data["warnings"]]
+    assert "no_reviewer_capacity" in codes
+
+    r = test_client.get("/status/full")
+    assert r.status_code == 200
+    data = r.json()
+    assert "warnings" in data
+    codes = [w["code"] for w in data["warnings"]]
+    assert "no_reviewer_capacity" in codes
+
+
+def test_status_warnings_empty_when_reviewer_present(tmp_path):
+    """When a reviewer worker is registered, no_reviewer_capacity warning is absent."""
+    from antfarm.core.backends.file import FileBackend
+    from antfarm.core.serve import get_app
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend)
+    test_client = TestClient(app)
+
+    _carry_review_task(test_client)
+    test_client.post(
+        "/workers/register",
+        json={
+            "worker_id": "local/reviewer-1",
+            "node_id": "local",
+            "agent_type": "reviewer",
+            "workspace_root": "/tmp/ws",
+            "capabilities": ["review"],
+        },
+    )
+
+    r = test_client.get("/status")
+    assert r.status_code == 200
+    data = r.json()
+    codes = [w.get("code") for w in data.get("warnings", [])]
+    assert "no_reviewer_capacity" not in codes

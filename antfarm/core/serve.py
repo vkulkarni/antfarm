@@ -1040,6 +1040,26 @@ def get_app(
     # Status
     # ------------------------------------------------------------------
 
+    def _compute_status_warnings(backend: TaskBackend) -> list[dict]:
+        """Collect all colony-level warnings for the /status response.
+
+        Each warning dict has keys: code, message, hint, count.
+        Pure read — never mutates state.
+        """
+        from antfarm.core.warnings import detect_no_reviewer_capacity
+
+        try:
+            tasks = backend.list_tasks()
+            workers = backend.list_workers() if hasattr(backend, "list_workers") else []
+        except Exception:
+            return []
+
+        warnings: list[dict] = []
+        w = detect_no_reviewer_capacity(tasks, workers)
+        if w is not None:
+            warnings.append(w)
+        return warnings
+
     @app.get("/status", status_code=200)
     def colony_status():
         """Return colony status summary."""
@@ -1048,6 +1068,7 @@ def get_app(
         result["doctor"] = _doctor_status
         result["queen"] = _queen_status
         result["autoscaler"] = _autoscaler_status
+        result["warnings"] = _compute_status_warnings(_backend)
         return result
 
     @app.get("/status/full", status_code=200)
@@ -1067,6 +1088,7 @@ def get_app(
             "doctor": _doctor_status,
             "queen": _queen_status,
             "autoscaler": _autoscaler_status,
+            "warnings": _compute_status_warnings(_backend),
         }
 
     # ------------------------------------------------------------------
