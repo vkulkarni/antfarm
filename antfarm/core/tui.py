@@ -326,6 +326,9 @@ class AntfarmTUI:
                     snap.waiting_new.append(task)
 
             elif status == "done":
+                if task.get("cancelled_at"):
+                    snap.review_tasks[task_id] = task
+                    continue
                 if self._has_merged_attempt(task):
                     if not is_infra_task(task):  # only show impl tasks in merged
                         snap.recently_merged.append(task)

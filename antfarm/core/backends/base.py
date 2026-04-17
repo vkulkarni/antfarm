@@ -477,3 +477,23 @@ class TaskBackend(ABC):
     def update_mission(self, mission_id: str, updates: dict) -> None:
         """Shallow-merge ``updates`` into the mission JSON. Atomic write."""
         ...
+
+    @abstractmethod
+    def cancel_mission_tasks(self, mission_id: str, reason: str) -> list[str]:
+        """Atomically cancel a mission and purge all non-terminal tasks to done/.
+
+        Sets mission status to "cancelled" and, for every task whose
+        ``mission_id`` matches and whose status is in {ready, blocked, active,
+        paused}: supersedes ``current_attempt`` (if any), stamps
+        ``cancelled_at`` and ``cancelled_reason`` on the task dict, appends a
+        trail entry with ``action_type="cancel"``, sets ``status="done"``, and
+        renames the file into ``done/``.
+
+        Args:
+            mission_id: ID of the mission to cancel.
+            reason: Human-readable reason recorded on each cancelled task.
+
+        Returns:
+            List of task IDs that were moved to done/.
+        """
+        ...

@@ -1423,8 +1423,9 @@ def mission_report(mission_id: str, fmt: str, colony_url: str, token: str | None
 @TOKEN_OPTION
 def mission_cancel(mission_id: str, colony_url: str, token: str | None):
     """Cancel a mission."""
-    _post(colony_url, f"/missions/{mission_id}/cancel", {}, token=token)
-    click.echo(f"Mission cancelled: {mission_id}")
+    result = _post(colony_url, f"/missions/{mission_id}/cancel", {}, token=token)
+    cancelled_tasks = result.get("cancelled_tasks", []) if result else []
+    click.echo(f"Mission cancelled: {mission_id} ({len(cancelled_tasks)} task(s) moved to done)")
 
 
 @mission.command("list")

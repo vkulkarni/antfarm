@@ -401,10 +401,11 @@ def test_e2e_mission_cancel_stops_spawning(mission_env):
     mission = client.get(f"/missions/{mission_id}").json()
     assert mission["status"] == "cancelled"
 
-    # Child tasks still exist but are not processed further by Queen
+    # Child tasks are moved to done/ with cancellation metadata
     for cid in child_ids:
         task = client.get(f"/tasks/{cid}").json()
-        assert task["status"] == "ready"  # never foraged
+        assert task["status"] == "done"  # purged to done/ by cancel
+        assert task.get("cancelled_at") is not None
 
 
 def test_e2e_mission_blocked_task(mission_env):

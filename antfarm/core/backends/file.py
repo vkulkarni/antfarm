@@ -1044,3 +1044,122 @@ class FileBackend(TaskBackend):
             data.update(updates)
             data["updated_at"] = _now_iso()
             self._write_json(path, data)
+
+    def cancel_mission_tasks(self, mission_id: str, reason: str) -> list[str]:
+        """Purge all non-terminal tasks for this mission into done/ and cancel the mission.
+
+        Non-terminal tasks (ready, blocked, active, paused) are moved to done/
+        with cancellation metadata and their current attempt superseded.
+
+        Already-done-but-unmerged tasks are stamped with cancelled_at/cancelled_reason
+        in-place so the Soldier and TUI can filter them out of the merge queue.
+
+        Operates under self._lock. PR closes happen after the lock is released
+        to avoid blocking other workers during subprocess execution.
+
+        Returns:
+            List of task IDs moved to done/ (non-terminal tasks only).
+        """
+        _NON_TERMINAL_STATUSES = {"ready", "blocked", "active", "paused"}
+        # Map from logical status to source path helper
+        _source_path_map = {
+            "ready": self._ready_path,
+            "blocked": self._blocked_path,
+            "active": self._active_path,
+            "paused": self._paused_path,
+        }
+        superseded_attempts: list[tuple[dict, str]] = []
+        moved_task_ids: list[str] = []
+
+        with self._lock:
+            now = _now_iso()
+            all_tasks = self.list_tasks()
+            for task in all_tasks:
+                if task.get("mission_id") != mission_id:
+                    continue
+                status = task.get("status", "")
+                task_id = task["id"]
+
+                if status in _NON_TERMINAL_STATUSES:
+                    source_path_fn = _source_path_map[status]
+                    source_path = source_path_fn(task_id)
+                    if not source_path.exists():
+                        continue
+
+                    data = self._read_json(source_path)
+
+                    # Supersede current attempt (operator override — skip transition assertion)
+                    current_attempt_id = data.get("current_attempt")
+                    if current_attempt_id:
+                        for a in data["attempts"]:
+                            if a["attempt_id"] == current_attempt_id:
+                                a["status"] = AttemptStatus.SUPERSEDED.value
+                                a["completed_at"] = now
+                                superseded_attempts.append((dict(a), task_id))
+                                break
+                        data["current_attempt"] = None
+
+                    # Stamp cancellation metadata
+                    data["cancelled_at"] = now
+                    data["cancelled_reason"] = reason
+
+                    # Append cancel trail entry
+                    trail_entry = TrailEntry(
+                        ts=now,
+                        worker_id="system",
+                        message=f"mission cancelled: {reason}",
+                        action_type="cancel",
+                    )
+                    data.setdefault("trail", [])
+                    data["trail"].append(trail_entry.to_dict())
+
+                    # Transition to done (operator override — no lifecycle assertion)
+                    data["status"] = TaskStatus.DONE.value
+                    data["updated_at"] = now
+
+                    self._write_json(source_path, data)
+                    os.rename(source_path, self._done_path(task_id))
+                    moved_task_ids.append(task_id)
+
+                elif status == "done" and not task.get("cancelled_at"):
+                    # Already-done tasks: stamp cancellation so Soldier and TUI can filter.
+                    # Skip tasks that are already merged — they're truly terminal.
+                    if self._has_merged_attempt(task):
+                        continue
+                    done_path = self._done_path(task_id)
+                    if not done_path.exists():
+                        continue
+                    data = self._read_json(done_path)
+                    data["cancelled_at"] = now
+                    data["cancelled_reason"] = reason
+                    data["updated_at"] = now
+                    trail_entry = TrailEntry(
+                        ts=now,
+                        worker_id="system",
+                        message=f"mission cancelled: {reason}",
+                        action_type="cancel",
+                    )
+                    data.setdefault("trail", [])
+                    data["trail"].append(trail_entry.to_dict())
+                    self._write_json(done_path, data)
+
+            # Cancel the mission itself
+            mission_path = self._mission_path(mission_id)
+            if mission_path.exists():
+                mission_data = self._read_json(mission_path)
+                mission_data["status"] = "cancelled"
+                mission_data["completed_at"] = now
+                mission_data["updated_at"] = now
+                self._write_json(mission_path, mission_data)
+
+        # Close superseded PRs OUTSIDE the lock to avoid stalling other workers.
+        for attempt, _task_id in superseded_attempts:
+            self._close_superseded_pr(attempt, f"mission {mission_id} cancelled")
+
+        return moved_task_ids
+
+    def _has_merged_attempt(self, task: dict) -> bool:
+        """Return True if any attempt on the task has status=merged."""
+        return any(
+            a.get("status") == AttemptStatus.MERGED.value for a in task.get("attempts", [])
+        )

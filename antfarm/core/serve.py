@@ -935,15 +935,15 @@ def get_app(
 
     @app.post("/missions/{mission_id}/cancel", status_code=200)
     def cancel_mission(mission_id: str):
-        """Cancel a mission. Idempotent for terminal states."""
+        """Cancel a mission and purge all non-terminal tasks to done/. Idempotent."""
         mission = _backend.get_mission(mission_id)
         if mission is None:
             raise HTTPException(status_code=404, detail=f"Mission '{mission_id}' not found")
         terminal = {"complete", "failed", "cancelled"}
         if mission["status"] in terminal:
-            return {"ok": True}
-        _backend.update_mission(mission_id, {"status": "cancelled"})
-        return {"ok": True}
+            return {"ok": True, "cancelled_tasks": []}
+        ids = _backend.cancel_mission_tasks(mission_id, reason="mission cancelled")
+        return {"ok": True, "cancelled_tasks": ids}
 
     @app.get("/missions/{mission_id}/context")
     def get_mission_context_endpoint(mission_id: str):
