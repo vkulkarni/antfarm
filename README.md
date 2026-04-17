@@ -51,22 +51,22 @@ No manual intervention between `mission create` and `mission complete`. The kick
 
 <!-- asciicast: record after rewrite lands, link here -->
 
-### Adding a second machine
+### Adding a second node
 
 ```
-# on machine-2 (same trusted network, same repo cloned)
+# on node-2 / mac-mini-2 (same trusted network, same repo cloned)
 $ antfarm runner --colony-url http://lead:7433 --repo-path ~/projects/rate-limiter
-[runner] node=machine-2  listening on 127.0.0.1:7434  max-workers=4
+[runner] node=node-2 (mac-mini-2)  listening on 127.0.0.1:7434  max-workers=4
 [runner] registered with colony a4f2c1e8
 
 # back on the lead, scout --watch picks it up:
-14:21:03  colony      node registered: machine-2  (capacity=4)
-14:21:04  autoscaler  scaling builders 3 -> 5  (2 placed on machine-2)
-14:21:11  worker      machine-2/builder-1 claimed task-004
-14:21:11  worker      machine-2/builder-2 claimed task-005
+14:21:03  colony      node registered: node-2 (mac-mini-2)  (capacity=4)
+14:21:04  autoscaler  scaling builders 3 -> 5  (2 placed on node-2)
+14:21:11  worker      node-2/builder-1 claimed task-004
+14:21:11  worker      node-2/builder-2 claimed task-005
 ```
 
-Same mission, two machines. The autoscaler sees the new runner's capacity and places additional builders there; workers draw from the shared queue over HTTP.
+Same mission, two nodes. The autoscaler sees the new runner's capacity and places additional builders there; workers draw from the shared queue over HTTP.
 
 ---
 
