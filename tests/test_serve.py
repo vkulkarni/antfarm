@@ -910,3 +910,26 @@ def test_carry_accepts_mission_id(client):
 
     mission = client.get("/missions/m-1").json()
     assert "task-linked" in mission["task_ids"]
+
+
+def test_startup_logs_colony_hash(tmp_path, caplog):
+    """Colony startup logs the 8-char data_dir hash so operators can correlate sessions."""
+    import logging
+
+    from antfarm.core.backends.file import FileBackend
+    from antfarm.core.process_manager import colony_hash
+
+    data_dir = str(tmp_path / ".antfarm")
+    backend = FileBackend(root=data_dir)
+
+    with caplog.at_level(logging.INFO, logger="antfarm.core.serve"):
+        get_app(backend=backend, data_dir=data_dir)
+
+    expected_hash = colony_hash(data_dir)
+    matching = [
+        r
+        for r in caplog.records
+        if "colony hash:" in r.getMessage() and expected_hash in r.getMessage()
+    ]
+    assert matching, f"expected colony hash log, got: {[r.getMessage() for r in caplog.records]}"
+    assert os.path.realpath(data_dir) in matching[0].getMessage()

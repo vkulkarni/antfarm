@@ -700,10 +700,43 @@ def scent(task_id: str, poll_interval: float, colony_url: str, token: str | None
 @main.command()
 @click.option("--fix", is_flag=True, default=False, help="Apply safe auto-fixes.")
 @click.option("--data-dir", default=".antfarm", show_default=True, help="Data directory.")
-def doctor(fix: bool, data_dir: str):
+@click.option(
+    "--sweep-legacy-tmux",
+    is_flag=True,
+    default=False,
+    help=(
+        "Kill pre-hash tmux sessions (auto-/runner-/antfarm- without colony hash). "
+        "Operates host-wide, not scoped to a colony."
+    ),
+)
+@click.option(
+    "--yes",
+    "-y",
+    is_flag=True,
+    default=False,
+    help="Skip confirmation prompt for --sweep-legacy-tmux.",
+)
+def doctor(fix: bool, data_dir: str, sweep_legacy_tmux: bool, yes: bool):
     """Run pre-flight diagnostics on the colony data directory."""
     from antfarm.core.backends.file import FileBackend
-    from antfarm.core.doctor import run_doctor
+    from antfarm.core.doctor import run_doctor, sweep_legacy_tmux_sessions
+
+    if sweep_legacy_tmux:
+        # Dry-run preview first so the operator sees exactly what will die.
+        preview = sweep_legacy_tmux_sessions({"data_dir": data_dir}, confirmed=False)
+        if not preview:
+            click.echo("No legacy sessions found.")
+            return
+        for f in preview:
+            click.echo(f"[{f.severity.upper()}] {f.check}: {f.message}")
+        if not yes and not click.confirm(f"Kill {len(preview)} legacy sessions?", default=False):
+            click.echo("Aborted.")
+            return
+        killed = sweep_legacy_tmux_sessions({"data_dir": data_dir}, confirmed=True)
+        for f in killed:
+            status = "[FIXED]" if f.fixed else "[FAILED]"
+            click.echo(f"[{f.severity.upper()}] {f.check}: {f.message} {status}".strip())
+        return
 
     backend = FileBackend(data_dir)
     config = {"data_dir": data_dir}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -204,8 +205,12 @@ class TestComputeDesired:
     def test_review_prefixed_tasks_not_counted_as_unreviewed(self):
         a = _make_autoscaler()
         tasks = [
-            _task("review-t1", status="done", current_attempt="att-1",
-                  attempts=[{"attempt_id": "att-1", "status": "done"}]),
+            _task(
+                "review-t1",
+                status="done",
+                current_attempt="att-1",
+                attempts=[{"attempt_id": "att-1", "status": "done"}],
+            ),
         ]
         result = a._compute_desired(tasks, [])
         assert result["reviewer"] == 0
@@ -268,8 +273,7 @@ class TestReconciliation:
 
         # Should have started 2 builders (2 scope groups, 2 tasks)
         builder_starts = [
-            c for c in pm.start.call_args_list
-            if "--type" in c[0][1] and "builder" in c[0][1]
+            c for c in pm.start.call_args_list if "--type" in c[0][1] and "builder" in c[0][1]
         ]
         assert len(builder_starts) == 2
 
@@ -613,3 +617,63 @@ class TestAdoptExisting:
         a._adopt_existing()
 
         assert a._counter == 7
+
+    def test_adopt_existing_ignores_legacy_unprefixed_sessions(self, tmp_path):
+        """Pre-#231 `auto-builder-3` sessions must NOT be adopted after upgrade.
+
+        Uses a real TmuxProcessManager whose prefix is the autoscaler's current
+        hashed prefix. The legacy name lacks the hash token, so list_managed()
+        filters it out and adopt_existing() returns {}.
+        """
+        from unittest.mock import MagicMock, patch
+
+        from antfarm.core.process_manager import TmuxProcessManager, colony_hash
+
+        data_dir = str(tmp_path / ".antfarm")
+        os.makedirs(data_dir, exist_ok=True)
+        prefix = f"auto-{colony_hash(data_dir)}-"
+        pm = TmuxProcessManager(prefix=prefix, state_dir=data_dir)
+
+        list_result = MagicMock()
+        list_result.returncode = 0
+        list_result.stdout = "auto-builder-3\nauto-planner-1\n"
+
+        with (
+            patch("antfarm.core.process_manager.shutil.which", return_value="/usr/bin/tmux"),
+            patch("antfarm.core.process_manager.subprocess.run", return_value=list_result),
+        ):
+            a = _make_autoscaler(_pm=pm, data_dir=data_dir, node_id="node-x")
+            a._adopt_existing()
+
+        assert a.managed == {}
+        assert a._counter == 0
+
+    def test_adopt_existing_ignores_peer_colony_sessions(self, tmp_path):
+        """Sessions with a DIFFERENT colony hash must NOT be adopted.
+
+        Peer colonies on the same host use their own hash; the autoscaler's
+        prefix filter rejects them in list_managed().
+        """
+        from unittest.mock import MagicMock, patch
+
+        from antfarm.core.process_manager import TmuxProcessManager, colony_hash
+
+        data_dir = str(tmp_path / ".antfarm")
+        os.makedirs(data_dir, exist_ok=True)
+        prefix = f"auto-{colony_hash(data_dir)}-"
+        pm = TmuxProcessManager(prefix=prefix, state_dir=data_dir)
+
+        # Foreign hash that is very unlikely to collide with the real hash.
+        list_result = MagicMock()
+        list_result.returncode = 0
+        list_result.stdout = "auto-deadbeef-builder-1\nauto-ffffffff-reviewer-2\n"
+
+        with (
+            patch("antfarm.core.process_manager.shutil.which", return_value="/usr/bin/tmux"),
+            patch("antfarm.core.process_manager.subprocess.run", return_value=list_result),
+        ):
+            a = _make_autoscaler(_pm=pm, data_dir=data_dir, node_id="node-x")
+            a._adopt_existing()
+
+        assert a.managed == {}
+        assert a._counter == 0

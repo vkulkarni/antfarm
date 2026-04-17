@@ -83,9 +83,12 @@ def test_cli_carry_creates_task():
             main,
             [
                 "carry",
-                "--title", "Test Task",
-                "--spec", "Do the thing",
-                "--colony-url", "http://localhost:7433",
+                "--title",
+                "Test Task",
+                "--spec",
+                "Do the thing",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -271,6 +274,100 @@ def test_cli_doctor_fix(tmp_path: Path):
     assert result.exit_code == 0, result.output
 
 
+def test_cli_doctor_sweep_no_legacy_sessions(tmp_path: Path):
+    """--sweep-legacy-tmux with no matches prints the no-op message and exits."""
+    runner = CliRunner()
+
+    with patch("antfarm.core.doctor.sweep_legacy_tmux_sessions") as mock_sweep:
+        mock_sweep.return_value = []
+        result = runner.invoke(
+            main,
+            ["doctor", "--sweep-legacy-tmux", "--data-dir", str(tmp_path)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "No legacy sessions found" in result.output
+    # Only the dry-run call should have happened; no confirmation prompt either.
+    mock_sweep.assert_called_once()
+    assert mock_sweep.call_args.kwargs["confirmed"] is False
+
+
+def test_cli_doctor_sweep_prompts_without_yes(tmp_path: Path):
+    """Without --yes, --sweep-legacy-tmux requires interactive confirmation and aborts on 'n'."""
+    from antfarm.core.doctor import Finding
+
+    runner = CliRunner()
+
+    preview = [
+        Finding(
+            severity="info",
+            check="legacy_tmux_session",
+            message="Legacy session: auto-builder-3",
+            auto_fixable=True,
+        ),
+    ]
+
+    with patch("antfarm.core.doctor.sweep_legacy_tmux_sessions") as mock_sweep:
+        mock_sweep.return_value = preview
+        result = runner.invoke(
+            main,
+            ["doctor", "--sweep-legacy-tmux", "--data-dir", str(tmp_path)],
+            input="n\n",
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "auto-builder-3" in result.output
+    assert "Aborted" in result.output
+    # Dry-run only — no confirmed=True call.
+    assert mock_sweep.call_count == 1
+    assert mock_sweep.call_args.kwargs["confirmed"] is False
+
+
+def test_cli_doctor_sweep_yes_bypasses_prompt(tmp_path: Path):
+    """--yes skips the prompt and invokes the sweep with confirmed=True."""
+    from antfarm.core.doctor import Finding
+
+    runner = CliRunner()
+
+    preview = [
+        Finding(
+            severity="info",
+            check="legacy_tmux_session",
+            message="Legacy session: auto-builder-3",
+            auto_fixable=True,
+        ),
+    ]
+    killed = [
+        Finding(
+            severity="info",
+            check="legacy_tmux_session",
+            message="Legacy session: auto-builder-3",
+            auto_fixable=True,
+            fixed=True,
+        ),
+    ]
+
+    with patch("antfarm.core.doctor.sweep_legacy_tmux_sessions") as mock_sweep:
+        mock_sweep.side_effect = [preview, killed]
+        result = runner.invoke(
+            main,
+            [
+                "doctor",
+                "--sweep-legacy-tmux",
+                "--yes",
+                "--data-dir",
+                str(tmp_path),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "auto-builder-3" in result.output
+    assert "[FIXED]" in result.output
+    assert mock_sweep.call_count == 2
+    assert mock_sweep.call_args_list[0].kwargs["confirmed"] is False
+    assert mock_sweep.call_args_list[1].kwargs["confirmed"] is True
+
+
 # ---------------------------------------------------------------------------
 # join
 # ---------------------------------------------------------------------------
@@ -315,10 +412,14 @@ def test_cli_hatch_registers_worker():
             main,
             [
                 "hatch",
-                "--node", "node-1",
-                "--agent", "claude-code",
-                "--name", "claude-1",
-                "--colony-url", "http://localhost:7433",
+                "--node",
+                "node-1",
+                "--agent",
+                "claude-code",
+                "--name",
+                "claude-1",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -381,9 +482,13 @@ def test_cli_trail_appends_entry():
         result = runner.invoke(
             main,
             [
-                "trail", "task-001", "completed routes",
-                "--worker-id", "node-1/w1",
-                "--colony-url", "http://localhost:7433",
+                "trail",
+                "task-001",
+                "completed routes",
+                "--worker-id",
+                "node-1/w1",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -405,9 +510,12 @@ def test_cli_harvest_posts_pr():
         result = runner.invoke(
             main,
             [
-                "harvest", "task-001",
-                "--pr", "https://github.com/org/repo/pull/42",
-                "--colony-url", "http://localhost:7433",
+                "harvest",
+                "task-001",
+                "--pr",
+                "https://github.com/org/repo/pull/42",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -468,9 +576,13 @@ def test_cli_signal_posts():
         result = runner.invoke(
             main,
             [
-                "signal", "task-001", "needs re-scoping",
-                "--worker-id", "node-1/w1",
-                "--colony-url", "http://localhost:7433",
+                "signal",
+                "task-001",
+                "needs re-scoping",
+                "--worker-id",
+                "node-1/w1",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -497,11 +609,16 @@ def test_worker_start_reviewer_adds_review_capability():
         result = runner.invoke(
             main,
             [
-                "worker", "start",
-                "--agent", "claude-code",
-                "--type", "reviewer",
-                "--node", "n1",
-                "--colony-url", "http://localhost:7433",
+                "worker",
+                "start",
+                "--agent",
+                "claude-code",
+                "--type",
+                "reviewer",
+                "--node",
+                "n1",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -523,10 +640,14 @@ def test_worker_start_builder_no_review_capability():
         result = runner.invoke(
             main,
             [
-                "worker", "start",
-                "--agent", "claude-code",
-                "--node", "n1",
-                "--colony-url", "http://localhost:7433",
+                "worker",
+                "start",
+                "--agent",
+                "claude-code",
+                "--node",
+                "n1",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -548,11 +669,16 @@ def test_worker_start_name_defaults_to_type():
         result = runner.invoke(
             main,
             [
-                "worker", "start",
-                "--agent", "claude-code",
-                "--type", "reviewer",
-                "--node", "n1",
-                "--colony-url", "http://localhost:7433",
+                "worker",
+                "start",
+                "--agent",
+                "claude-code",
+                "--type",
+                "reviewer",
+                "--node",
+                "n1",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -574,12 +700,18 @@ def test_worker_start_explicit_name_overrides():
         result = runner.invoke(
             main,
             [
-                "worker", "start",
-                "--agent", "claude-code",
-                "--type", "reviewer",
-                "--name", "my-worker",
-                "--node", "n1",
-                "--colony-url", "http://localhost:7433",
+                "worker",
+                "start",
+                "--agent",
+                "claude-code",
+                "--type",
+                "reviewer",
+                "--name",
+                "my-worker",
+                "--node",
+                "n1",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -633,8 +765,10 @@ def test_cli_colony_multi_node_flag():
                 "colony",
                 "--autoscaler",
                 "--multi-node",
-                "--port", "9001",
-                "--host", "127.0.0.1",
+                "--port",
+                "9001",
+                "--host",
+                "127.0.0.1",
             ],
         )
 
@@ -652,10 +786,12 @@ def test_plan_carry_resolves_index_deps():
     """plan --carry resolves 1-based index deps to generated task IDs."""
     runner = CliRunner()
 
-    plan_json = json.dumps([
-        {"title": "Task A", "spec": "Do A"},
-        {"title": "Task B", "spec": "Do B", "depends_on": [1]},
-    ])
+    plan_json = json.dumps(
+        [
+            {"title": "Task A", "spec": "Do A"},
+            {"title": "Task B", "spec": "Do B", "depends_on": [1]},
+        ]
+    )
 
     carried_payloads = []
 
@@ -672,9 +808,11 @@ def test_plan_carry_resolves_index_deps():
             main,
             [
                 "plan",
-                "--spec", plan_json,
+                "--spec",
+                plan_json,
                 "--carry",
-                "--colony-url", "http://localhost:7433",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 

@@ -13,11 +13,25 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+# Matches legacy (pre-#231/#235) tmux session names. A hash slot is exactly
+# 8 lowercase hex chars followed by a dash; the negative lookahead ensures
+# the token after the prefix is NOT a hash. Regressions in PRs #234 (#231)
+# and #243 (#235) introduced colony-hash-prefixed names; pre-upgrade sessions
+# have no hash token and must be swept manually.
+LEGACY_TMUX_RE = re.compile(
+    r"^(?:"
+    r"auto-(?![0-9a-f]{8}-)[A-Za-z][A-Za-z0-9_-]*-\d+"
+    r"|runner-(?![0-9a-f]{8}-)[A-Za-z][A-Za-z0-9_-]*-\d+"
+    r"|antfarm-(?![0-9a-f]{8}-)[A-Za-z0-9_][A-Za-z0-9_-]*-[A-Za-z0-9_-]+-\d+"
+    r")$"
+)
 
 
 @dataclass
@@ -29,7 +43,12 @@ class Finding:
     fixed: bool = False
 
 
-def run_doctor(backend, config: dict, fix: bool = False) -> list[Finding]:
+def run_doctor(
+    backend,
+    config: dict,
+    fix: bool = False,
+    sweep_legacy_tmux: bool = False,
+) -> list[Finding]:
     """Run all diagnostic checks. If fix=True, apply safe repairs.
 
     Args:
@@ -40,6 +59,9 @@ def run_doctor(backend, config: dict, fix: bool = False) -> list[Finding]:
             - worker_ttl (int, default 300): seconds before worker is stale
             - guard_ttl (int, default 300): seconds before guard is stale
         fix: If True, apply safe auto-fixes.
+        sweep_legacy_tmux: If True, also kill pre-hash tmux sessions host-wide
+            (``auto-``/``runner-``/``antfarm-`` without a colony hash). Intended
+            to be driven from the CLI after explicit operator confirmation.
 
     Returns:
         List of Finding objects describing issues found.
@@ -60,6 +82,9 @@ def run_doctor(backend, config: dict, fix: bool = False) -> list[Finding]:
     findings.extend(check_runner_health(backend, config))
     findings.extend(check_tmux_available(config))
     findings.extend(check_orphan_tmux_sessions(config, fix))
+
+    if sweep_legacy_tmux:
+        findings.extend(sweep_legacy_tmux_sessions(config, confirmed=True))
 
     return findings
 
@@ -1159,6 +1184,104 @@ def check_orphan_tmux_sessions(config: dict, fix: bool = False) -> list[Finding]
                     "no server running",
                 )
                 if any(m in stderr_lower for m in gone_markers):
+                    finding.fixed = True
+                    finding.message += " (already gone)"
+                else:
+                    detail = (
+                        kill.stderr.strip().splitlines()[0]
+                        if kill.stderr and kill.stderr.strip()
+                        else f"returncode={kill.returncode}"
+                    )
+                    finding.message += f" — kill failed: {detail}"
+                    finding.fixed = False
+
+        findings.append(finding)
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Migration: sweep legacy (pre-hash) tmux sessions
+# ---------------------------------------------------------------------------
+
+
+_BENIGN_KILL_MARKERS = (
+    "can't find session",
+    "session not found",
+    "no server running",
+)
+
+
+def sweep_legacy_tmux_sessions(
+    config: dict,
+    confirmed: bool = False,
+) -> list[Finding]:
+    """List or kill pre-hash tmux session names host-wide.
+
+    Matches sessions whose names follow the pre-upgrade layout introduced
+    before #231 (autoscaler/runner) and #235 (deploy) — i.e., names lacking
+    an 8-char colony hash token:
+
+    - ``auto-<role>-<N>``
+    - ``runner-<role>-<N>``
+    - ``antfarm-<node>-<agent>-<idx>``
+
+    When ``confirmed=False``, returns one ``info`` finding per match so callers
+    can preview the sweep. When ``confirmed=True``, attempts ``tmux kill-session``
+    per match using the same benign-race stderr tolerance as
+    :func:`check_orphan_tmux_sessions`.
+
+    This is a **host-wide** operation; it is not scoped to a single colony.
+    Run it only after confirming there is no peer colony still using the
+    legacy format.
+
+    Args:
+        config: Doctor config dict (unused; signature mirrors other checks).
+        confirmed: When True, kill each match. Default False (dry-run preview).
+
+    Returns:
+        List of findings, one per matched legacy session.
+    """
+    del config  # unused — sweep is host-wide
+    if not shutil.which("tmux"):
+        return []
+
+    env = {**os.environ, "LC_ALL": "C"}
+    result = subprocess.run(
+        ["tmux", "list-sessions", "-F", "#{session_name}"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if result.returncode != 0:
+        # tmux server not running — nothing to sweep
+        return []
+
+    findings: list[Finding] = []
+    for raw in result.stdout.splitlines():
+        name = raw.strip()
+        if not name or not LEGACY_TMUX_RE.match(name):
+            continue
+
+        finding = Finding(
+            severity="info",
+            check="legacy_tmux_session",
+            message=f"Legacy session: {name}",
+            auto_fixable=True,
+        )
+
+        if confirmed:
+            kill = subprocess.run(
+                ["tmux", "kill-session", "-t", name],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if kill.returncode == 0:
+                finding.fixed = True
+            else:
+                stderr_lower = (kill.stderr or "").strip().lower()
+                if any(m in stderr_lower for m in _BENIGN_KILL_MARKERS):
                     finding.fixed = True
                     finding.message += " (already gone)"
                 else:

@@ -1068,3 +1068,248 @@ def test_two_mock_colonies_dont_cross_see(tmp_path):
 
     assert len(findings_b) == 1 and name_b in findings_b[0].message
     assert name_a not in findings_b[0].message
+
+
+# ---------------------------------------------------------------------------
+# Legacy tmux sweep (#237)
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_regex_matches_auto_role_n():
+    """Pre-#231 ``auto-<role>-<N>`` sessions match, including multi-word roles."""
+    from antfarm.core.doctor import LEGACY_TMUX_RE
+
+    assert LEGACY_TMUX_RE.match("auto-builder-3")
+    assert LEGACY_TMUX_RE.match("auto-code-reviewer-12")
+    assert LEGACY_TMUX_RE.match("auto-planner-1")
+
+
+def test_legacy_regex_matches_runner_role_n():
+    """Pre-#231 ``runner-<role>-<N>`` sessions match, including multi-word roles."""
+    from antfarm.core.doctor import LEGACY_TMUX_RE
+
+    assert LEGACY_TMUX_RE.match("runner-planner-1")
+    assert LEGACY_TMUX_RE.match("runner-code-reviewer-7")
+
+
+def test_legacy_regex_matches_antfarm_deploy():
+    """Pre-#235 deploy sessions (``antfarm-<node>-<agent>-<idx>``) match."""
+    from antfarm.core.doctor import LEGACY_TMUX_RE
+
+    assert LEGACY_TMUX_RE.match("antfarm-node1-claude-0")
+    assert LEGACY_TMUX_RE.match("antfarm-node-2-codex-11")
+
+
+def test_legacy_regex_rejects_hashed_names():
+    """New-format hash-prefixed names for all three prefixes do NOT match."""
+    from antfarm.core.doctor import LEGACY_TMUX_RE
+
+    assert not LEGACY_TMUX_RE.match("auto-a1b2c3d4-builder-3")
+    assert not LEGACY_TMUX_RE.match("runner-deadbeef-planner-1")
+    assert not LEGACY_TMUX_RE.match("antfarm-ffffffff-node1-claude-0")
+    # Also don't trip on unrelated session names
+    assert not LEGACY_TMUX_RE.match("some-unrelated-session")
+    assert not LEGACY_TMUX_RE.match("auto-builder")  # missing -N
+    assert not LEGACY_TMUX_RE.match("runner-3")  # missing role
+
+
+def test_sweep_legacy_tmux_dry_run_reports_only():
+    """confirmed=False emits info findings only; no kill-session invoked."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import sweep_legacy_tmux_sessions
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = "auto-builder-3\nrunner-planner-1\nantfarm-a1b2c3d4-node-x-0\n"
+
+    calls: list = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        return list_result
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", side_effect=fake_run),
+    ):
+        findings = sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=False)
+
+    assert len(findings) == 2
+    names = sorted(f.message for f in findings)
+    assert any("auto-builder-3" in n for n in names)
+    assert any("runner-planner-1" in n for n in names)
+    for f in findings:
+        assert f.severity == "info"
+        assert f.check == "legacy_tmux_session"
+        assert f.auto_fixable is True
+        assert f.fixed is False
+    # Only list-sessions was called — no kill-session
+    assert all(c[:2] == ["tmux", "list-sessions"] for c in calls)
+
+
+def test_sweep_legacy_tmux_confirmed_kills():
+    """confirmed=True runs tmux kill-session per match and marks fixed=True."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import sweep_legacy_tmux_sessions
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = "auto-builder-3\nrunner-planner-1\n"
+
+    kill_result = MagicMock()
+    kill_result.returncode = 0
+    kill_result.stderr = ""
+
+    calls: list = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["tmux", "list-sessions"]:
+            return list_result
+        return kill_result
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", side_effect=fake_run),
+    ):
+        findings = sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=True)
+
+    assert len(findings) == 2
+    assert all(f.fixed for f in findings)
+    kill_cmds = [c for c in calls if c[:2] == ["tmux", "kill-session"]]
+    targets = sorted(c[3] for c in kill_cmds)
+    assert targets == ["auto-builder-3", "runner-planner-1"]
+
+
+def test_sweep_legacy_tmux_handles_already_gone():
+    """Benign-race stderr from kill-session → fixed=True with "(already gone)"."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import sweep_legacy_tmux_sessions
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = "auto-builder-3\n"
+
+    kill_result = MagicMock()
+    kill_result.returncode = 1
+    kill_result.stderr = "can't find session: auto-builder-3"
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["tmux", "list-sessions"]:
+            return list_result
+        return kill_result
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", side_effect=fake_run),
+    ):
+        findings = sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=True)
+
+    assert len(findings) == 1
+    assert findings[0].fixed is True
+    assert "(already gone)" in findings[0].message
+
+
+def test_sweep_legacy_tmux_handles_kill_failure():
+    """Real kill-session failure → fixed=False with "kill failed:" detail."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import sweep_legacy_tmux_sessions
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = "runner-planner-1\n"
+
+    kill_result = MagicMock()
+    kill_result.returncode = 2
+    kill_result.stderr = "permission denied: something real and bad"
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["tmux", "list-sessions"]:
+            return list_result
+        return kill_result
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", side_effect=fake_run),
+    ):
+        findings = sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=True)
+
+    assert len(findings) == 1
+    assert findings[0].fixed is False
+    assert "kill failed:" in findings[0].message
+    assert "permission denied" in findings[0].message
+
+
+def test_sweep_legacy_tmux_no_tmux_returns_empty():
+    """tmux binary missing → sweep returns [] without raising."""
+    from unittest.mock import patch
+
+    from antfarm.core.doctor import sweep_legacy_tmux_sessions
+
+    with patch("antfarm.core.doctor.shutil.which", return_value=None):
+        assert sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=False) == []
+        assert sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=True) == []
+
+
+def test_sweep_legacy_tmux_no_server_returns_empty():
+    """tmux server not running (list-sessions returncode != 0) → []."""
+    from unittest.mock import MagicMock, patch
+
+    from antfarm.core.doctor import sweep_legacy_tmux_sessions
+
+    list_result = MagicMock()
+    list_result.returncode = 1
+    list_result.stdout = ""
+
+    with (
+        patch("antfarm.core.doctor.shutil.which", return_value="/usr/bin/tmux"),
+        patch("antfarm.core.doctor.subprocess.run", return_value=list_result),
+    ):
+        assert sweep_legacy_tmux_sessions({"data_dir": "/x"}, confirmed=True) == []
+
+
+def test_run_doctor_sweep_legacy_tmux_flag_invokes_sweep():
+    """run_doctor(sweep_legacy_tmux=True) appends legacy_tmux_session findings."""
+    from unittest.mock import MagicMock, patch
+
+    import antfarm.core.doctor as doctor_mod
+
+    list_result = MagicMock()
+    list_result.returncode = 0
+    list_result.stdout = "auto-builder-3\n"
+
+    kill_result = MagicMock()
+    kill_result.returncode = 0
+    kill_result.stderr = ""
+
+    import subprocess as real_subprocess
+
+    real_run = real_subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "tmux":
+            if cmd[:2] == ["tmux", "list-sessions"]:
+                return list_result
+            return kill_result
+        return real_run(cmd, *args, **kwargs)
+
+    backend = MagicMock()
+    backend.list_tasks.return_value = []
+    backend.list_nodes.return_value = []
+
+    config = {"data_dir": "/tmp/antfarm-test-doctor-sweep"}
+    os.makedirs(config["data_dir"], exist_ok=True)
+
+    with (
+        patch.object(doctor_mod.shutil, "which", return_value="/usr/bin/tmux"),
+        patch.object(doctor_mod.subprocess, "run", side_effect=fake_run),
+    ):
+        findings = doctor_mod.run_doctor(backend, config, fix=False, sweep_legacy_tmux=True)
+
+    legacy = [f for f in findings if f.check == "legacy_tmux_session"]
+    assert len(legacy) == 1
+    assert legacy[0].fixed is True
