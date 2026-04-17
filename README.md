@@ -10,7 +10,7 @@ Not a framework. Not AGI. Not a cloud service.
 
 A self-hosted coordinator that fans coding tasks across multiple AI agent sessions — on one machine or many — and merges the results through a deterministic gate.
 
-Closest neighbor is tmux-orchestrator; unlike CrewAI or AutoGen, antfarm is not a meta-agent framework — the agents are real Claude Code (or Codex/Aider) sessions.
+Antfarm is not a multi-agent framework like CrewAI or AutoGen — there is no agent-to-agent conversation. It is closer to a CI runner pool: each task is sealed (one AI session, one git worktree, one PR), a deterministic gate merges the results, and coordination happens through specs and code review, not chat.
 
 ---
 
@@ -52,6 +52,23 @@ $ antfarm scout --watch
 No manual intervention between `mission create` and `mission complete`. The kickback at 14:13 is the Soldier refusing to merge a reviewer `needs_changes`; the builder re-tries attempt 2.
 
 <!-- asciicast: record after rewrite lands, link here -->
+
+### Adding a second machine
+
+```
+# on machine-2 (same trusted network, same repo cloned)
+$ antfarm runner --colony-url http://lead:7433 --repo-path ~/projects/rate-limiter
+[runner] node=machine-2  listening on 127.0.0.1:7434  max-workers=4
+[runner] registered with colony a4f2c1e8
+
+# back on the lead, scout --watch picks it up:
+14:21:03  colony      node registered: machine-2  (capacity=4)
+14:21:04  autoscaler  scaling builders 3 -> 5  (2 placed on machine-2)
+14:21:11  worker      machine-2/builder-1 claimed task-004
+14:21:11  worker      machine-2/builder-2 claimed task-005
+```
+
+Same mission, two machines. The autoscaler sees the new runner's capacity and places additional builders there; workers draw from the shared queue over HTTP.
 
 ---
 
