@@ -375,7 +375,10 @@ class WorkerRuntime:
                 task_id, self.worker_id, "task claimed, creating workspace"
             )
 
-        workspace = self.workspace_mgr.create(task_id, attempt_id)
+        dep_branches = self._resolve_dep_branches(task)
+        workspace = self.workspace_mgr.create(
+            task_id, attempt_id, dep_branches=dep_branches
+        )
         logger.info("workspace created path=%s", workspace)
         _emit("workspace_created", task_id, workspace)
 
@@ -618,6 +621,57 @@ class WorkerRuntime:
                     )
 
         return True
+
+    # ------------------------------------------------------------------
+    # Dependency branch resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_dep_branches(self, task: dict) -> list[str]:
+        """Resolve a task's unmerged dep branches for worktree base selection.
+
+        For each task ID in ``task["depends_on"]``:
+
+        1. Look up the dep via colony.get_task.
+        2. Keep deps where ``status == "done"`` and the current-attempt's
+           ``status != "merged"`` (i.e. harvested but not yet marked merged
+           by Soldier).
+        3. Collect each kept dep's current-attempt ``branch``; skip deps
+           with no branch (safe fallback to integration).
+
+        Returns an empty list if there are no deps or none are eligible.
+        WorkspaceManager uses the list length to decide base selection.
+        """
+        dep_ids = task.get("depends_on") or []
+        if not dep_ids:
+            return []
+
+        branches: list[str] = []
+        for dep_id in dep_ids:
+            try:
+                dep = self.colony.get_task(dep_id)
+            except Exception as exc:
+                logger.warning(
+                    "dep lookup failed dep_id=%s error=%s — skipping", dep_id, exc
+                )
+                continue
+            if not dep or dep.get("status") != "done":
+                continue
+            current_attempt_id = dep.get("current_attempt")
+            if not current_attempt_id:
+                continue
+            current_attempt = None
+            for att in dep.get("attempts", []):
+                if att.get("attempt_id") == current_attempt_id:
+                    current_attempt = att
+                    break
+            if current_attempt is None:
+                continue
+            if current_attempt.get("status") == "merged":
+                continue
+            branch = current_attempt.get("branch")
+            if branch:
+                branches.append(branch)
+        return branches
 
     # ------------------------------------------------------------------
     # Artifact building & PR creation

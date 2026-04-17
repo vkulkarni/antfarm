@@ -1752,3 +1752,83 @@ def test_invalid_poll_interval_raises(tmp_path, http_client):
             poll_interval=0,
             client=http_client,
         )
+
+
+# ---------------------------------------------------------------------------
+# v0.6.7 P2: Worker resolves depends_on → dep_branches for WorkspaceManager
+# ---------------------------------------------------------------------------
+
+
+def test_worker_passes_unmerged_dep_branch_to_workspace(tc, runtime):
+    """Worker resolves a harvested-but-unmerged dep and passes its branch.
+
+    Carries dep + child, marks the dep harvested (status=done, attempt done,
+    has a branch). The child is then foraged and WorkspaceManager.create must
+    be called with dep_branches=[<dep's current-attempt branch>].
+    """
+    # Carry dep, run a normal successful agent to harvest it
+    _carry(tc, task_id="task-dep")
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+    # Forage + harvest just the dep (no child yet)
+    runtime._process_one_task()
+
+    # The dep should now be done with a branch on its current attempt
+    dep = tc.get("/tasks/task-dep").json()
+    assert dep["status"] == "done"
+    dep_branch = None
+    for att in dep["attempts"]:
+        if att["attempt_id"] == dep["current_attempt"]:
+            dep_branch = att["branch"]
+            break
+    assert dep_branch, "dep attempt should have a branch after harvest"
+
+    # Carry the child that depends on it
+    r = tc.post("/tasks", json={
+        "id": "task-child", "title": "Child", "spec": "c",
+        "depends_on": ["task-dep"],
+    })
+    assert r.status_code == 201
+
+    # Now forage the child — WorkspaceManager.create should be called with
+    # dep_branches=[dep_branch]
+    runtime.workspace_mgr.create.reset_mock()
+    runtime._process_one_task()
+
+    # create() should have been called once for the child
+    runtime.workspace_mgr.create.assert_called_once()
+    _, kwargs = runtime.workspace_mgr.create.call_args
+    assert kwargs.get("dep_branches") == [dep_branch]
+
+
+def test_worker_skips_merged_deps(tc, runtime):
+    """If the dep's current attempt is MERGED, no dep branch is passed."""
+    # Carry + harvest dep
+    _carry(tc, task_id="task-dep-merged")
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+    runtime._process_one_task()
+
+    dep = tc.get("/tasks/task-dep-merged").json()
+    attempt_id = dep["current_attempt"]
+
+    # Mark the attempt as MERGED via the colony API
+    r = tc.post("/tasks/task-dep-merged/merge", json={"attempt_id": attempt_id})
+    assert r.status_code in (200, 201, 204)
+
+    # Carry child
+    r = tc.post("/tasks", json={
+        "id": "task-child-merged", "title": "Child", "spec": "c",
+        "depends_on": ["task-dep-merged"],
+    })
+    assert r.status_code == 201
+
+    runtime.workspace_mgr.create.reset_mock()
+    runtime._process_one_task()
+
+    runtime.workspace_mgr.create.assert_called_once()
+    _, kwargs = runtime.workspace_mgr.create.call_args
+    # Merged dep must NOT be included — falls back to integration
+    assert kwargs.get("dep_branches") == []

@@ -582,7 +582,7 @@ def _make_worker_with_fake_colony(fake: _FakeColony) -> WorkerRuntime:
     runtime._heartbeat_thread = None
 
     class _WS:
-        def create(self, task_id, attempt_id):
+        def create(self, task_id, attempt_id, dep_branches=None):
             return "/tmp/ws/fake"
 
     runtime.workspace_mgr = _WS()
