@@ -2,6 +2,10 @@
 
 Reads a fleet configuration file and starts workers on remote machines via SSH.
 Each worker is launched inside a tmux session for persistence and easy monitoring.
+
+Session names are scoped by ``hash(realpath(fleet_config) | colony_url)``.
+See UPGRADE.md § "Deploy Identity Model" for the full explanation of shared vs
+isolated namespaces and the localhost-tunnel edge case.
 """
 
 from __future__ import annotations
