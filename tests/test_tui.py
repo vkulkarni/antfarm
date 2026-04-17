@@ -5,6 +5,7 @@ without any live terminal or network I/O.
 """
 
 import httpx
+from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
@@ -12,7 +13,7 @@ from antfarm.core.tui import AntfarmTUI, PipelineSnapshot
 
 
 def _make_tui() -> AntfarmTUI:
-    return AntfarmTUI(colony_url="http://localhost:7433", token=None)
+    return AntfarmTUI(colony_url="http://localhost:7433", token=None, autostart_activity=False)
 
 
 def _attempt(
@@ -891,3 +892,258 @@ def test_tui_shows_generic_error_on_other_exceptions(monkeypatch):
     panel = layout.renderable
     text = str(panel.renderable)
     assert "Connection error: kaboom" in text
+
+
+# ---------------------------------------------------------------------------
+# Activity feed (SSE consumer + rendering)
+# ---------------------------------------------------------------------------
+
+
+class _FakeStream:
+    """Context manager mimicking httpx.stream() with iter_lines()."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def iter_lines(self):
+        yield from self._lines
+
+
+def _sse(event: dict) -> str:
+    import json as _json
+
+    return f"data: {_json.dumps(event)}"
+
+
+def test_ingest_event_appends_and_advances_cursor():
+    tui = _make_tui()
+    tui._ingest_event({"id": 7, "type": "merged", "actor": "soldier", "detail": "pr=1"})
+    tui._ingest_event({"id": 9, "type": "harvested", "actor": "worker", "detail": "pr=2"})
+    assert len(tui._activity_events) == 2
+    assert tui._activity_cursor == 9
+
+
+def test_ingest_event_cursor_never_decreases():
+    tui = _make_tui()
+    tui._ingest_event({"id": 12, "type": "merged"})
+    tui._ingest_event({"id": 3, "type": "merged"})
+    assert tui._activity_cursor == 12
+
+
+def test_poll_events_once_parses_stream(monkeypatch):
+    """_poll_events_once parses SSE data: lines and populates the deque."""
+    tui = _make_tui()
+    lines = [
+        _sse({"id": 1, "type": "queen_plan_created", "actor": "queen", "detail": "plan-001"}),
+        "",
+        _sse({"id": 2, "type": "worker_spawned", "actor": "autoscaler", "detail": "planner-1"}),
+        "",
+    ]
+
+    def fake_stream(method, url, **kwargs):
+        assert url.endswith("/events")
+        assert kwargs["params"]["after"] == 0
+        return _FakeStream(lines)
+
+    monkeypatch.setattr("antfarm.core.tui.httpx.stream", fake_stream)
+    tui._poll_events_once()
+
+    assert len(tui._activity_events) == 2
+    ids = [ev["id"] for ev in tui._activity_events]
+    assert ids == [1, 2]
+    assert tui._activity_cursor == 2
+
+
+def test_poll_events_once_skips_non_data_and_malformed(monkeypatch):
+    tui = _make_tui()
+    lines = [
+        ": keepalive",
+        "",
+        _sse({"id": 1, "type": "merged", "actor": "soldier", "detail": "ok"}),
+        "",
+        "data: not-json{{{",
+        "",
+        _sse({"id": 2, "type": "harvested", "actor": "worker", "detail": "ok"}),
+        "",
+    ]
+
+    def fake_stream(method, url, **kwargs):
+        return _FakeStream(lines)
+
+    monkeypatch.setattr("antfarm.core.tui.httpx.stream", fake_stream)
+    tui._poll_events_once()
+
+    assert [ev["id"] for ev in tui._activity_events] == [1, 2]
+
+
+def test_activity_loop_retries_on_httpx_error(monkeypatch):
+    """A single iteration that raises should be swallowed; the loop sleeps and retries."""
+    import contextlib
+
+    tui = _make_tui()
+    calls = {"n": 0}
+
+    def flaky_poll():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("boom")
+        # Second call: pretend to succeed, then stop the loop by raising SystemExit
+        raise SystemExit
+
+    monkeypatch.setattr(tui, "_poll_events_once", flaky_poll)
+    monkeypatch.setattr("antfarm.core.tui.time.sleep", lambda _s: None)
+
+    with contextlib.suppress(SystemExit):
+        tui._activity_loop()
+
+    assert calls["n"] >= 2
+
+
+def test_render_activity_empty_shows_placeholder():
+    tui = _make_tui()
+    rendered = tui._render_activity()
+    assert isinstance(rendered, Text)
+    assert "waiting for events" in rendered.plain
+
+
+def test_render_activity_formats_rows():
+    tui = _make_tui()
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "merged",
+            "actor": "soldier",
+            "detail": "merging task-001 to main",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    )
+    tui._ingest_event(
+        {
+            "id": 2,
+            "type": "queen_plan_created",
+            "actor": "queen",
+            "detail": "created plan plan-v061",
+            "ts": "2026-04-16T14:33:05+00:00",
+        }
+    )
+
+    rendered = tui._render_activity()
+    plain = rendered.plain
+
+    # Two rows, newest last (auto-scroll)
+    lines = plain.split("\n")
+    assert len(lines) == 2
+    assert "soldier" in lines[0]
+    assert "merging task-001 to main" in lines[0]
+    assert "queen" in lines[1]
+    assert "created plan plan-v061" in lines[1]
+    # Actor column is fixed-width 12
+    assert lines[0].split("  ")[1].startswith("soldier")
+
+
+def test_render_activity_uses_tail_when_over_max_rows():
+    tui = _make_tui()
+    for i in range(1, 11):
+        tui._ingest_event(
+            {
+                "id": i,
+                "type": "tick",
+                "actor": "doctor",
+                "detail": f"event-{i}",
+                "ts": "2026-04-16T14:32:11+00:00",
+            }
+        )
+    rendered = tui._render_activity(max_rows=4)
+    plain = rendered.plain
+    lines = plain.split("\n")
+    assert len(lines) == 4
+    # Newest (event-10) rendered last
+    assert "event-10" in lines[-1]
+    assert "event-7" in lines[0]
+
+
+def test_render_activity_failed_type_is_red():
+    tui = _make_tui()
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "merge_failed",
+            "actor": "soldier",
+            "detail": "conflict on task-001",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    )
+    rendered = tui._render_activity()
+    # Rich Text stores styles as spans; verify at least one span carries 'red'
+    styles = [str(span.style) for span in rendered.spans]
+    assert any("red" in s for s in styles)
+
+
+def test_build_display_includes_activity_panel(monkeypatch):
+    tui = _make_tui()
+
+    def _fake_fetch(path):
+        if path == "/status/full":
+            return {
+                "status": {"nodes": 0},
+                "tasks": [],
+                "workers": [],
+                "soldier": "idle",
+            }
+        if path == "/missions":
+            return []
+        return {}
+
+    monkeypatch.setattr(tui, "_fetch", _fake_fetch)
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "merged",
+            "actor": "soldier",
+            "detail": "task-001 merged",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    )
+
+    layout = tui._build_display()
+    activity_layout = layout["activity"]
+    panel = activity_layout.renderable
+    assert isinstance(panel, Panel)
+    body = panel.renderable
+    assert isinstance(body, Text)
+    assert "soldier" in body.plain
+    assert "task-001 merged" in body.plain
+
+
+def test_autostart_activity_default_starts_thread(monkeypatch):
+    """autostart_activity=True (default) spins up the background thread."""
+
+    # Stub httpx.stream so the thread doesn't actually hit the network.
+    # Raise ConnectError to exercise the retry-silent path, then yield to
+    # the main thread.
+    monkeypatch.setattr(
+        "antfarm.core.tui.httpx.stream",
+        lambda *a, **kw: (_ for _ in ()).throw(httpx.ConnectError("nope")),
+    )
+    # Shorten the retry sleep so the thread churns but stays daemon
+    monkeypatch.setattr("antfarm.core.tui.time.sleep", lambda _s: None)
+
+    tui = AntfarmTUI(colony_url="http://localhost:7433", token=None)
+    try:
+        assert tui._activity_thread is not None
+        assert tui._activity_thread.is_alive()
+        assert tui._activity_thread.daemon is True
+    finally:
+        # Thread is daemon; it will be reaped on interpreter exit.
+        pass
+
+
+def test_autostart_activity_false_does_not_start_thread():
+    tui = AntfarmTUI(colony_url="http://localhost:7433", token=None, autostart_activity=False)
+    assert tui._activity_thread is None
