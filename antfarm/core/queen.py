@@ -27,6 +27,7 @@ from antfarm.core.missions import (
     is_infra_task,
     link_task_to_mission,
 )
+from antfarm.core.serve import _emit_event
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,13 @@ class Queen:
         """
         plan_task_id = mission.get("plan_task_id")
         if plan_task_id is None:
+            if mission["re_plan_count"] == 0:
+                _emit_event(
+                    "mission_created",
+                    "",
+                    detail=f"mission={mission['mission_id']} {mission['spec'][:80]}",
+                    actor="queen",
+                )
             plan_task_id = self._create_plan_task(mission)
             self.backend.update_mission(
                 mission["mission_id"],
@@ -231,6 +239,12 @@ class Queen:
 
         if verdict["verdict"] == "pass":
             artifact = PlanArtifact.from_dict(mission["plan_artifact"])
+            _emit_event(
+                "plan_approved",
+                mission.get("plan_task_id", "") or "",
+                detail=f"mission={mission['mission_id']} tasks={artifact.task_count}",
+                actor="queen",
+            )
             self._spawn_child_tasks(mission, artifact)
             self._transition(mission, MissionStatus.BUILDING)
             self._maybe_generate_context(mission)
@@ -388,6 +402,12 @@ class Queen:
 
         with contextlib.suppress(ValueError):
             link_task_to_mission(self.backend, task, mission_id)
+        _emit_event(
+            "plan_task_created",
+            plan_task_id,
+            detail=f"mission={mission_id}",
+            actor="queen",
+        )
         return plan_task_id
 
     def _create_plan_review_task(self, mission: dict, artifact: PlanArtifact) -> str:
@@ -523,6 +543,12 @@ class Queen:
             with contextlib.suppress(ValueError):
                 link_task_to_mission(self.backend, task, mission_id)
 
+        _emit_event(
+            "tasks_seeded",
+            "",
+            detail=f"mission={mission_id} count={len(child_ids)}",
+            actor="queen",
+        )
         return child_ids
 
     # --- artifact extraction ---
@@ -687,6 +713,13 @@ class Queen:
             mission["mission_id"],
             new_status.value,
         )
+        if new_status == MissionStatus.COMPLETE:
+            _emit_event(
+                "mission_complete",
+                "",
+                detail=f"mission={mission['mission_id']}",
+                actor="queen",
+            )
 
     def _fail(self, mission: dict, reason: str) -> None:
         """Transition mission to FAILED with a reason."""
