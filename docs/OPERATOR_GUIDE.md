@@ -451,7 +451,7 @@ colony id: <uuid>  hash: <8hex>  (data_dir: /srv/colony/.antfarm)
 This fires once per server startup via the FastAPI startup event (#249),
 so it is reliable for mapping a tmux session back to its colony.
 
-`antfarm --version` prints the installed package version (backed by
+`antfarm version` prints the installed package version (backed by
 package metadata since #213 — editable installs no longer drift).
 
 ---
@@ -494,7 +494,7 @@ Concrete symptoms with concrete fixes.
 
 - **"Duplicate PRs from kickback"** — fixed in #222: Soldier now closes
   the superseded attempt's PR with a comment. Verify version with
-  `antfarm --version`; if older, upgrade or close the old PR manually.
+  `antfarm version`; if older, upgrade or close the old PR manually.
 
 - **"Orphan tmux sessions after restart"** — normal if tmux dies between
   adoption passes. Run `antfarm doctor --fix` to clean.
