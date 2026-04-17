@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from antfarm.core.process_manager import colony_hash
 
 logger = logging.getLogger(__name__)
 
@@ -47,15 +50,29 @@ def load_fleet_config(config_path: str) -> list[NodeConfig]:
     nodes = data if isinstance(data, list) else data.get("nodes", [])
     configs = []
     for entry in nodes:
-        configs.append(NodeConfig(
-            node_id=entry["node_id"],
-            host=entry["host"],
-            ssh_user=entry["ssh_user"],
-            repo_path=entry["repo_path"],
-            agent_type=entry["agent_type"],
-            count=entry.get("count", 1),
-        ))
+        configs.append(
+            NodeConfig(
+                node_id=entry["node_id"],
+                host=entry["host"],
+                ssh_user=entry["ssh_user"],
+                repo_path=entry["repo_path"],
+                agent_type=entry["agent_type"],
+                count=entry.get("count", 1),
+            )
+        )
     return configs
+
+
+def _colony_prefix(config_path: str, colony_url: str) -> str:
+    """Return the colony-scoped tmux session prefix for this deploy target.
+
+    The hash is taken over ``realpath(config_path) | colony_url`` so two deploys
+    pointed at different colonies (or different fleet configs) cannot collide on
+    session names — each colony sees only its own remote workers in
+    ``deploy --status``.
+    """
+    key = f"{os.path.realpath(config_path)}|{colony_url}"
+    return f"antfarm-{colony_hash(key)}"
 
 
 def _build_worker_command(
@@ -82,10 +99,12 @@ def _build_ssh_command(
     worker_index: int,
     colony_url: str,
     integration_branch: str,
+    config_path: str,
 ) -> list[str]:
     """Build the full SSH command that launches a worker in a tmux session."""
     worker_cmd = _build_worker_command(node, worker_index, colony_url, integration_branch)
-    session_name = f"antfarm-{node.node_id}-{node.agent_type}-{worker_index}"
+    prefix = _colony_prefix(config_path, colony_url)
+    session_name = f"{prefix}-{node.node_id}-{node.agent_type}-{worker_index}"
     # -A: attach-or-create to avoid duplicate session errors
     tmux_cmd = f"tmux new-session -A -d -s {shlex.quote(session_name)} {shlex.quote(worker_cmd)}"
     return [
@@ -109,65 +128,75 @@ def deploy(
 
     for node in nodes:
         for i in range(node.count):
-            ssh_cmd = _build_ssh_command(node, i, colony_url, integration_branch)
+            ssh_cmd = _build_ssh_command(node, i, colony_url, integration_branch, config_path)
             logger.info("Deploying worker %d to %s@%s", i, node.ssh_user, node.host)
             try:
                 subprocess.run(ssh_cmd, check=True, capture_output=True, text=True, timeout=30)
-                results.append(DeployResult(
-                    node_id=node.node_id,
-                    host=node.host,
-                    worker_index=i,
-                    success=True,
-                    message="Worker launched successfully",
-                ))
+                results.append(
+                    DeployResult(
+                        node_id=node.node_id,
+                        host=node.host,
+                        worker_index=i,
+                        success=True,
+                        message="Worker launched successfully",
+                    )
+                )
             except subprocess.CalledProcessError as e:
-                results.append(DeployResult(
-                    node_id=node.node_id,
-                    host=node.host,
-                    worker_index=i,
-                    success=False,
-                    message=f"SSH failed: {e.stderr.strip() or e.stdout.strip() or str(e)}",
-                ))
+                results.append(
+                    DeployResult(
+                        node_id=node.node_id,
+                        host=node.host,
+                        worker_index=i,
+                        success=False,
+                        message=f"SSH failed: {e.stderr.strip() or e.stdout.strip() or str(e)}",
+                    )
+                )
             except subprocess.TimeoutExpired:
-                results.append(DeployResult(
-                    node_id=node.node_id,
-                    host=node.host,
-                    worker_index=i,
-                    success=False,
-                    message="SSH connection timed out",
-                ))
+                results.append(
+                    DeployResult(
+                        node_id=node.node_id,
+                        host=node.host,
+                        worker_index=i,
+                        success=False,
+                        message="SSH connection timed out",
+                    )
+                )
 
     return results
 
 
-def _build_status_ssh_command(node: NodeConfig) -> list[str]:
-    """Build SSH command to list antfarm tmux sessions on a remote node."""
+def _build_status_ssh_command(node: NodeConfig, prefix: str) -> list[str]:
+    """Build SSH command to list this colony's antfarm tmux sessions on a remote node."""
+    # Grep is scoped to the colony-specific prefix so sessions for peer colonies
+    # deployed to the same host are not reported.
+    grep_pattern = f"^{prefix}-"
     return [
         "ssh",
         f"{node.ssh_user}@{node.host}",
-        "tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^antfarm-' || true",
+        f"tmux list-sessions -F '#{{session_name}}' 2>/dev/null | "
+        f"grep {shlex.quote(grep_pattern)} || true",
     ]
 
 
-def deploy_status(config_path: str) -> dict[str, list[str]]:
-    """Check which antfarm tmux sessions are running on each node.
+def deploy_status(
+    config_path: str,
+    colony_url: str = "http://localhost:7433",
+) -> dict[str, list[str]]:
+    """Check which antfarm tmux sessions for this colony are running on each node.
 
     Returns a dict mapping node_id to a list of active tmux session names.
+    Only sessions matching this colony's prefix are returned; sessions belonging
+    to peer colonies on the same host are filtered out at the remote ``grep``.
     """
     nodes = load_fleet_config(config_path)
+    prefix = _colony_prefix(config_path, colony_url)
     status: dict[str, list[str]] = {}
 
     for node in nodes:
-        ssh_cmd = _build_status_ssh_command(node)
+        ssh_cmd = _build_status_ssh_command(node, prefix)
         try:
-            result = subprocess.run(
-                ssh_cmd, capture_output=True, text=True, timeout=10
-            )
-            sessions = [
-                line.strip()
-                for line in result.stdout.strip().splitlines()
-                if line.strip()
-            ]
+            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=10)
+            sessions = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
             status[node.node_id] = sessions
         except subprocess.TimeoutExpired:
             status[node.node_id] = []

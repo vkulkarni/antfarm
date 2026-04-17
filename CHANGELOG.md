@@ -6,6 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+- `deploy.py` tmux session names are now colony-scoped with an 8-char hash of `(realpath(fleet_config) | colony_url)`. **Breaking:** pre-upgrade deploy sessions won't be found by `deploy status` — kill them manually via `tmux kill-session` and redeploy. (#235)
+
 ## [0.6.3] - 2026-04-16
 
 ### Changed
