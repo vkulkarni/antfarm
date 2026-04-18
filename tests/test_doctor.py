@@ -1816,3 +1816,166 @@ def test_check_stale_tasks_fix_respects_max_attempts(setup):
     data = json.loads(blocked_path.read_text())
     assert data["status"] == "blocked"
     assert any("moved to blocked" in t["message"] for t in data.get("trail", []))
+
+
+# ---------------------------------------------------------------------------
+# Retry-pattern checks (#325)
+# ---------------------------------------------------------------------------
+
+
+def _write_task_file(
+    data_dir: Path,
+    folder: str,
+    task_id: str,
+    *,
+    status: str,
+    attempts: list[dict] | None = None,
+    trail: list[dict] | None = None,
+    title: str | None = None,
+    max_attempts: int | None = None,
+) -> Path:
+    """Place a task JSON file directly into {data_dir}/tasks/{folder}/."""
+    task = _make_task(task_id)
+    task["status"] = status
+    task["current_attempt"] = None
+    task["attempts"] = attempts or []
+    task["trail"] = trail or []
+    task["signals"] = []
+    if title is not None:
+        task["title"] = title
+    if max_attempts is not None:
+        task["max_attempts"] = max_attempts
+    path = data_dir / "tasks" / folder / f"{task_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(task))
+    return path
+
+
+def _att(attempt_id: str, status: str) -> dict:
+    return {
+        "attempt_id": attempt_id,
+        "worker_id": "worker-x",
+        "status": status,
+        "branch": None,
+        "pr": None,
+        "started_at": datetime.now(UTC).isoformat(),
+        "completed_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def test_retry_patterns_flags_retry_ceiling(setup):
+    """3 superseded attempts + status=blocked → one retry_ceiling error."""
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+    _write_task_file(
+        data_dir,
+        "blocked",
+        "task-dead",
+        status="blocked",
+        attempts=[
+            _att("att-001", "superseded"),
+            _att("att-002", "superseded"),
+            _att("att-003", "superseded"),
+        ],
+    )
+
+    findings = run_doctor(backend, config, fix=False)
+    retry = [f for f in findings if f.check == "retry_ceiling"]
+    assert len(retry) == 1
+    assert retry[0].severity == "error"
+    assert retry[0].auto_fixable is False
+    assert "task-dead" in retry[0].message
+    assert "3/3" in retry[0].message
+
+
+def test_retry_patterns_flags_retrying_at_two_of_three(setup):
+    """2 finished attempts, task still ready → one retrying warning."""
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+    _write_task_file(
+        data_dir,
+        "ready",
+        "task-warn",
+        status="ready",
+        attempts=[
+            _att("att-001", "superseded"),
+            _att("att-002", "superseded"),
+        ],
+    )
+
+    findings = run_doctor(backend, config, fix=False)
+    retrying = [f for f in findings if f.check == "retrying"]
+    ceilings = [f for f in findings if f.check == "retry_ceiling"]
+    assert ceilings == []
+    assert len(retrying) == 1
+    assert retrying[0].severity == "warning"
+    assert retrying[0].auto_fixable is False
+    assert "task-warn" in retrying[0].message
+    assert "2 of max 3" in retrying[0].message
+
+
+def test_retry_patterns_ignores_fresh_task(setup):
+    """A task with zero finished attempts triggers no retry findings."""
+    backend, config = setup
+    backend.carry(_make_task("task-fresh"))
+
+    findings = run_doctor(backend, config, fix=False)
+    retry = [f for f in findings if f.check in ("retry_ceiling", "retrying")]
+    assert retry == []
+
+
+def test_retry_patterns_skips_infra_tasks(setup):
+    """Plan/review infra tasks are never flagged for retry patterns."""
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+    infra_ids = ["plan-foo", "review-foo", "review-plan-foo"]
+    for tid in infra_ids:
+        _write_task_file(
+            data_dir,
+            "blocked",
+            tid,
+            status="blocked",
+            attempts=[
+                _att("att-001", "superseded"),
+                _att("att-002", "superseded"),
+                _att("att-003", "superseded"),
+            ],
+        )
+
+    findings = run_doctor(backend, config, fix=False)
+    retry = [f for f in findings if f.check in ("retry_ceiling", "retrying")]
+    assert retry == []
+
+
+def test_retry_patterns_extracts_last_failure_reason(setup):
+    """The most recent kickback trail message is surfaced in the finding."""
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+    now = datetime.now(UTC).isoformat()
+    trail = [
+        {"ts": now, "worker_id": "w1", "message": "started work"},
+        {
+            "ts": now,
+            "worker_id": "system",
+            "message": "tests failed: ImportError while loading conftest",
+            "action_type": "kickback",
+        },
+        {"ts": now, "worker_id": "w2", "message": "later noise unrelated to failure"},
+    ]
+    _write_task_file(
+        data_dir,
+        "blocked",
+        "task-reason",
+        status="blocked",
+        attempts=[
+            _att("att-001", "superseded"),
+            _att("att-002", "superseded"),
+            _att("att-003", "superseded"),
+        ],
+        trail=trail,
+    )
+
+    findings = run_doctor(backend, config, fix=False)
+    retry = [f for f in findings if f.check == "retry_ceiling"]
+    assert len(retry) == 1
+    assert "tests failed: ImportError while loading conftest" in retry[0].message
