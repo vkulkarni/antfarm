@@ -96,7 +96,9 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
-    def recover_stale_task_if_worker_dead(self, task_id: str, current_attempt_id: str) -> bool:
+    def recover_stale_task_if_worker_dead(
+        self, task_id: str, current_attempt_id: str, max_attempts: int = 3
+    ) -> bool:
         """Atomically recover a stale active task only if its worker is dead.
 
         Under the backend lock, verify that the task is still in the active
@@ -106,10 +108,14 @@ class TaskBackend(ABC):
         observation was stale and another actor has already moved state
         forward.
 
-        When the conditions hold, supersede the current attempt, reset the
-        task to READY with ``current_attempt=None``, append a doctor trail
-        entry ("recovered by doctor"), and move the JSON from ``active/`` to
-        ``ready/``.
+        When the conditions hold, supersede the current attempt and then
+        route the task the same way ``kickback()`` does: if total
+        finished (DONE+SUPERSEDED) attempts >= effective max_attempts, move
+        the JSON from ``active/`` to ``blocked/`` with status BLOCKED.
+        Otherwise reset the task to READY with ``current_attempt=None``,
+        append a doctor trail entry ("recovered by doctor"), and move the
+        JSON from ``active/`` to ``ready/``. Per-task ``max_attempts``
+        overrides the function parameter (issue #333).
 
         Drift conditions that trigger a False return:
 
@@ -125,9 +131,12 @@ class TaskBackend(ABC):
         Args:
             task_id: ID of the task suspected to be stale.
             current_attempt_id: The attempt ID the caller observed as current.
+            max_attempts: Default max finished attempts before the task
+                is routed to BLOCKED instead of READY. Per-task
+                ``max_attempts`` on the task dict overrides this default.
 
         Returns:
-            True if the task was recovered to READY.
+            True if the task was recovered (to READY or BLOCKED).
             False if any drift condition prevented the recovery.
         """
         ...
