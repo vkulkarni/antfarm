@@ -54,18 +54,22 @@ def test_e2e_multi_node_placement(tmp_path):
     backend = FileBackend(root=data_dir)
 
     # Register 2 nodes with runner_urls
-    backend.register_node({
-        "node_id": "node-1",
-        "runner_url": "http://node1:7434",
-        "max_workers": 4,
-        "capabilities": [],
-    })
-    backend.register_node({
-        "node_id": "node-2",
-        "runner_url": "http://node2:7434",
-        "max_workers": 4,
-        "capabilities": [],
-    })
+    backend.register_node(
+        {
+            "node_id": "node-1",
+            "runner_url": "http://node1:7434",
+            "max_workers": 4,
+            "capabilities": [],
+        }
+    )
+    backend.register_node(
+        {
+            "node_id": "node-2",
+            "runner_url": "http://node2:7434",
+            "max_workers": 4,
+            "capabilities": [],
+        }
+    )
 
     # Add 4 ready builder tasks with different touches (non-overlapping)
     for i in range(1, 5):
@@ -103,13 +107,18 @@ def test_e2e_multi_node_placement(tmp_path):
         desired = call.args[1] if len(call.args) > 1 else call.kwargs.get("desired")
         node_desired[runner_url] = desired
 
-    # Both nodes should receive builder allocations
+    # Post-#320 depth-aware scaling: target = ceil(ready_unblocked * 0.5)
+    # = ceil(4 * 0.5) = 2 builders total across all nodes. Threshold (2) is
+    # met so both builders are placed. With 2 reachable nodes and round-robin
+    # placement (see placement.compute_placement), those 2 builders land one
+    # per node — we must never send both builders to a single node when
+    # capacity is available elsewhere.
     total_builders = sum(d.get("builder", 0) for d in node_desired.values())
-    assert total_builders == 4  # 4 tasks, 4 scope groups, max_builders=4
-
-    # Work should be distributed (each node gets some builders)
-    for url, desired in node_desired.items():
-        assert desired.get("builder", 0) > 0, f"Node {url} got no builders"
+    assert total_builders == 2
+    builders_per_node = [d.get("builder", 0) for d in node_desired.values()]
+    assert all(count >= 1 for count in builders_per_node), (
+        f"expected at least 1 builder on each of 2 nodes, got {node_desired}"
+    )
 
 
 def test_e2e_prompt_cache_roundtrip(tmp_path):
@@ -126,12 +135,8 @@ def test_e2e_prompt_cache_roundtrip(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True
-    )
+    subprocess.run(["git", "config", "user.email", "test@test"], cwd=str(repo), capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True)
     (repo / "CLAUDE.md").write_text("# Project\n\nTest project conventions.\n")
     subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
     subprocess.run(
