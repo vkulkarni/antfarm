@@ -134,8 +134,23 @@ class FileBackend(TaskBackend):
         return self._root / "guards" / f"{safe}.lock"
 
     def _write_json(self, path: Path, data: dict) -> None:
+        """Atomically write JSON to ``path`` via temp-file + rename.
+
+        Durability: the payload is flushed to disk via ``os.fsync`` on the
+        temp fd BEFORE the rename, so an OS crash after this call returns
+        cannot leave ``path`` with partial contents. The enclosing
+        directory is NOT fsynced — the rename becomes visible but its
+        durability across a power loss is not guaranteed in v0.1; add a
+        directory fsync under an env-var opt-in later if required.
+        """
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
+        payload = json.dumps(data, indent=2).encode("utf-8")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         tmp.replace(path)
 
     def _read_json(self, path: Path) -> dict:
@@ -1045,13 +1060,24 @@ class FileBackend(TaskBackend):
             return True
 
     def heartbeat(self, worker_id: str, status: dict) -> None:
-        """Write/update worker file in workers/. mtime = heartbeat timestamp."""
+        """Write/update worker file in workers/. mtime = heartbeat timestamp.
+
+        Held under ``self._lock`` to serialize against ``register_worker``,
+        ``update_worker_activity``, and ``deregister_worker_if_stale`` —
+        otherwise the read-modify-write here can clobber fields written by
+        a concurrent register (e.g. capabilities, rate_limit_until).
+        """
         worker_path = self._worker_path(worker_id)
-        data = self._read_json(worker_path) if worker_path.exists() else {"worker_id": worker_id}
-        data.update(status)
-        data["last_heartbeat"] = _now_iso()
-        self._write_json(worker_path, data)
-        # Touch to ensure mtime reflects now (write_json via replace does this)
+        with self._lock:
+            data = (
+                self._read_json(worker_path)
+                if worker_path.exists()
+                else {"worker_id": worker_id}
+            )
+            data.update(status)
+            data["last_heartbeat"] = _now_iso()
+            self._write_json(worker_path, data)
+            # Touch to ensure mtime reflects now (write_json via replace does this)
 
     def update_worker_activity(self, worker_id: str, action: str | None) -> None:
         """Set current_action / current_action_at on the worker file.
