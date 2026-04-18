@@ -1385,7 +1385,7 @@ def _make_runtime_with_caps(tmp_path, http_client, name, capabilities):
 
 
 def test_builder_polls_on_empty_queue(tmp_path, http_client):
-    """Builder workers poll 5 times (2.5min) before exiting on empty queue."""
+    """Builder workers poll 20 times (10min) before exiting on empty queue."""
     rt = _make_runtime_with_caps(tmp_path, http_client, "builder-1", capabilities=[])
 
     call_count = [0]
@@ -1397,8 +1397,8 @@ def test_builder_polls_on_empty_queue(tmp_path, http_client):
     rt.colony.forage = fake_forage
     rt.run()
 
-    # max_idle_polls=5 → one initial attempt + 5 retries = 6 forage calls
-    assert call_count[0] == 6
+    # max_idle_polls=20 → one initial attempt + 20 retries = 21 forage calls
+    assert call_count[0] == 21
 
 
 def test_planner_exits_immediately_on_empty_queue(tmp_path, http_client):
@@ -1816,7 +1816,7 @@ def test_max_empty_polls_zero_exits_immediately(tmp_path, http_client):
 
 
 def test_role_defaults_preserved_when_unset(tmp_path, http_client):
-    """max_empty_polls=None keeps reviewer=10, builder=5, planner=0."""
+    """max_empty_polls=None keeps reviewer=10, builder=20, planner=0."""
     reviewer = _make_runtime_with_polls(
         tmp_path, http_client, "r1", capabilities=["review"], max_empty_polls=None
     )
@@ -1828,8 +1828,35 @@ def test_role_defaults_preserved_when_unset(tmp_path, http_client):
     )
 
     assert reviewer._max_idle_polls == 10
-    assert builder._max_idle_polls == 5
+    assert builder._max_idle_polls == 20
     assert planner._max_idle_polls == 0
+
+
+def test_builder_default_max_empty_polls_is_twenty(tmp_path, http_client):
+    """Builders default to 20 idle polls so long missions amortize setup cost (#321)."""
+    builder = _make_runtime_with_polls(
+        tmp_path, http_client, "b-default", capabilities=[], max_empty_polls=None
+    )
+    assert builder._role == "builder"
+    assert builder._max_idle_polls == 20
+
+
+def test_reviewer_default_unchanged(tmp_path, http_client):
+    """Reviewer default stays at 10 after the builder bump (#321)."""
+    reviewer = _make_runtime_with_polls(
+        tmp_path, http_client, "r-default", capabilities=["review"], max_empty_polls=None
+    )
+    assert reviewer._role == "reviewer"
+    assert reviewer._max_idle_polls == 10
+
+
+def test_explicit_max_empty_polls_overrides_default(tmp_path, http_client):
+    """Explicit --max-empty-polls wins over the role default for builders (#321)."""
+    builder = _make_runtime_with_polls(
+        tmp_path, http_client, "b-explicit", capabilities=[], max_empty_polls=3
+    )
+    assert builder._role == "builder"
+    assert builder._max_idle_polls == 3
 
 
 def test_invalid_poll_interval_raises(tmp_path, http_client):
