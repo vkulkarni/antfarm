@@ -128,6 +128,17 @@ def _emit(event_type: str, task_id: str, detail: str = "") -> None:
         logger.debug("soldier _emit: _emit_event(%s) raised", event_type, exc_info=True)
 
 
+def _stderr_tail(stderr_bytes: bytes, n: int = 20) -> str:
+    """Return the last ``n`` lines of decoded stderr bytes.
+
+    Used to preserve diagnostic context on test failures (#326): without a
+    tail, short one-line summaries truncate the actual error into noise.
+    """
+    text = stderr_bytes.decode(errors="replace").rstrip()
+    lines = text.splitlines()
+    return "\n".join(lines[-n:]) if lines else ""
+
+
 class MergeResult(StrEnum):
     MERGED = "merged"
     FAILED = "failed"
@@ -177,6 +188,9 @@ class Soldier:
         self.last_failure_reason = ""
         # Event cursor for /events SSE stream. In-memory only; never persists.
         self._event_cursor: int = 0
+        # One-shot preflight validation of ``test_command`` — see #326. Fires
+        # at most once per Soldier lifetime from ``run`` or ``run_once``.
+        self._preflight_done: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -198,6 +212,7 @@ class Soldier:
         disabled (``require_review=False``), which no production deploy
         sets today (see #328 for the bug this split was hiding).
         """
+        self._run_preflight_if_needed()
         while True:
             if self.require_review:
                 self.run_once_with_review()
@@ -223,6 +238,7 @@ class Soldier:
         Returns:
             List of (task_id, MergeResult) tuples for each task processed.
         """
+        self._run_preflight_if_needed()
         if self.require_review:
             self.process_done_tasks()
         results = []
@@ -294,7 +310,8 @@ class Soldier:
                 continue
             task_id = task.get("id", "")
             if self._has_merged_attempt(task):
-                _emit("merge_skipped", task_id, "reason=already_merged")
+                # #327b: no emit here — merge_reconciled_external in
+                # _reconcile_external_merge is the operator-actionable signal.
                 continue
             # Post-kickback tasks have no current_attempt.
             if not task.get("current_attempt"):
@@ -565,7 +582,8 @@ class Soldier:
                 continue
             # Skip already-merged tasks
             if self._has_merged_attempt(task):
-                _emit("merge_skipped", task_id, "reason=already_merged")
+                # #327b: no emit here — merge_reconciled_external in
+                # _reconcile_external_merge is the operator-actionable signal.
                 continue
             # Post-kickback tasks have current_attempt=None.
             if not task.get("current_attempt"):
@@ -735,9 +753,13 @@ class Soldier:
                 check=False,
             )
             if r.returncode != 0:
-                self.last_failure_reason = (
-                    f"tests failed: {r.stdout.decode().strip()} {r.stderr.decode().strip()}"
+                stderr_tail = _stderr_tail(r.stderr or b"")
+                short = (
+                    r.stdout.decode(errors="replace").strip()
+                    + " "
+                    + r.stderr.decode(errors="replace").strip()
                 ).strip()
+                self.last_failure_reason = f"tests failed: {short[:120]}\n---\n{stderr_tail}\n---"
                 _emit(
                     "merge_failed",
                     task_id,
@@ -1043,9 +1065,13 @@ class Soldier:
             check=False,
         )
         if r.returncode != 0:
-            self.last_failure_reason = (
-                f"tests failed: {r.stdout.decode().strip()} {r.stderr.decode().strip()}"
+            stderr_tail = _stderr_tail(r.stderr or b"")
+            short = (
+                r.stdout.decode(errors="replace").strip()
+                + " "
+                + r.stderr.decode(errors="replace").strip()
             ).strip()
+            self.last_failure_reason = f"tests failed: {short[:120]}\n---\n{stderr_tail}\n---"
             _emit(
                 "merge_failed",
                 task_id,
@@ -1151,6 +1177,58 @@ class Soldier:
             return r.returncode != 0
         except OSError:
             return False
+
+    def _preflight_test_command(self) -> tuple[bool, str]:
+        """Run ``test_command`` once on a clean integration branch.
+
+        Returns:
+            Tuple of (passed, stderr_tail). ``passed`` is True if the command
+            exits 0 (or is empty). ``stderr_tail`` is the last 20 lines of
+            stderr on failure, or an exec-failure message if the command
+            could not be spawned.
+
+        See #326: catches operator mistakes like a missing ``test_command``
+        binary or a broken default ``pytest`` install before the first real
+        task fails. Fires at most once per Soldier lifetime.
+        """
+        if not self.test_command:
+            return True, ""
+        try:
+            r = subprocess.run(
+                self.test_command,
+                cwd=self.repo_path,
+                capture_output=True,
+                check=False,
+            )
+        except (OSError, FileNotFoundError) as exc:
+            return False, f"could not exec {self.test_command!r}: {exc}"
+        if r.returncode == 0:
+            return True, ""
+        return False, _stderr_tail(r.stderr or b"") or _stderr_tail(r.stdout or b"")
+
+    def _run_preflight_if_needed(self) -> None:
+        """One-shot preflight hook invoked by ``run`` and ``run_once``.
+
+        Sets ``_preflight_done=True`` BEFORE performing any work so that a
+        mid-preflight crash cannot cause an infinite retry loop on the next
+        lifetime. Skipped when ``_force_clean_repo`` cannot establish a
+        clean integration branch — a separate failure path already logs
+        that condition.
+        """
+        if self._preflight_done:
+            return
+        self._preflight_done = True
+        if not self._force_clean_repo():
+            return
+        passed, tail = self._preflight_test_command()
+        if passed:
+            return
+        logger.warning("soldier preflight: test_command failed:\n%s", tail)
+        _emit(
+            "test_command_broken",
+            "",
+            f"cmd={' '.join(self.test_command)} stderr=\n{tail}",
+        )
 
     def _force_clean_repo(self) -> bool:
         """Destructive recovery routine to restore a pristine clone.
@@ -1858,6 +1936,7 @@ class Soldier:
         instance.data_dir_name = data_dir_name
         instance.last_failure_reason = ""
         instance._event_cursor = 0
+        instance._preflight_done = False
         return instance
 
 
