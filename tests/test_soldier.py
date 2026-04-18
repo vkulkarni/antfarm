@@ -3239,3 +3239,206 @@ def test_cleanup_emits_diagnostic_when_incomplete(soldier_env, monkeypatch, tmp_
 
     incomplete = [e for e in events if e[0] == "cleanup_incomplete"]
     assert incomplete, f"expected cleanup_incomplete event, got {events}"
+
+
+# ---------------------------------------------------------------------------
+# #323: preserve colony data dir under git clean
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_preserves_data_dir_when_not_gitignored(soldier_env):
+    """_cleanup must not wipe the configured data dir, even when target repo's
+    .gitignore doesn't list it (#323)."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+
+    # soldier_env does not create a .gitignore — this matches the bug scenario
+    # where a fresh target repo has no entry for .antfarm/.
+    import os
+
+    os.makedirs(f"{repo}/.antfarm/tasks", exist_ok=True)
+    with open(f"{repo}/.antfarm/tasks/t.json", "w") as f:
+        f.write('{"id": "t-323"}')
+
+    soldier._cleanup()
+
+    assert os.path.exists(f"{repo}/.antfarm/tasks/t.json"), (
+        "colony data dir was wiped by git clean -fd in _cleanup (#323)"
+    )
+    with open(f"{repo}/.antfarm/tasks/t.json") as f:
+        assert f.read() == '{"id": "t-323"}'
+
+
+def test_force_clean_repo_preserves_data_dir_when_not_gitignored(soldier_env):
+    """_force_clean_repo must not wipe the configured data dir. Other untracked
+    files must still be removed (confirming clean still runs)."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+
+    import os
+
+    os.makedirs(f"{repo}/.antfarm/tasks", exist_ok=True)
+    with open(f"{repo}/.antfarm/tasks/t.json", "w") as f:
+        f.write('{"id": "t-323-force"}')
+
+    # Force the full destructive recovery code path: tracked dirty + untracked.
+    with open(f"{repo}/README.md", "w") as f:
+        f.write("dirty tracked change\n")
+    with open(f"{repo}/junk.txt", "w") as f:
+        f.write("untracked noise\n")
+
+    assert soldier._force_clean_repo() is True
+
+    # Data dir survived, other untracked files removed.
+    assert os.path.exists(f"{repo}/.antfarm/tasks/t.json")
+    assert not os.path.exists(f"{repo}/junk.txt")
+
+
+def test_cleanup_with_custom_data_dir_name(soldier_env):
+    """A soldier configured with a custom data_dir_name protects only that dir."""
+    repo = soldier_env["repo_path"]
+
+    # Build a soldier with a custom exclude dir.
+    soldier = Soldier(
+        colony_url="http://testserver",
+        repo_path=repo,
+        integration_branch="dev",
+        test_command=["true"],
+        poll_interval=0.0,
+        data_dir_name="custom-dir",
+        client=soldier_env["soldier"].colony._client,
+    )
+
+    import os
+
+    os.makedirs(f"{repo}/custom-dir", exist_ok=True)
+    with open(f"{repo}/custom-dir/state.json", "w") as f:
+        f.write("{}")
+
+    os.makedirs(f"{repo}/.antfarm/tasks", exist_ok=True)
+    with open(f"{repo}/.antfarm/tasks/t.json", "w") as f:
+        f.write("{}")
+
+    soldier._cleanup()
+
+    # Configured dir survives; un-configured .antfarm is cleaned.
+    assert os.path.exists(f"{repo}/custom-dir/state.json")
+    assert not os.path.exists(f"{repo}/.antfarm/tasks/t.json")
+
+
+def test_cleanup_still_removes_other_untracked_files(soldier_env):
+    """With the default data_dir_name, untracked files outside it still clean."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+
+    import os
+
+    with open(f"{repo}/some-random.txt", "w") as f:
+        f.write("should be removed\n")
+
+    soldier._cleanup()
+
+    assert not os.path.exists(f"{repo}/some-random.txt")
+
+
+def test_start_soldier_thread_passes_data_dir_name(tmp_path, monkeypatch):
+    """_start_soldier_thread must propagate data_dir_name to Soldier.from_backend."""
+    from antfarm.core import serve as serve_mod
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+
+    captured: dict = {}
+
+    class _FakeSoldier:
+        @classmethod
+        def from_backend(cls, backend_arg, **kwargs):  # noqa: N803
+            captured["backend"] = backend_arg
+            captured["kwargs"] = kwargs
+            inst = cls.__new__(cls)
+            inst.require_review = kwargs.get("require_review", False)
+            return inst
+
+        def run(self):
+            return None
+
+    import antfarm.core.soldier as soldier_mod
+
+    monkeypatch.setattr(soldier_mod, "Soldier", _FakeSoldier)
+    monkeypatch.setattr(serve_mod, "_soldier_thread", None, raising=False)
+    monkeypatch.setattr(serve_mod, "_soldier_status", "not started", raising=False)
+
+    serve_mod._start_soldier_thread(backend, data_dir=str(tmp_path / ".antfarm"))
+
+    assert captured.get("kwargs", {}).get("data_dir_name") == ".antfarm"
+
+
+def test_start_soldier_thread_warns_when_gitignore_missing_entry(tmp_path, monkeypatch):
+    """When the target repo's .gitignore doesn't list the data dir, emit
+    data_dir_not_gitignored for operator visibility (#323)."""
+    from antfarm.core import serve as serve_mod
+
+    # tmp_path itself acts as the (no-.gitignore) target repo root.
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+
+    events: list[tuple[str, str, str, str]] = []
+
+    def _capture(event_type, task_id, detail="", actor="colony"):
+        events.append((event_type, task_id, detail, actor))
+
+    class _FakeSoldier:
+        @classmethod
+        def from_backend(cls, backend_arg, **kwargs):  # noqa: N803
+            inst = cls.__new__(cls)
+            inst.require_review = kwargs.get("require_review", False)
+            return inst
+
+        def run(self):
+            return None
+
+    import antfarm.core.soldier as soldier_mod
+
+    monkeypatch.setattr(soldier_mod, "Soldier", _FakeSoldier)
+    monkeypatch.setattr(serve_mod, "_emit_event", _capture)
+    monkeypatch.setattr(serve_mod, "_soldier_thread", None, raising=False)
+    monkeypatch.setattr(serve_mod, "_soldier_status", "not started", raising=False)
+
+    serve_mod._start_soldier_thread(backend, data_dir=str(tmp_path / ".antfarm"))
+
+    warn = [e for e in events if e[0] == "data_dir_not_gitignored"]
+    assert warn, f"expected data_dir_not_gitignored, got {events}"
+
+
+def test_start_soldier_thread_silent_when_gitignore_has_entry(tmp_path, monkeypatch):
+    """No data_dir_not_gitignored event when .gitignore lists the data dir."""
+    from antfarm.core import serve as serve_mod
+
+    (tmp_path / ".gitignore").write_text(".antfarm/\n")
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+
+    events: list[tuple[str, str, str, str]] = []
+
+    def _capture(event_type, task_id, detail="", actor="colony"):
+        events.append((event_type, task_id, detail, actor))
+
+    class _FakeSoldier:
+        @classmethod
+        def from_backend(cls, backend_arg, **kwargs):  # noqa: N803
+            inst = cls.__new__(cls)
+            inst.require_review = kwargs.get("require_review", False)
+            return inst
+
+        def run(self):
+            return None
+
+    import antfarm.core.soldier as soldier_mod
+
+    monkeypatch.setattr(soldier_mod, "Soldier", _FakeSoldier)
+    monkeypatch.setattr(serve_mod, "_emit_event", _capture)
+    monkeypatch.setattr(serve_mod, "_soldier_thread", None, raising=False)
+    monkeypatch.setattr(serve_mod, "_soldier_status", "not started", raising=False)
+
+    serve_mod._start_soldier_thread(backend, data_dir=str(tmp_path / ".antfarm"))
+
+    warn = [e for e in events if e[0] == "data_dir_not_gitignored"]
+    assert not warn, f"unexpected data_dir_not_gitignored, got {events}"
