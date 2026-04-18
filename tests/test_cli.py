@@ -412,6 +412,54 @@ def test_cli_doctor_fix(tmp_path: Path):
     assert result.exit_code == 0, result.output
 
 
+def test_doctor_cli_reads_config_json_max_attempts(tmp_path: Path):
+    """#344: antfarm doctor must load <data_dir>/config.json and honor
+    max_attempts. Without this, stale-task recovery silently uses the
+    default of 3 no matter what the colony was started with."""
+    data_dir = tmp_path / ".antfarm"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(json.dumps({"max_attempts": 7}))
+
+    captured: dict = {}
+
+    def _spy(backend, config, fix=False):
+        captured["config"] = config
+        return []
+
+    runner = CliRunner()
+    with patch("antfarm.core.doctor.run_doctor", side_effect=_spy):
+        result = runner.invoke(main, ["doctor", "--data-dir", str(data_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].get("max_attempts") == 7
+    # data_dir must still be present so downstream checks that need it
+    # (e.g. filesystem, orphan workspaces) continue to work.
+    assert captured["config"].get("data_dir") == str(data_dir)
+
+
+def test_doctor_cli_falls_back_when_no_config_json(tmp_path: Path):
+    """No config.json present — doctor still runs and passes only
+    data_dir through. max_attempts stays absent so callees apply their
+    default (3)."""
+    data_dir = tmp_path / ".antfarm"
+    data_dir.mkdir()
+    assert not (data_dir / "config.json").exists()
+
+    captured: dict = {}
+
+    def _spy(backend, config, fix=False):
+        captured["config"] = config
+        return []
+
+    runner = CliRunner()
+    with patch("antfarm.core.doctor.run_doctor", side_effect=_spy):
+        result = runner.invoke(main, ["doctor", "--data-dir", str(data_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].get("data_dir") == str(data_dir)
+    assert "max_attempts" not in captured["config"]
+
+
 def test_cli_doctor_sweep_no_legacy_sessions(tmp_path: Path):
     """--sweep-legacy-tmux with no matches prints the no-op message and exits."""
     runner = CliRunner()
@@ -970,11 +1018,16 @@ def test_worker_start_agent_timeout_flag_propagates():
         result = runner.invoke(
             main,
             [
-                "worker", "start",
-                "--agent", "claude-code",
-                "--node", "n1",
-                "--agent-timeout", "60",
-                "--colony-url", "http://localhost:7433",
+                "worker",
+                "start",
+                "--agent",
+                "claude-code",
+                "--node",
+                "n1",
+                "--agent-timeout",
+                "60",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
     assert result.exit_code == 0, result.output
@@ -987,16 +1040,18 @@ def test_worker_start_agent_timeout_flag_propagates():
         captured_default.update(kwargs)
         return MagicMock()
 
-    with patch(
-        "antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime_default
-    ):
+    with patch("antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime_default):
         result = runner.invoke(
             main,
             [
-                "worker", "start",
-                "--agent", "claude-code",
-                "--node", "n1",
-                "--colony-url", "http://localhost:7433",
+                "worker",
+                "start",
+                "--agent",
+                "claude-code",
+                "--node",
+                "n1",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
     assert result.exit_code == 0, result.output
@@ -1146,8 +1201,9 @@ def test_render_scout_prints_warnings():
         msg = args[0] if args else ""
         output_lines.append(str(msg))
 
-    with patch("antfarm.core.cli.click.echo", side_effect=capturing_echo), patch(
-        "antfarm.core.cli.click.secho", side_effect=capturing_echo
+    with (
+        patch("antfarm.core.cli.click.echo", side_effect=capturing_echo),
+        patch("antfarm.core.cli.click.secho", side_effect=capturing_echo),
     ):
         status2 = {
             "tasks": {"ready": 1, "active": 0, "done": 0},
