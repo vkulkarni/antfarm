@@ -282,7 +282,7 @@ class AntfarmTUI:
 
         layout["missions"].update(
             Panel(
-                self._render_missions(missions),
+                self._render_missions(missions, tasks=tasks),
                 title=f"[bold bright_white]Missions ({len(missions)})[/bold bright_white]",
             )
         )
@@ -605,12 +605,23 @@ class AntfarmTUI:
 
         return table
 
-    def _render_missions(self, missions: list[dict], max_shown: int = 5) -> Table:
-        """Render mission list with status, task counts, and progress time."""
+    def _render_missions(
+        self,
+        missions: list[dict],
+        tasks: list[dict] | None = None,
+        max_shown: int = 5,
+    ) -> Table:
+        """Render mission list with status, task counts, and progress time.
+
+        Live merged counts come from the tasks list (fixes #331 — reports are
+        only populated after a mission completes, so in-flight missions would
+        otherwise show 0/N until done). Falls back to report["merged_tasks"]
+        when no tasks list is supplied, preserving legacy behaviour.
+        """
         table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
         table.add_column("ID", max_width=25, no_wrap=True)
         table.add_column("Status", max_width=15, no_wrap=True)
-        table.add_column("Tasks", max_width=8, no_wrap=True)
+        table.add_column("Tasks", max_width=10, no_wrap=True)
         table.add_column("Progress", max_width=20, no_wrap=True)
 
         if not missions:
@@ -627,6 +638,8 @@ class AntfarmTUI:
             "cancelled": "dim",
         }
 
+        task_by_id = {t.get("id", ""): t for t in (tasks or [])}
+
         shown = missions[:max_shown]
         for m in shown:
             mid = m.get("mission_id", "")
@@ -639,9 +652,14 @@ class AntfarmTUI:
             total = len(task_ids)
             blocked = len(blocked_ids)
 
-            # Derive merged count from report if available
-            report = m.get("report")
-            merged = report.get("merged_tasks", 0) if report else 0
+            # Prefer live count from task attempts so in-flight missions show
+            # real progress. Fall back to the report only when the caller
+            # didn't supply a tasks list (legacy/test callers).
+            if tasks is not None:
+                merged = self._count_merged_tasks(task_ids, task_by_id)
+            else:
+                report = m.get("report")
+                merged = report.get("merged_tasks", 0) if report else 0
             tasks_text = f"{merged}/{total}"
             if blocked > 0:
                 tasks_text += f" ({blocked}blk)"
@@ -658,6 +676,20 @@ class AntfarmTUI:
 
         self._add_overflow_hint(table, len(missions), max_shown)
         return table
+
+    @staticmethod
+    def _count_merged_tasks(task_ids: list[str], task_by_id: dict[str, dict]) -> int:
+        """Count task_ids whose task has at least one merged attempt."""
+        merged = 0
+        for tid in task_ids:
+            task = task_by_id.get(tid)
+            if not task:
+                continue
+            for att in task.get("attempts", []):
+                if att.get("status") == "merged":
+                    merged += 1
+                    break
+        return merged
 
     def _format_mission_progress(self, mission: dict) -> str:
         """Format progress column for a mission.
