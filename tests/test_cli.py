@@ -955,6 +955,54 @@ def test_worker_start_poll_flags_flow_through():
     assert captured_kwargs["max_empty_polls"] == 3
 
 
+def test_worker_start_agent_timeout_flag_propagates():
+    """--agent-timeout is plumbed through to WorkerRuntime; default = 7200s."""
+    runner = CliRunner()
+
+    # Explicit override
+    captured: dict = {}
+
+    def fake_worker_runtime(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    with patch("antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime):
+        result = runner.invoke(
+            main,
+            [
+                "worker", "start",
+                "--agent", "claude-code",
+                "--node", "n1",
+                "--agent-timeout", "60",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert captured["agent_timeout"] == 60.0
+
+    # Default when flag omitted
+    captured_default: dict = {}
+
+    def fake_worker_runtime_default(**kwargs):
+        captured_default.update(kwargs)
+        return MagicMock()
+
+    with patch(
+        "antfarm.core.worker.WorkerRuntime", side_effect=fake_worker_runtime_default
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "worker", "start",
+                "--agent", "claude-code",
+                "--node", "n1",
+                "--colony-url", "http://localhost:7433",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert captured_default["agent_timeout"] == 7200.0
+
+
 # ---------------------------------------------------------------------------
 # plan --carry dependency resolution (#93)
 # ---------------------------------------------------------------------------

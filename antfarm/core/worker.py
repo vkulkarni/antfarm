@@ -232,6 +232,12 @@ class WorkerRuntime:
         heartbeat_interval: Seconds between heartbeat posts (default 30).
         poll_interval: Seconds to sleep between empty forage polls (default 30).
             Must be > 0; non-positive values raise ValueError.
+        agent_timeout: Seconds before the agent subprocess is killed by
+            ``subprocess.run``. Default 7200 (2h). Must be > 0; non-positive
+            values raise ValueError. On timeout the worker synthesizes an
+            ``AgentResult(returncode=-15)`` so the existing failure pipeline
+            classifies it as ``FailureType.AGENT_TIMEOUT`` and the standard
+            retry policy applies (see #301).
         max_empty_polls: Max consecutive empty forages before the worker exits.
             When None (default), the role-based default applies:
             reviewer=10, builder=5, planner=0 (exit on first empty). An explicit
@@ -252,6 +258,7 @@ class WorkerRuntime:
         integration_branch: str = "main",
         heartbeat_interval: float = 30.0,
         poll_interval: float = 30.0,
+        agent_timeout: float = 7200.0,
         max_empty_polls: int | None = None,
         capabilities: list[str] | None = None,
         client: httpx.Client | None = None,
@@ -261,12 +268,17 @@ class WorkerRuntime:
             raise ValueError(
                 f"poll_interval must be > 0, got {poll_interval}"
             )
+        if agent_timeout <= 0:
+            raise ValueError(
+                f"agent_timeout must be > 0, got {agent_timeout}"
+            )
         self.worker_id = f"{node_id}/{name}"
         self.node_id = node_id
         self.agent_type = agent_type
         self.workspace_root = workspace_root
         self.heartbeat_interval = heartbeat_interval
         self.poll_interval = poll_interval
+        self.agent_timeout = agent_timeout
         self.capabilities = capabilities or []
         self._token = token
         self._data_dir = os.environ.get("ANTFARM_DATA_DIR", ".antfarm")
@@ -795,12 +807,25 @@ class WorkerRuntime:
 
         Selects the command based on agent_type. Never uses shell=True.
 
+        The subprocess is bounded by ``self.agent_timeout`` (default 7200s/2h,
+        overridable via ``--agent-timeout`` on ``worker start``). On timeout
+        ``subprocess.TimeoutExpired`` is caught and a synthetic
+        ``AgentResult(returncode=-15, ...)`` is returned so ``classify_failure``
+        maps it to ``FailureType.AGENT_TIMEOUT`` and the standard retry policy
+        runs. Without this guard the worker would block forever while the
+        background heartbeat thread kept reporting it healthy (#301).
+
+        Note: Python's stdlib only kills the direct child process on timeout.
+        Orphaned grandchild processes are a known v0.1 limitation and are not
+        addressed here.
+
         Args:
             task: Task dict from the colony (contains id, spec, etc.).
             workspace: Absolute path to the git worktree for this attempt.
 
         Returns:
             AgentResult with returncode, stdout, stderr, and branch name.
+            Returncode is -15 if the subprocess timed out.
         """
         spec = task.get("spec", "")
         title = task.get("title", "")
@@ -930,14 +955,41 @@ class WorkerRuntime:
         if self._token:
             env["ANTFARM_TOKEN"] = self._token
 
-        proc = subprocess.run(
-            cmd,
-            cwd=workspace,
-            capture_output=True,
-            text=True,
-            env=env,
-            input=prompt if use_stdin else None,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                env=env,
+                input=prompt if use_stdin else None,
+                timeout=self.agent_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            logger.error(
+                "agent subprocess timed out task_id=%s worker_id=%s after=%.0fs",
+                task["id"],
+                self.worker_id,
+                self.agent_timeout,
+            )
+            # TimeoutExpired.stdout/stderr may be bytes or str depending on
+            # whether text=True was honored before the timeout fired. Normalize.
+            raw_stdout = exc.stdout or ""
+            stdout = (
+                raw_stdout
+                if isinstance(raw_stdout, str)
+                else raw_stdout.decode("utf-8", "replace")
+            )
+            raw_stderr = exc.stderr or ""
+            stderr_partial = (
+                raw_stderr
+                if isinstance(raw_stderr, str)
+                else raw_stderr.decode("utf-8", "replace")
+            )
+            stderr = f"[TIMEOUT after {self.agent_timeout:.0f}s] {stderr_partial}"
+            return AgentResult(
+                returncode=-15, stdout=stdout, stderr=stderr, branch=branch
+            )
 
         return AgentResult(
             returncode=proc.returncode,
