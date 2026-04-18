@@ -4,21 +4,26 @@ Starts and stops worker subprocesses based on queue state. Opt-in via
 ``antfarm colony --autoscaler``. Manages its own workers only — manually
 started workers on other machines are untouched.
 
-Scope-aware: groups ready build tasks by ``touches`` overlap and caps
-builder count to the number of non-overlapping scope groups, preventing
-over-allocation to a single scope.
+Depth-aware (issue #320): builder target is
+``ceil(ready_unblocked * builder_depth_factor)`` clamped to
+``max_builders``. Scale-up is immediate once
+``builder_scale_up_threshold`` is met; scale-down is lazy — at most one
+builder is retired per tick, and only after it has been idle for
+``builder_scale_down_idle_seconds``. The mission-wide
+``max_parallel_builders`` is enforced as a hard cap.
 
-Standalone functions (``compute_desired``, ``count_scope_groups``, etc.)
-are shared by both the single-host ``Autoscaler`` and the
-``MultiNodeAutoscaler``.
+Standalone functions (``compute_desired``, ``count_ready_unblocked``,
+``compute_depth_aware_target``, ``count_scope_groups``) are shared by
+both the single-host ``Autoscaler`` and the ``MultiNodeAutoscaler``.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -53,6 +58,57 @@ def _emit(event_type: str, task_id: str, detail: str = "") -> None:
 # ---------------------------------------------------------------------------
 
 
+def count_ready_unblocked(tasks: list[dict]) -> int:
+    """Count ready, non-infra, dependency-met build tasks.
+
+    A task counts toward builder demand when:
+    - ``status == "ready"``
+    - It is NOT an infra task (id does not start with ``plan-`` or ``review-``)
+    - All ``depends_on`` entries are in ``done_task_ids`` or ``merged_task_ids``
+
+    ``merged_task_ids`` here is the set of task ids whose current attempt has
+    ``status == "merged"``. ``done_task_ids`` is every task currently in
+    ``done`` (a merged task is still in ``done``, so this union is safe).
+    """
+    done_task_ids = {t["id"] for t in tasks if t["status"] == "done"}
+    merged_task_ids = {t["id"] for t in tasks if has_merged_attempt(t)}
+    unblocked_ids = done_task_ids | merged_task_ids
+
+    count = 0
+    for t in tasks:
+        if t["status"] != "ready":
+            continue
+        tid = t.get("id", "")
+        if tid.startswith(("plan-", "review-")):
+            continue
+        if t.get("capabilities_required"):
+            # Infra / specialized tasks (plan, review) are handled by their
+            # own scaling paths, not the depth-aware builder pool.
+            continue
+        deps = t.get("depends_on") or []
+        if any(d not in unblocked_ids for d in deps):
+            continue
+        count += 1
+    return count
+
+
+def compute_depth_aware_target(ready_unblocked: int, config: AutoscalerConfig) -> int:
+    """Depth-aware target builder count with a hard mission cap.
+
+    Formula (issue #320):
+
+        target = min(
+            config.max_builders,
+            max(1 if ready_unblocked > 0 else 0,
+                ceil(ready_unblocked * builder_depth_factor)),
+        )
+    """
+    if ready_unblocked <= 0:
+        return 0
+    scaled = math.ceil(ready_unblocked * config.builder_depth_factor)
+    return min(config.max_builders, max(1, scaled))
+
+
 def compute_desired(
     tasks: list[dict], workers: list[dict], config: AutoscalerConfig
 ) -> dict[str, int]:
@@ -61,21 +117,12 @@ def compute_desired(
     Shared by single-host and multi-node autoscalers.
     """
     ready_plan = [
-        t
-        for t in tasks
-        if t["status"] == "ready"
-        and "plan" in t.get("capabilities_required", [])
-    ]
-    ready_build = [
-        t
-        for t in tasks
-        if t["status"] == "ready" and not t.get("capabilities_required")
+        t for t in tasks if t["status"] == "ready" and "plan" in t.get("capabilities_required", [])
     ]
     ready_review = [
         t
         for t in tasks
-        if t["status"] == "ready"
-        and "review" in t.get("capabilities_required", [])
+        if t["status"] == "ready" and "review" in t.get("capabilities_required", [])
     ]
     done_unreviewed = [
         t
@@ -87,7 +134,8 @@ def compute_desired(
         and not has_merged_attempt(t)
     ]
 
-    scope_groups = count_scope_groups(ready_build)
+    ready_unblocked = count_ready_unblocked(tasks)
+    desired_builders = compute_depth_aware_target(ready_unblocked, config)
 
     active_builders = [
         w
@@ -97,12 +145,6 @@ def compute_desired(
         and w.get("status") != "offline"
     ]
     rate_limited = [w for w in active_builders if is_rate_limited(w)]
-
-    desired_builders = min(
-        scope_groups,
-        config.max_builders,
-        len(ready_build),
-    )
     if rate_limited and len(rate_limited) > len(active_builders) // 2:
         desired_builders = min(desired_builders, len(active_builders))
 
@@ -182,6 +224,16 @@ class AutoscalerConfig:
     poll_interval: float = 30.0
     colony_url: str = "http://127.0.0.1:7433"
     data_dir: str = ".antfarm"
+    # Depth-aware scaling (issue #320).
+    # target_builders = min(max_builders, max(1 if ready>0 else 0,
+    #                                          ceil(ready * builder_depth_factor)))
+    builder_depth_factor: float = 0.5
+    # Minimum ready_unblocked before the autoscaler will spawn a NEW builder
+    # beyond what's already running. Prevents flutter on a shallow queue.
+    builder_scale_up_threshold: int = 2
+    # Seconds a builder must be idle before it is eligible for retirement.
+    # Lazy scale-down: retire at most one idle builder per reconcile tick.
+    builder_scale_down_idle_seconds: float = 30.0
 
 
 @dataclass
@@ -189,6 +241,11 @@ class ManagedWorker:
     name: str
     role: str  # "planner" | "builder" | "reviewer"
     worker_id: str
+    # Wall-clock seconds at which this worker was first observed idle in
+    # the current idle run. Reset to None whenever the worker is seen
+    # active (or its heartbeat is fresher than the scale-down window).
+    # Used exclusively by the depth-aware builder scale-down path.
+    idle_since: float | None = field(default=None)
 
 
 class Autoscaler:
@@ -251,12 +308,15 @@ class Autoscaler:
         workers = self.backend.list_workers()
         desired = self._compute_desired(tasks, workers)
         actual = self._count_actual()
+        ready_unblocked = count_ready_unblocked(tasks)
+        self._update_builder_idle_tracking(workers)
         for role in ("planner", "builder", "reviewer"):
-            self._reconcile_role(role, desired[role], actual.get(role, 0))
+            if role == "builder":
+                self._reconcile_builders(desired[role], actual.get(role, 0), ready_unblocked)
+            else:
+                self._reconcile_role(role, desired[role], actual.get(role, 0))
 
-    def _compute_desired(
-        self, tasks: list[dict], workers: list[dict]
-    ) -> dict[str, int]:
+    def _compute_desired(self, tasks: list[dict], workers: list[dict]) -> dict[str, int]:
         return compute_desired(tasks, workers, self.config)
 
     @staticmethod
@@ -287,6 +347,31 @@ class Autoscaler:
             if not self._stop_idle_worker(role):
                 break  # no idle workers to stop this tick
             delta += 1
+
+    def _reconcile_builders(self, desired: int, actual: int, ready_unblocked: int) -> None:
+        """Depth-aware reconciliation for the builder pool.
+
+        Scale-up: only spawn NEW builders above ``actual`` when the queue has
+        enough work to justify it (``ready_unblocked >=
+        builder_scale_up_threshold``). No cooldown — spawn the full delta
+        immediately when the threshold is met.
+
+        Scale-down: lazy and conservative. Retire at most ONE builder per
+        reconcile tick, and only when that builder has been idle for at least
+        ``builder_scale_down_idle_seconds``.
+        """
+        delta = desired - actual
+        if delta > 0:
+            if ready_unblocked >= self.config.builder_scale_up_threshold:
+                while delta > 0:
+                    self._start_worker("builder")
+                    delta -= 1
+            # Otherwise: threshold not met, hold the current count steady.
+            return
+        if delta < 0:
+            # Retire at most one builder per tick, and only after the idle
+            # window has elapsed.
+            self._retire_one_idle_builder()
 
     def _start_worker(self, role: str) -> None:
         """Spawn a new worker via ProcessManager. Retries once on name collision."""
@@ -372,6 +457,69 @@ class Autoscaler:
             logger.info("autoscaler stopped idle worker name=%s role=%s", name, role)
             del self.managed[name]
             _emit("worker_retired", "", f"role={role} name={name}")
+            return True
+        return False
+
+    def _update_builder_idle_tracking(self, colony_workers: list[dict]) -> None:
+        """Refresh ``idle_since`` for every managed builder.
+
+        Called each tick. A builder whose colony-side status is ``idle`` AND
+        whose heartbeat is older than the scale-down window is considered
+        "confirmed idle" for retirement scoring. Any other observation
+        (active, offline, fresh heartbeat) resets the timer.
+        """
+        colony_status_map = {w["worker_id"]: w for w in colony_workers}
+        now = self._clock()
+        idle_window = self.config.builder_scale_down_idle_seconds
+
+        for mw in self.managed.values():
+            if mw.role != "builder":
+                continue
+            cw = colony_status_map.get(mw.worker_id)
+            confirmed_idle = False
+            if cw and cw.get("status") == "idle":
+                last_hb = cw.get("last_heartbeat")
+                if last_hb:
+                    try:
+                        hb_dt = datetime.fromisoformat(last_hb)
+                        age = (datetime.now(UTC) - hb_dt).total_seconds()
+                        if age >= idle_window:
+                            confirmed_idle = True
+                    except (ValueError, TypeError):
+                        pass
+            if confirmed_idle:
+                if mw.idle_since is None:
+                    mw.idle_since = now
+            else:
+                mw.idle_since = None
+
+    def _retire_one_idle_builder(self) -> bool:
+        """Retire at most one builder whose idle timer has elapsed.
+
+        Iterates managed builders in insertion order and retires the first
+        one whose ``idle_since`` is at least ``builder_scale_down_idle_seconds``
+        old. Returns True if a builder was retired.
+        """
+        now = self._clock()
+        idle_window = self.config.builder_scale_down_idle_seconds
+
+        for name, mw in list(self.managed.items()):
+            if mw.role != "builder":
+                continue
+            if not self._pm.is_alive(name):
+                continue
+            if mw.idle_since is None:
+                continue
+            if now - mw.idle_since < idle_window:
+                continue
+            self._pm.stop(name)
+            logger.info(
+                "autoscaler retired idle builder name=%s idle_for=%.1fs",
+                name,
+                now - mw.idle_since,
+            )
+            del self.managed[name]
+            _emit("worker_retired", "", f"role=builder name={name}")
             return True
         return False
 

@@ -6,7 +6,13 @@ import os
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
-from antfarm.core.autoscaler import Autoscaler, AutoscalerConfig, ManagedWorker
+from antfarm.core.autoscaler import (
+    Autoscaler,
+    AutoscalerConfig,
+    ManagedWorker,
+    compute_depth_aware_target,
+    count_ready_unblocked,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -106,7 +112,12 @@ class TestComputeDesired:
         assert result["planner"] == 1
         assert result["builder"] == 0
 
-    def test_three_scope_groups_returns_three_builders(self):
+    def test_three_ready_builds_returns_depth_aware_target(self):
+        """Post-#320: target is ceil(ready_unblocked * depth_factor), capped at max.
+
+        3 ready unblocked build tasks with default factor 0.5 → ceil(1.5) = 2.
+        (Old scope-groups logic would have returned 3 — replaced by depth.)
+        """
         a = _make_autoscaler(max_builders=10)
         tasks = [
             _task("t1", touches=["api"]),
@@ -114,9 +125,10 @@ class TestComputeDesired:
             _task("t3", touches=["auth"]),
         ]
         result = a._compute_desired(tasks, [])
-        assert result["builder"] == 3
+        assert result["builder"] == 2
 
-    def test_overlapping_scopes_returns_one_builder(self):
+    def test_two_ready_builds_returns_one_builder(self):
+        """2 ready unblocked build tasks → ceil(2*0.5)=1. Overlap no longer matters."""
         a = _make_autoscaler(max_builders=10)
         tasks = [
             _task("t1", touches=["api", "db"]),
@@ -261,17 +273,19 @@ class TestCountScopeGroups:
 
 class TestReconciliation:
     def test_reconcile_starts_workers_to_meet_desired(self):
+        """Depth-aware: 4 ready build tasks * 0.5 = target=2 builders spawned."""
         pm = _mock_pm()
         a = _make_autoscaler(_pm=pm, max_builders=4)
         a.backend.list_tasks.return_value = [
             _task("t1", touches=["api"]),
             _task("t2", touches=["db"]),
+            _task("t3", touches=["auth"]),
+            _task("t4", touches=["ui"]),
         ]
         a.backend.list_workers.return_value = []
 
         a._reconcile()
 
-        # Should have started 2 builders (2 scope groups, 2 tasks)
         builder_starts = [
             c for c in pm.start.call_args_list if "--type" in c[0][1] and "builder" in c[0][1]
         ]
@@ -392,13 +406,22 @@ class TestReconciliation:
 
     def test_run_once_is_idempotent_when_at_desired(self):
         pm = _mock_pm()
-        a = _make_autoscaler(_pm=pm)
-        a.backend.list_tasks.return_value = [_task("t1", touches=["api"])]
+        # 4 ready build tasks -> target=2 with default factor. Threshold (2)
+        # is met, so the first tick spawns 2 builders. Second tick should
+        # not spawn more.
+        a = _make_autoscaler(_pm=pm, max_builders=5)
+        a.backend.list_tasks.return_value = [
+            _task("t1", touches=["api"]),
+            _task("t2", touches=["db"]),
+            _task("t3", touches=["auth"]),
+            _task("t4", touches=["ui"]),
+        ]
         a.backend.list_workers.return_value = []
 
         # First reconcile starts workers
         a._reconcile()
         first_count = pm.start.call_count
+        assert first_count == 2
 
         # Second reconcile should not start more (already at desired)
         a._reconcile()
@@ -775,3 +798,164 @@ class TestActivityFeedEvents:
 
         events = _drain_actor_events("autoscaler")
         assert [e for e in events if e["type"] == "worker_retired"] == []
+
+
+# ---------------------------------------------------------------------------
+# Depth-aware scaling with hysteresis (issue #320)
+# ---------------------------------------------------------------------------
+
+
+class TestDepthAwareTarget:
+    def test_depth_aware_target_when_queue_is_deep(self):
+        """max_parallel_builders=5, ready_unblocked=8, factor=0.5 -> target=4."""
+        config = AutoscalerConfig(max_builders=5, builder_depth_factor=0.5)
+        assert compute_depth_aware_target(8, config) == 4
+
+    def test_depth_aware_target_clamps_to_mission_cap(self):
+        """max_parallel_builders=3, ready_unblocked=10, factor=0.5 -> target=3."""
+        config = AutoscalerConfig(max_builders=3, builder_depth_factor=0.5)
+        assert compute_depth_aware_target(10, config) == 3
+
+    def test_depth_aware_target_at_least_one_when_work_exists(self):
+        """ready_unblocked=1, factor=0.5 -> target=1 (floor protection)."""
+        config = AutoscalerConfig(max_builders=5, builder_depth_factor=0.5)
+        assert compute_depth_aware_target(1, config) == 1
+
+    def test_depth_aware_target_zero_when_no_work(self):
+        """ready_unblocked=0 -> target=0."""
+        config = AutoscalerConfig(max_builders=5, builder_depth_factor=0.5)
+        assert compute_depth_aware_target(0, config) == 0
+
+
+class TestScaleUpThreshold:
+    def test_scale_up_respects_threshold(self):
+        """ready_unblocked=1, builder_scale_up_threshold=2 -> do NOT spawn."""
+        pm = _mock_pm()
+        a = _make_autoscaler(
+            _pm=pm,
+            max_builders=5,
+            builder_depth_factor=0.5,
+            builder_scale_up_threshold=2,
+        )
+        # One ready unblocked task
+        a.backend.list_tasks.return_value = [_task("task-1", status="ready")]
+        a.backend.list_workers.return_value = []
+
+        a._reconcile()
+
+        # compute_depth_aware_target(1, ...) == 1, actual == 0, delta == 1.
+        # But ready_unblocked (1) < threshold (2), so no spawn.
+        assert pm.start.call_count == 0
+
+
+class TestDepthAwareScaleDown:
+    def test_scale_down_only_after_idle_period(self):
+        """current=3, target=1, builder idle 10s, threshold 30s -> do NOT retire."""
+        pm = _mock_pm()
+        pm.is_alive.return_value = True
+
+        # Deterministic clock: current time is t0 + 10s (10s idle window).
+        t0 = 1_000_000.0
+        clock_val = {"t": t0}
+
+        def clock() -> float:
+            return clock_val["t"]
+
+        backend = MagicMock()
+        config = AutoscalerConfig(
+            max_builders=5,
+            builder_depth_factor=0.5,
+            builder_scale_up_threshold=2,
+            builder_scale_down_idle_seconds=30.0,
+            poll_interval=30.0,
+        )
+        a = Autoscaler(backend, config, clock=clock, _pm=pm)
+
+        # 3 builders, all idle, all with aged heartbeats (so they register as
+        # "confirmed idle" in the tracker).
+        for i in range(1, 4):
+            name = f"auto-builder-{i}"
+            a.managed[name] = ManagedWorker(name=name, role="builder", worker_id=f"local/{name}")
+        a.backend.list_tasks.return_value = [_task("task-1", status="ready")]
+        a.backend.list_workers.return_value = [
+            _worker(
+                f"local/auto-builder-{i}",
+                status="idle",
+                last_heartbeat=_aged_hb(60),
+            )
+            for i in range(1, 4)
+        ]
+
+        # First reconcile: idle_since is stamped at t0. target=1 (ceil(1*0.5)),
+        # current=3, so delta=-2, but we only retire 1/tick AND only after
+        # idle_since has aged >= 30s. At t0 the delta between now and
+        # idle_since is 0, so no retirement.
+        a._reconcile()
+        assert pm.stop.call_count == 0
+
+        # Advance 10s (still < 30s window). Still no retirement.
+        clock_val["t"] = t0 + 10
+        a._reconcile()
+        assert pm.stop.call_count == 0
+
+    def test_scale_down_retires_one_per_tick(self):
+        """current=5, target=1, all idle 60s -> retire exactly 1."""
+        pm = _mock_pm()
+        pm.is_alive.return_value = True
+
+        t0 = 1_000_000.0
+        clock_val = {"t": t0}
+
+        def clock() -> float:
+            return clock_val["t"]
+
+        backend = MagicMock()
+        config = AutoscalerConfig(
+            max_builders=5,
+            builder_depth_factor=0.5,
+            builder_scale_up_threshold=2,
+            builder_scale_down_idle_seconds=30.0,
+            poll_interval=30.0,
+        )
+        a = Autoscaler(backend, config, clock=clock, _pm=pm)
+
+        # 5 managed builders, all idle with aged heartbeats.
+        for i in range(1, 6):
+            name = f"auto-builder-{i}"
+            a.managed[name] = ManagedWorker(name=name, role="builder", worker_id=f"local/{name}")
+        a.backend.list_tasks.return_value = [_task("task-1", status="ready")]
+        a.backend.list_workers.return_value = [
+            _worker(
+                f"local/auto-builder-{i}",
+                status="idle",
+                last_heartbeat=_aged_hb(90),
+            )
+            for i in range(1, 6)
+        ]
+
+        # First tick: stamps idle_since = t0 for every builder. No retirements
+        # yet because t0 - t0 < 30s.
+        a._reconcile()
+        assert pm.stop.call_count == 0
+
+        # Jump forward past the idle window. Exactly ONE retirement per tick.
+        clock_val["t"] = t0 + 60.0
+        a._reconcile()
+        assert pm.stop.call_count == 1
+
+        # Next tick: one more retirement (deterministic: one per tick).
+        a._reconcile()
+        assert pm.stop.call_count == 2
+
+
+class TestInfraExcludedFromDepth:
+    def test_infra_tasks_excluded_from_depth(self):
+        """ready queue has 3 plan-* tasks -> target=0 (infra excluded)."""
+        tasks = [
+            _task("plan-001", status="ready", capabilities_required=["plan"]),
+            _task("plan-002", status="ready", capabilities_required=["plan"]),
+            _task("plan-003", status="ready", capabilities_required=["plan"]),
+        ]
+        assert count_ready_unblocked(tasks) == 0
+        config = AutoscalerConfig(max_builders=5, builder_depth_factor=0.5)
+        assert compute_depth_aware_target(count_ready_unblocked(tasks), config) == 0
