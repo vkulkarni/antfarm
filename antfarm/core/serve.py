@@ -43,6 +43,10 @@ _autoscaler_instance = None
 # SSE event bus
 _event_queue: collections.deque = collections.deque(maxlen=1000)
 _event_counter: int = 0
+# Serializes _event_counter increment + _event_queue append. Kept separate
+# from _lock so task-state mutations don't block event emission and vice
+# versa. See #309.
+_event_lock = threading.Lock()
 # UUID regenerated every time get_app() runs. Tags every emitted event so the
 # TUI can detect a colony restart and reset its cursor — see #306.
 _server_epoch: str = str(uuid.uuid4())
@@ -55,6 +59,10 @@ def _now_iso() -> str:
 def _emit_event(event_type: str, task_id: str, detail: str = "", actor: str = "colony") -> None:
     """Append an event to the SSE event bus.
 
+    Thread-safe: counter increment and queue append are performed under
+    _event_lock as one atomic step so ids are monotonic and unique under
+    concurrent emits. See #309.
+
     Args:
         event_type: Event kind (e.g. "harvested", "kickback", "merged").
         task_id: Task identifier the event relates to. Empty string if not task-scoped.
@@ -64,18 +72,19 @@ def _emit_event(event_type: str, task_id: str, detail: str = "", actor: str = "c
             inside colony HTTP handlers.
     """
     global _event_counter
-    _event_counter += 1
-    _event_queue.append(
-        {
-            "id": _event_counter,
-            "epoch": _server_epoch,
-            "actor": actor,
-            "type": event_type,
-            "task_id": task_id,
-            "detail": detail,
-            "ts": _now_iso(),
-        }
-    )
+    with _event_lock:
+        _event_counter += 1
+        _event_queue.append(
+            {
+                "id": _event_counter,
+                "epoch": _server_epoch,
+                "actor": actor,
+                "type": event_type,
+                "task_id": task_id,
+                "detail": detail,
+                "ts": _now_iso(),
+            }
+        )
 
 
 def _start_soldier_thread(backend: TaskBackend, data_dir: str) -> None:

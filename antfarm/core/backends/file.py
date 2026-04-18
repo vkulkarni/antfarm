@@ -888,24 +888,28 @@ class FileBackend(TaskBackend):
     def release_guard(self, resource: str, owner: str) -> None:
         """Release a guard. Only the owner can release.
 
+        Thread-safe: serialized under self._lock so the exists/read/unlink
+        triple cannot race with a concurrent acquire or another release on
+        the same resource. Double-release is idempotent via
+        unlink(missing_ok=True). See #308.
+
         Raises:
             PermissionError: If the owner field doesn't match.
             FileNotFoundError: If no guard exists for this resource.
         """
         guard_path = self._guard_path(resource)
-        if not guard_path.exists():
-            raise FileNotFoundError(f"No guard exists for resource '{resource}'")
-
-        try:
-            data = json.loads(guard_path.read_text())
-        except (json.JSONDecodeError, FileNotFoundError) as exc:
-            raise FileNotFoundError(f"Guard file for '{resource}' is unreadable") from exc
-
-        if data.get("owner") != owner:
-            raise PermissionError(
-                f"Guard on '{resource}' is owned by '{data.get('owner')}', not '{owner}'"
-            )
-        guard_path.unlink()
+        with self._lock:
+            if not guard_path.exists():
+                raise FileNotFoundError(f"No guard exists for resource '{resource}'")
+            try:
+                data = json.loads(guard_path.read_text())
+            except (json.JSONDecodeError, FileNotFoundError) as exc:
+                raise FileNotFoundError(f"Guard file for '{resource}' is unreadable") from exc
+            if data.get("owner") != owner:
+                raise PermissionError(
+                    f"Guard on '{resource}' is owned by '{data.get('owner')}', not '{owner}'"
+                )
+            guard_path.unlink(missing_ok=True)
 
     def release_guard_if_owner_dead(self, resource: str) -> bool:
         """Atomically release the guard only if its owner is no longer alive.
