@@ -143,6 +143,235 @@ def test_inbox_empty_when_healthy():
     assert len(items) == 0
 
 
+def test_inbox_retry_ceiling_flags_blocked_task_at_max():
+    """Blocked task with finished attempts >= max emits retry_ceiling error."""
+    tasks = [
+        {
+            "id": "task-1",
+            "status": "blocked",
+            "depends_on": [],
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+                {"attempt_id": "att-3", "status": "superseded"},
+            ],
+            "trail": [
+                {"message": "tests failed: ImportError", "action_type": "kickback"},
+            ],
+            "signals": [],
+        },
+    ]
+    items = collect_inbox_items(tasks=tasks, workers=[])
+    ceiling = [i for i in items if i["type"] == "retry_ceiling"]
+    assert len(ceiling) == 1
+    assert ceiling[0]["severity"] == "error"
+    assert "task-1" in ceiling[0]["message"]
+    assert "3/3" in ceiling[0]["message"]
+    assert "ImportError" in ceiling[0]["message"]
+
+
+def test_inbox_retrying_flags_task_near_ceiling():
+    """Non-blocked task with finished attempts == max-1 emits retrying warning."""
+    tasks = [
+        {
+            "id": "task-2",
+            "status": "ready",
+            "depends_on": [],
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+            ],
+            "trail": [
+                {"message": "review failed: needs_changes", "action_type": "kickback"},
+            ],
+            "signals": [],
+        },
+    ]
+    items = collect_inbox_items(tasks=tasks, workers=[])
+    retrying = [i for i in items if i["type"] == "retrying"]
+    assert len(retrying) == 1
+    assert retrying[0]["severity"] == "warning"
+    assert "task-2" in retrying[0]["message"]
+    assert "2 of max 3" in retrying[0]["message"]
+    assert "needs_changes" in retrying[0]["message"]
+
+
+def test_inbox_retry_skips_infra_tasks():
+    """Plan/review infra tasks are excluded from retry-pattern emissions."""
+    tasks = [
+        {
+            "id": "plan-123",
+            "status": "blocked",
+            "depends_on": [],
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+                {"attempt_id": "att-3", "status": "superseded"},
+            ],
+            "trail": [{"message": "plan failure", "action_type": "kickback"}],
+            "signals": [],
+        },
+        {
+            "id": "review-456",
+            "status": "ready",
+            "depends_on": [],
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+            ],
+            "trail": [{"message": "review failure", "action_type": "kickback"}],
+            "signals": [],
+        },
+        {
+            "id": "review-plan-789",
+            "status": "blocked",
+            "depends_on": [],
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+                {"attempt_id": "att-3", "status": "superseded"},
+            ],
+            "trail": [{"message": "plan review failure", "action_type": "kickback"}],
+            "signals": [],
+        },
+    ]
+    items = collect_inbox_items(tasks=tasks, workers=[])
+    retry_items = [
+        i for i in items if i["type"] in ("retry_ceiling", "retrying")
+    ]
+    assert retry_items == []
+
+
+def test_inbox_retry_ignores_fresh_tasks():
+    """Tasks with zero or one finished attempt do not trigger retry emissions."""
+    tasks = [
+        {
+            "id": "task-fresh",
+            "status": "ready",
+            "depends_on": [],
+            "attempts": [],
+            "trail": [],
+            "signals": [],
+        },
+        {
+            "id": "task-one-attempt",
+            "status": "ready",
+            "depends_on": [],
+            "attempts": [{"attempt_id": "att-1", "status": "superseded"}],
+            "trail": [{"message": "first failure", "action_type": "kickback"}],
+            "signals": [],
+        },
+    ]
+    items = collect_inbox_items(tasks=tasks, workers=[])
+    retry_items = [
+        i for i in items if i["type"] in ("retry_ceiling", "retrying")
+    ]
+    assert retry_items == []
+
+
+def test_inbox_retry_last_failure_reason_prefers_kickback_entry():
+    """Last failure reason prefers most-recent kickback over trailing chatter."""
+    tasks = [
+        {
+            "id": "task-9",
+            "status": "blocked",
+            "depends_on": [],
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+                {"attempt_id": "att-3", "status": "superseded"},
+            ],
+            "trail": [
+                {"message": "merge conflict on models.py", "action_type": "kickback"},
+                {"message": "doctor recovered task"},
+            ],
+            "signals": [],
+        },
+    ]
+    items = collect_inbox_items(tasks=tasks, workers=[])
+    ceiling = [i for i in items if i["type"] == "retry_ceiling"]
+    assert len(ceiling) == 1
+    assert "merge conflict on models.py" in ceiling[0]["message"]
+
+
+def test_inbox_retry_falls_back_to_last_trail_entry():
+    """If no kickback entry exists, fall back to the most recent trail message."""
+    tasks = [
+        {
+            "id": "task-10",
+            "status": "ready",
+            "depends_on": [],
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+            ],
+            "trail": [{"message": "generic failure trace"}],
+            "signals": [],
+        },
+    ]
+    items = collect_inbox_items(tasks=tasks, workers=[])
+    retrying = [i for i in items if i["type"] == "retrying"]
+    assert len(retrying) == 1
+    assert "generic failure trace" in retrying[0]["message"]
+
+
+def test_inbox_retry_respects_per_task_max_attempts_override():
+    """Per-task max_attempts overrides the default budget."""
+    tasks = [
+        {
+            "id": "task-11",
+            "status": "blocked",
+            "depends_on": [],
+            "max_attempts": 2,
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+            ],
+            "trail": [{"message": "failure", "action_type": "kickback"}],
+            "signals": [],
+        },
+    ]
+    items = collect_inbox_items(tasks=tasks, workers=[])
+    ceiling = [i for i in items if i["type"] == "retry_ceiling"]
+    assert len(ceiling) == 1
+    assert "2/2" in ceiling[0]["message"]
+
+
+def test_inbox_retry_ceiling_sorts_before_retrying():
+    """Errors (retry_ceiling) sort before warnings (retrying)."""
+    tasks = [
+        {
+            "id": "task-warn",
+            "status": "ready",
+            "depends_on": [],
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+            ],
+            "trail": [{"message": "warn reason", "action_type": "kickback"}],
+            "signals": [],
+        },
+        {
+            "id": "task-err",
+            "status": "blocked",
+            "depends_on": [],
+            "attempts": [
+                {"attempt_id": "att-1", "status": "superseded"},
+                {"attempt_id": "att-2", "status": "superseded"},
+                {"attempt_id": "att-3", "status": "superseded"},
+            ],
+            "trail": [{"message": "err reason", "action_type": "kickback"}],
+            "signals": [],
+        },
+    ]
+    items = collect_inbox_items(tasks=tasks, workers=[])
+    retry_items = [
+        i for i in items if i["type"] in ("retry_ceiling", "retrying")
+    ]
+    assert retry_items[0]["type"] == "retry_ceiling"
+    assert retry_items[1]["type"] == "retrying"
+
+
 def test_inbox_sorts_by_severity():
     """Errors come before warnings, warnings before info."""
     tasks = [
