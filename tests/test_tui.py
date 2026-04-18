@@ -4,6 +4,8 @@ Tests classification, helpers, render methods, and pipeline bar
 without any live terminal or network I/O.
 """
 
+import threading
+
 import httpx
 from rich.panel import Panel
 from rich.table import Table
@@ -1147,3 +1149,130 @@ def test_autostart_activity_default_starts_thread(monkeypatch):
 def test_autostart_activity_false_does_not_start_thread():
     tui = AntfarmTUI(colony_url="http://localhost:7433", token=None, autostart_activity=False)
     assert tui._activity_thread is None
+
+
+# ---------------------------------------------------------------------------
+# Epoch-aware ingestion (#306)
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_first_event_learns_epoch():
+    tui = _make_tui()
+    tui._ingest_event({"id": 1, "epoch": "E1", "type": "merged", "actor": "soldier"})
+    assert tui._activity_epoch == "E1"
+    assert tui._activity_cursor == 1
+
+
+def test_ingest_event_same_epoch_advances_cursor():
+    tui = _make_tui()
+    tui._ingest_event({"id": 1, "epoch": "E1", "type": "merged"})
+    tui._ingest_event({"id": 4, "epoch": "E1", "type": "harvested"})
+    assert tui._activity_epoch == "E1"
+    assert tui._activity_cursor == 4
+
+
+def test_ingest_event_different_epoch_resets_cursor():
+    tui = _make_tui()
+    tui._ingest_event({"id": 5, "epoch": "E1", "type": "merged"})
+    assert tui._activity_cursor == 5
+    tui._ingest_event({"id": 2, "epoch": "E2", "type": "harvested"})
+    assert tui._activity_epoch == "E2"
+    assert tui._activity_cursor == 2
+
+
+def test_ingest_event_missing_epoch_keeps_current():
+    tui = _make_tui()
+    tui._ingest_event({"id": 1, "epoch": "E1", "type": "merged"})
+    # Second event has no `epoch` key — backward compat with older servers.
+    tui._ingest_event({"id": 3, "type": "harvested"})
+    assert tui._activity_epoch == "E1"
+    assert tui._activity_cursor == 3
+
+
+# ---------------------------------------------------------------------------
+# Activity loop backoff (#307)
+# ---------------------------------------------------------------------------
+
+
+def test_activity_loop_backs_off_on_connect_error(monkeypatch):
+    """ConnectError repeats trigger exponential backoff starting at 1.0s."""
+    import contextlib
+
+    tui = _make_tui()
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def fake_sleep(s):
+        sleeps.append(s)
+
+    def always_fail():
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise SystemExit
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr("antfarm.core.tui.time.sleep", fake_sleep)
+    monkeypatch.setattr(tui, "_poll_events_once", always_fail)
+
+    with contextlib.suppress(SystemExit):
+        tui._activity_loop()
+
+    assert sleeps == [1.0, 2.0, 4.0]
+    assert tui._activity_status.startswith("reconnecting")
+
+
+def test_activity_loop_stops_on_auth_error(monkeypatch):
+    """401/403 is terminal — the loop returns and records an auth status."""
+    tui = _make_tui()
+
+    class _FakeResponse:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+
+    poll_calls = {"n": 0}
+
+    def auth_fail():
+        poll_calls["n"] += 1
+        raise httpx.HTTPStatusError("unauthorized", request=None, response=_FakeResponse(401))
+
+    monkeypatch.setattr(tui, "_poll_events_once", auth_fail)
+
+    t = threading.Thread(target=tui._activity_loop, daemon=True)
+    t.start()
+    t.join(timeout=1.0)
+
+    assert not t.is_alive(), "loop should have returned on auth error"
+    assert poll_calls["n"] == 1, "auth error should terminate after a single poll"
+    assert tui._activity_status.startswith("auth error")
+
+
+def test_activity_loop_resets_backoff_on_success(monkeypatch):
+    """After a successful poll, backoff resets to 1.0s for the next failure."""
+    import contextlib
+
+    tui = _make_tui()
+    sleeps: list[float] = []
+    calls = {"n": 0}
+
+    def flaky_poll():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ReadTimeout("slow")
+        if calls["n"] == 2:
+            return  # success
+        if calls["n"] == 3:
+            raise httpx.ReadTimeout("slow again")
+        # Bail out of the infinite loop once we have enough data.
+        raise SystemExit
+
+    def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr(tui, "_poll_events_once", flaky_poll)
+    monkeypatch.setattr("antfarm.core.tui.time.sleep", fake_sleep)
+
+    with contextlib.suppress(SystemExit):
+        tui._activity_loop()
+
+    # Failure -> backoff 1.0s; success -> 0.5s rate-limit; failure -> 1.0s again.
+    assert sleeps == [1.0, 0.5, 1.0]

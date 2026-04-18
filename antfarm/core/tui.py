@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import collections
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ from rich.table import Table
 from rich.text import Text
 
 from antfarm.core.missions import is_infra_task
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -64,6 +67,8 @@ class AntfarmTUI:
 
         self._activity_events: collections.deque = collections.deque(maxlen=1000)
         self._activity_cursor: int = 0
+        self._activity_epoch: str = ""
+        self._activity_status: str = "connected"
         self._activity_lock = threading.Lock()
         self._activity_thread: threading.Thread | None = None
         if autostart_activity:
@@ -82,12 +87,51 @@ class AntfarmTUI:
         t.start()
 
     def _activity_loop(self) -> None:
-        """Consume the colony /events SSE stream, retrying silently on error."""
+        """Consume the colony /events SSE stream with exponential backoff.
+
+        Classifies errors and surfaces a human-readable status string to the
+        TUI header. Auth errors (401/403) are terminal; transport errors and
+        HTTP 5xx bump the backoff up to 30s. Successful polls reset backoff.
+        """
+        backoff = 1.0
+        max_backoff = 30.0
         while True:
             try:
                 self._poll_events_once()
-            except Exception:
-                time.sleep(1)
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status in (401, 403):
+                    with self._activity_lock:
+                        self._activity_status = f"auth error ({status})"
+                    return
+                with self._activity_lock:
+                    self._activity_status = f"http {status} — retry in {backoff:.0f}s"
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                continue
+            except (
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.ReadError,
+                httpx.RemoteProtocolError,
+                httpx.ConnectTimeout,
+            ):
+                with self._activity_lock:
+                    self._activity_status = f"reconnecting in {backoff:.0f}s"
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                continue
+            except Exception as e:
+                with self._activity_lock:
+                    self._activity_status = f"error: {type(e).__name__}"
+                time.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                continue
+            # Healthy return — stream closed at server timeout with no error.
+            with self._activity_lock:
+                self._activity_status = "connected"
+            backoff = 1.0
+            time.sleep(0.5)  # rate-limit empty-stream reconnects
 
     def _poll_events_once(self) -> None:
         """Open one streaming request to /events and ingest each event."""
@@ -95,7 +139,11 @@ class AntfarmTUI:
         with httpx.stream(
             "GET",
             f"{self.colony_url}/events",
-            params={"after": self._activity_cursor, "timeout": 5},
+            params={
+                "after": self._activity_cursor,
+                "epoch": self._activity_epoch,
+                "timeout": 5,
+            },
             headers=headers,
             timeout=30.0,
         ) as response:
@@ -109,8 +157,23 @@ class AntfarmTUI:
                 self._ingest_event(event)
 
     def _ingest_event(self, event: dict) -> None:
-        """Append an event to the activity deque and advance the cursor."""
+        """Append an event to the activity deque and advance the cursor.
+
+        If the event carries an epoch that differs from the one we've been
+        tracking, the colony restarted — zero the cursor so we replay events
+        from the new server's id=1 onward (#306).
+        """
         with self._activity_lock:
+            incoming_epoch = event.get("epoch", "")
+            if incoming_epoch and incoming_epoch != self._activity_epoch:
+                if self._activity_epoch:
+                    logger.info(
+                        "colony epoch changed %s -> %s; resetting cursor",
+                        self._activity_epoch,
+                        incoming_epoch,
+                    )
+                self._activity_epoch = incoming_epoch
+                self._activity_cursor = 0
             self._activity_events.append(event)
             eid = event.get("id", 0)
             if isinstance(eid, int) and eid > self._activity_cursor:
@@ -179,9 +242,7 @@ class AntfarmTUI:
 
         # Warnings panel — only present when there are warnings
         if snap.warnings:
-            layout["warnings"].update(
-                self._render_warnings(snap.warnings)
-            )
+            layout["warnings"].update(self._render_warnings(snap.warnings))
 
         # Header: banner (left) + colony summary (right) side by side
         layout["header"].split_row(
@@ -202,6 +263,14 @@ class AntfarmTUI:
         from antfarm.core import __version__
 
         banner.append(f"\n v{__version__}", style="bold bright_white")
+
+        # SSE consumer status — visible signal that the event stream is healthy
+        # or in backoff (#307). Read once under the lock to avoid torn strings.
+        with self._activity_lock:
+            stream_status = self._activity_status
+        if len(stream_status) > 60:
+            stream_status = stream_status[:59] + "…"
+        banner.append(f"\n stream: {stream_status}", style="dim")
         layout["header"]["banner"].update(Panel(banner))
 
         layout["header"]["summary"].update(

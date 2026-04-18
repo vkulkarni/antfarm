@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -42,15 +43,16 @@ _autoscaler_instance = None
 # SSE event bus
 _event_queue: collections.deque = collections.deque(maxlen=1000)
 _event_counter: int = 0
+# UUID regenerated every time get_app() runs. Tags every emitted event so the
+# TUI can detect a colony restart and reset its cursor — see #306.
+_server_epoch: str = str(uuid.uuid4())
 
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _emit_event(
-    event_type: str, task_id: str, detail: str = "", actor: str = "colony"
-) -> None:
+def _emit_event(event_type: str, task_id: str, detail: str = "", actor: str = "colony") -> None:
     """Append an event to the SSE event bus.
 
     Args:
@@ -66,6 +68,7 @@ def _emit_event(
     _event_queue.append(
         {
             "id": _event_counter,
+            "epoch": _server_epoch,
             "actor": actor,
             "type": event_type,
             "task_id": task_id,
@@ -372,7 +375,11 @@ def get_app(
     Returns:
         Configured FastAPI application.
     """
-    global _backend, _max_attempts
+    global _backend, _max_attempts, _server_epoch
+
+    # Fresh epoch per app instance — ensures tests and real colony restarts
+    # both present a new server identity to SSE clients (#306).
+    _server_epoch = str(uuid.uuid4())
 
     # Ensure a persisted colony id exists BEFORE any other code (including
     # the config.json read below) touches the file. colony_id() serializes
@@ -1014,12 +1021,23 @@ def get_app(
     @app.get("/events")
     def event_stream(
         after: int = Query(default=0, description="Cursor: return events with id > after"),
+        epoch: str = Query(
+            default="",
+            description=(
+                "Server epoch seen by the client. If non-empty and differs from the "
+                "current epoch, the cursor is reset to 0 (colony restart recovery)."
+            ),
+        ),
         timeout: float = Query(default=30.0, description="Max seconds to hold connection"),
     ):
         """Stream colony events (harvest, kickback, merge) as SSE."""
 
         def _generate():
-            cursor = after
+            # If client supplies a non-empty epoch that differs from ours, the
+            # client was talking to a prior server instance. Reset its cursor.
+            # Empty epoch = first connect; use `after` literally for backward
+            # compat with old TUIs that don't send the epoch parameter.
+            cursor = 0 if epoch and epoch != _server_epoch else after
             start = time.monotonic()
             try:
                 while True:
@@ -1035,6 +1053,16 @@ def get_app(
                 pass
 
         return StreamingResponse(_generate(), media_type="text/event-stream")
+
+    @app.get("/events/epoch")
+    def event_epoch():
+        """Return the server's current SSE epoch.
+
+        Used by clients (e.g. TUI) to learn the server identity without waiting
+        for the first event. If the epoch changes between two reads, the colony
+        restarted.
+        """
+        return {"epoch": _server_epoch}
 
     # ------------------------------------------------------------------
     # Status
