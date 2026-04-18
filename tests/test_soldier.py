@@ -3786,3 +3786,129 @@ def test_run_does_not_kickback_when_require_review_false(tmp_path, monkeypatch):
     # Either the task was merged (happy path) or stayed done — either is
     # acceptable; the invariant is "no kickback on verdict" in legacy.
     assert after["current_attempt"] is not None
+
+
+# ---------------------------------------------------------------------------
+# #327 + #326: observability — activity-log task_id + preflight validation
+# ---------------------------------------------------------------------------
+
+
+def test_get_merge_queue_does_not_emit_already_merged_spam(soldier_env, clear_events, monkeypatch):
+    """#327b: no ``merge_skipped reason=already_merged`` emit on repeat polls.
+
+    After a task is merged, subsequent calls to ``run_once`` must not
+    re-emit the log-noise event every tick.
+    """
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-327-spam", "feat/task-327-spam")
+
+    # First tick merges it; clear the queue so we can isolate the second tick.
+    soldier.run_once()
+    clear_events.clear()
+
+    # Skip preflight on the 2nd tick so we isolate the merge-queue path.
+    soldier._preflight_done = True
+
+    # Second tick should find the task already merged and skip — but must
+    # NOT emit merge_skipped with reason=already_merged. It may emit other
+    # events (e.g. internal ticks); those are allowed.
+    soldier.run_once()
+
+    for e in clear_events:
+        if e.get("type") == "merge_skipped":
+            assert "already_merged" not in (e.get("detail") or ""), (
+                f"soldier must not spam already_merged merge_skipped events: {e}"
+            )
+
+
+def test_preflight_test_command_passes_on_clean(tmp_path, monkeypatch):
+    """#326: ``_preflight_test_command`` returns (True, '') when the command exits 0."""
+    soldier = _build_bare_soldier(tmp_path, test_command=["true"])
+    monkeypatch.setattr(Soldier, "_force_clean_repo", lambda self: True)
+
+    passed, tail = soldier._preflight_test_command()
+    assert passed is True
+    assert tail == ""
+
+
+def test_preflight_test_command_emits_broken_when_fails(tmp_path, monkeypatch):
+    """#326: ``_preflight_test_command`` returns (False, tail) with last-20 stderr."""
+    soldier = _build_bare_soldier(
+        tmp_path,
+        test_command=["sh", "-c", "echo line1 1>&2; echo line2 1>&2; exit 1"],
+    )
+    monkeypatch.setattr(Soldier, "_force_clean_repo", lambda self: True)
+
+    passed, tail = soldier._preflight_test_command()
+    assert passed is False
+    assert "line2" in tail
+
+
+def test_preflight_emits_test_command_broken_event_in_run_once(
+    soldier_env, clear_events, monkeypatch
+):
+    """#326: preflight fires ONCE per Soldier lifetime and emits test_command_broken."""
+    soldier = soldier_env["soldier"]
+
+    # Swap in a failing test_command for preflight purposes.
+    soldier.test_command = ["sh", "-c", "echo boom 1>&2; exit 1"]
+    soldier._preflight_done = False
+
+    # Skip real git recovery; assume the integration branch is clean.
+    monkeypatch.setattr(Soldier, "_force_clean_repo", lambda self: True)
+
+    # Two ticks, yet preflight must emit test_command_broken exactly once.
+    soldier.run_once()
+    soldier.run_once()
+
+    broken = _events_of_type(clear_events, "test_command_broken")
+    assert len(broken) == 1, f"expected exactly one test_command_broken, got {broken}"
+    assert broken[0]["actor"] == "soldier"
+    assert "boom" in broken[0]["detail"]
+
+
+def test_trail_includes_full_stderr_on_test_failure(tmp_path, monkeypatch):
+    """#326: task-failure ``last_failure_reason`` embeds last 20 lines of stderr."""
+    # Build 24 lines of stderr; first 4 should be dropped by the tail.
+    err_lines = "\n".join(f"err-line-{i}" for i in range(1, 25))
+    script = f"printf '%s\\n' '{err_lines}' 1>&2; exit 1"
+
+    soldier = _build_bare_soldier(tmp_path, test_command=["sh", "-c", script])
+    # Skip the preflight path so run_once below doesn't swallow the
+    # behaviour under test; we're asserting on attempt_merge's output.
+    soldier._preflight_done = True
+
+    task = _make_mock_task()
+
+    real_run = subprocess.run
+
+    def fake_run(args, **kwargs):
+        import subprocess as _sp
+
+        # Let the test_command ("sh -c ...") run for real so its actual
+        # stderr is captured; short-circuit all git invocations to success.
+        if args and args[0] == "sh":
+            return real_run(args, **kwargs)
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
+
+    result = soldier.attempt_merge(task)
+    assert result == MergeResult.FAILED
+
+    reason = soldier.last_failure_reason
+    # The reason has a short prefix then '---<tail>---' with the last 20
+    # stderr lines. Extract the tail block and assert against it.
+    assert "---" in reason
+    tail_block = reason.split("---", 2)[1]
+    tail_lines = tail_block.strip().splitlines()
+    # Exactly 20 lines of tail, newest last.
+    assert tail_lines[-1] == "err-line-24"
+    assert tail_lines[0] == "err-line-5"
+    assert len(tail_lines) == 20
+    # First four lines must not appear in the tail block.
+    for dropped in ("err-line-1", "err-line-2", "err-line-3", "err-line-4"):
+        assert dropped not in tail_lines, f"{dropped} should have been trimmed"

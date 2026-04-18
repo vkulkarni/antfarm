@@ -936,11 +936,21 @@ class AntfarmTUI:
                 time_str = "--:--:--"
 
             actor = (ev.get("actor") or "-")[:12].ljust(12)
-            event_type = ev.get("type", "") or ""
-            detail = ev.get("detail") or event_type or "-"
+            event_type = (ev.get("type") or "-")[:16].ljust(16)
+            raw_tid = ev.get("task_id") or ""
+            tid_short = (raw_tid.rsplit("-", 1)[-1] if raw_tid else "")[:8].ljust(10)
+            detail = ev.get("detail") or "-"
 
-            style = "red" if "failed" in event_type else ""
-            text.append(f"{time_str}  {actor}  {detail}", style=style)
+            if "failed" in event_type:
+                style = "red"
+            elif "kick" in event_type:
+                style = "yellow"
+            else:
+                style = ""
+            text.append(
+                f"{time_str}  {actor}  {event_type}  {tid_short}  {detail}",
+                style=style,
+            )
             if i < len(tail) - 1:
                 text.append("\n")
 

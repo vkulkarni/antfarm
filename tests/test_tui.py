@@ -1087,6 +1087,45 @@ def test_render_activity_failed_type_is_red():
     assert any("red" in s for s in styles)
 
 
+def test_render_activity_includes_type_and_task_id():
+    """#327: activity log must surface event type and task id columns."""
+    tui = _make_tui()
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "merge_skipped",
+            "actor": "soldier",
+            "task_id": "r3-06",
+            "detail": "reason=already_merged",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    )
+    rendered = tui._render_activity()
+    plain = rendered.plain
+    assert "merge_skipped" in plain
+    # task_id column uses last segment after final '-'
+    assert "r3-06" in plain or "06" in plain
+    assert "reason=already_merged" in plain
+
+
+def test_render_activity_kickback_is_yellow():
+    """#327: kickback events should render in yellow."""
+    tui = _make_tui()
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "task_kicked_back",
+            "actor": "soldier",
+            "task_id": "task-y",
+            "detail": "reason=review:needs_changes",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    )
+    rendered = tui._render_activity()
+    styles = [str(s.style) for s in rendered.spans]
+    assert any("yellow" in s for s in styles)
+
+
 def test_build_display_includes_activity_panel(monkeypatch):
     tui = _make_tui()
 
