@@ -1098,3 +1098,134 @@ def test_status_warnings_empty_when_reviewer_present(tmp_path):
     data = r.json()
     codes = [w.get("code") for w in data.get("warnings", [])]
     assert "no_reviewer_capacity" not in codes
+
+
+# ---------------------------------------------------------------------------
+# SSE epoch (#306) — server tags events + client can detect restarts
+# ---------------------------------------------------------------------------
+
+
+def _harvest_one_task(client, task_id="task-001"):
+    """Carry, forage, and harvest a task so _emit_event appends a harvested event."""
+    _carry(client, task_id=task_id)
+    task = _forage(client).json()
+    attempt_id = task["current_attempt"]
+    client.post(
+        f"/tasks/{task['id']}/harvest",
+        json={"attempt_id": attempt_id, "pr": "pr-1", "branch": "feat/x"},
+    )
+
+
+def _read_sse_events(client, query: str) -> list[dict]:
+    import json as json_mod
+
+    events: list[dict] = []
+    with client.stream("GET", f"/events{query}") as r:
+        assert r.status_code == 200
+        for line in r.iter_lines():
+            if line.startswith("data: "):
+                events.append(json_mod.loads(line[len("data: ") :]))
+    return events
+
+
+def test_events_include_epoch(tmp_path):
+    """Every streamed event carries a non-empty `epoch` field."""
+    from antfarm.core.backends.file import FileBackend
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    _harvest_one_task(client)
+    events = _read_sse_events(client, "?after=0&timeout=0.2")
+
+    assert len(events) >= 1
+    for ev in events:
+        assert "epoch" in ev
+        assert ev["epoch"] == serve_mod._server_epoch
+        assert ev["epoch"]  # non-empty
+
+
+def test_events_epoch_match_filters_by_cursor(tmp_path):
+    """When epoch matches, `after` filters out already-seen events."""
+    from antfarm.core.backends.file import FileBackend
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    # Emit 3 events so ids 1, 2, 3 exist
+    for i in range(3):
+        serve_mod._emit_event("harvested", f"task-{i}", "d")
+
+    current_epoch = serve_mod._server_epoch
+    events = _read_sse_events(client, f"?after=1&epoch={current_epoch}&timeout=0.3")
+
+    ids = [ev["id"] for ev in events]
+    assert ids == [2, 3]
+
+
+def test_events_epoch_mismatch_resets_cursor(tmp_path):
+    """Stale epoch signals a colony restart — cursor resets to 0."""
+    from antfarm.core.backends.file import FileBackend
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    for i in range(3):
+        serve_mod._emit_event("harvested", f"task-{i}", "d")
+
+    events = _read_sse_events(client, "?after=2&epoch=stale-uuid&timeout=0.3")
+    ids = [ev["id"] for ev in events]
+    assert ids == [1, 2, 3]
+
+
+def test_events_empty_epoch_uses_after_literally(tmp_path):
+    """Empty epoch = old TUI or first connect — `after` is obeyed as-is."""
+    from antfarm.core.backends.file import FileBackend
+
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    for i in range(3):
+        serve_mod._emit_event("harvested", f"task-{i}", "d")
+
+    events = _read_sse_events(client, "?epoch=&after=2&timeout=0.3")
+    ids = [ev["id"] for ev in events]
+    assert ids == [3]
+
+
+def test_events_epoch_endpoint(tmp_path):
+    """GET /events/epoch returns a parseable UUID under the `epoch` key."""
+    import uuid as _uuid
+
+    from antfarm.core.backends.file import FileBackend
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    client = TestClient(app)
+
+    r = client.get("/events/epoch")
+    assert r.status_code == 200
+    payload = r.json()
+    assert set(payload.keys()) == {"epoch"}
+    epoch = payload["epoch"]
+    assert isinstance(epoch, str)
+    assert len(epoch) == 36
+    assert epoch.count("-") == 4
+    _uuid.UUID(epoch)  # raises if not a valid UUID
+    assert epoch == serve_mod._server_epoch
