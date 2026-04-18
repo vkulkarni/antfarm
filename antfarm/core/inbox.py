@@ -27,12 +27,30 @@ def _age_seconds(ts: str) -> float:
     return (datetime.now(UTC) - dt).total_seconds()
 
 
+def _is_infra_task_id(task_id: str) -> bool:
+    """Return True if the task id identifies plan/review infrastructure work."""
+    return task_id.startswith(("plan-", "review-", "review-plan-"))
+
+
+def _last_failure_reason(trail: list[dict]) -> str:
+    """Extract the most recent kickback reason, else the last trail message."""
+    for entry in reversed(trail):
+        if entry.get("action_type") == "kickback":
+            msg = entry.get("message", "")
+            if msg:
+                return msg
+    if trail:
+        return trail[-1].get("message", "") or "unknown"
+    return "unknown"
+
+
 def collect_inbox_items(
     tasks: list[dict],
     workers: list[dict],
     *,
     stale_worker_ttl: float = 300.0,
     long_running_threshold: float = 3600.0,
+    max_attempts_default: int = 3,
 ) -> list[dict]:
     """Collect actionable items from colony state.
 
@@ -41,6 +59,9 @@ def collect_inbox_items(
         workers: List of worker dicts from the colony.
         stale_worker_ttl: Seconds after which a worker heartbeat is stale.
         long_running_threshold: Seconds after which an active task is flagged.
+        max_attempts_default: Default attempt ceiling when a task has no
+            ``max_attempts`` override. Finished attempts (DONE or SUPERSEDED)
+            are counted against this value.
 
     Returns:
         List of inbox item dicts with keys:
@@ -166,6 +187,54 @@ def collect_inbox_items(
                     "type": "kicked_back",
                     "message": f"Task '{tid}' was kicked back: {reason[:100]}",
                     "action": "Review rejection reason and requeue",
+                    "task_id": tid,
+                })
+
+        # --- Retry-pattern failures ---
+        # Count finished (DONE or SUPERSEDED) attempts and compare to the
+        # effective max_attempts budget. Blocked tasks at the ceiling become
+        # errors (retry_ceiling); non-blocked tasks one attempt away from the
+        # ceiling become warnings (retrying). Infra tasks (plan/review) are
+        # skipped — they're handled by their own lifecycle.
+        if not _is_infra_task_id(tid):
+            attempts = t.get("attempts", [])
+            finished = sum(
+                1 for a in attempts if a.get("status") in ("done", "superseded")
+            )
+            effective_max = t.get("max_attempts") or max_attempts_default
+            trail = t.get("trail", [])
+            if finished >= effective_max and status == "blocked":
+                reason = _last_failure_reason(trail)
+                items.append({
+                    "severity": "error",
+                    "type": "retry_ceiling",
+                    "message": (
+                        f"Task '{tid}' has failed {finished}/{effective_max} "
+                        f"attempts. Last failure: {reason[:120]}"
+                    ),
+                    "action": (
+                        "Task is at the retry ceiling. Inspect trail or "
+                        f"unblock via: antfarm kickback {tid}"
+                    ),
+                    "task_id": tid,
+                })
+            elif (
+                finished >= effective_max - 1
+                and finished > 0
+                and status != "blocked"
+            ):
+                reason = _last_failure_reason(trail)
+                items.append({
+                    "severity": "warning",
+                    "type": "retrying",
+                    "message": (
+                        f"Task '{tid}' has failed {finished} of max "
+                        f"{effective_max} attempts. Last failure: {reason[:120]}"
+                    ),
+                    "action": (
+                        "Task may block the mission if the next attempt fails. "
+                        "Inspect trail before it hits the retry ceiling."
+                    ),
                     "task_id": tid,
                 })
 
