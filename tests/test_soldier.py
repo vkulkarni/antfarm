@@ -3442,3 +3442,347 @@ def test_start_soldier_thread_silent_when_gitignore_has_entry(tmp_path, monkeypa
 
     warn = [e for e in events if e[0] == "data_dir_not_gitignored"]
     assert not warn, f"unexpected data_dir_not_gitignored, got {events}"
+
+
+# ---------------------------------------------------------------------------
+# #328: Soldier.run() must route through run_once_with_review() when
+# require_review=True so needs_changes verdicts trigger kickback instead of
+# rotting in done/ forever. During Phase 4 M1-r3 we had to manually kickback.
+# ---------------------------------------------------------------------------
+
+
+class _LoopSentinel(Exception):
+    """Raised by the monkeypatched _wait_for_event to exit run()'s loop."""
+
+
+def _inject_verdict_on_current_attempt(backend, task_id, verdict_dict):
+    """Write a review verdict onto the current attempt of a done task.
+
+    Tasks live under tasks/done/<id>.json after harvest.
+    """
+    from pathlib import Path
+
+    done_path = Path(backend._root) / "tasks" / "done" / f"{task_id}.json"
+    data = json.loads(done_path.read_text())
+    current_attempt = data["current_attempt"]
+    for a in data["attempts"]:
+        if a["attempt_id"] == current_attempt:
+            a["review_verdict"] = verdict_dict
+            break
+    done_path.write_text(json.dumps(data, indent=2))
+
+
+def _needs_changes_verdict_dict(sha: str = "a" * 40) -> dict:
+    from antfarm.core.models import ReviewVerdict
+
+    return ReviewVerdict(
+        provider="human",
+        verdict="needs_changes",
+        summary="please fix X",
+        findings=["bug in Y"],
+        reviewed_commit_sha=sha,
+    ).to_dict()
+
+
+def _pass_verdict_dict(sha: str = "a" * 40) -> dict:
+    from antfarm.core.models import ReviewVerdict
+
+    return ReviewVerdict(
+        provider="human",
+        verdict="pass",
+        summary="LGTM",
+        reviewed_commit_sha=sha,
+    ).to_dict()
+
+
+def _run_one_tick(soldier, monkeypatch):
+    """Drive exactly one tick of soldier.run() via a sentinel exception.
+
+    Monkeypatches the Soldier instance's ``_wait_for_event`` so the first
+    call after a tick raises ``_LoopSentinel`` and breaks out of the
+    otherwise-infinite loop.
+    """
+
+    def _raise_after_one(timeout):
+        raise _LoopSentinel()
+
+    monkeypatch.setattr(soldier, "_wait_for_event", _raise_after_one)
+    with pytest.raises(_LoopSentinel):
+        soldier.run()
+
+
+def test_run_kickbacks_on_needs_changes_when_require_review(tmp_path, monkeypatch):
+    """#328: production path — require_review=True, needs_changes verdict
+    stored on the current attempt. Driving one tick of ``run()`` must
+    route through ``run_once_with_review``, which kicks the task back.
+
+    Before the fix, run()'s inline loop called get_merge_queue(), which
+    silently filtered needs_changes tasks and continued — leaving them
+    rotting in done/.
+    """
+    sha = "a" * 40
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-328-prod", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-328-prod", sha)
+    _inject_verdict_on_current_attempt(backend, "task-328-prod", _needs_changes_verdict_dict(sha))
+
+    pre = backend.get_task("task-328-prod")
+    pre_attempt_id = pre["current_attempt"]
+    assert pre["status"] == "done"
+    assert pre_attempt_id is not None
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
+    assert soldier.require_review is True
+    # Idempotence guard from the plan: _get_done_candidates skips
+    # current_attempt=None tasks, so a post-kickback re-tick is a no-op.
+    _run_one_tick(soldier, monkeypatch)
+
+    after = backend.get_task("task-328-prod")
+    assert after["status"] == "ready", (
+        f"expected ready after needs_changes kickback, got {after['status']}"
+    )
+    assert after["current_attempt"] is None
+
+    # The prior attempt must be marked superseded.
+    superseded = [
+        a
+        for a in after["attempts"]
+        if a["attempt_id"] == pre_attempt_id and a["status"] == "superseded"
+    ]
+    assert superseded, f"expected superseded attempt, attempts={after['attempts']}"
+
+    trail_msgs = [e["message"] for e in after.get("trail", [])]
+    assert any("review failed" in m.lower() for m in trail_msgs), (
+        f"expected a 'review failed' trail entry, got: {trail_msgs}"
+    )
+
+
+def test_run_once_with_review_kickbacks_on_needs_changes(tmp_path, monkeypatch):
+    """Unit coverage for the new task_kicked_back emission in
+    run_once_with_review's needs_changes branch (#328)."""
+    from antfarm.core import soldier as soldier_mod
+
+    sha = "b" * 40
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-328-unit", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-328-unit", sha)
+    _inject_verdict_on_current_attempt(backend, "task-328-unit", _needs_changes_verdict_dict(sha))
+
+    captured: list[tuple[str, str, str]] = []
+
+    def _fake_emit(event_type, task_id, detail=""):
+        captured.append((event_type, task_id, detail))
+
+    monkeypatch.setattr(soldier_mod, "_emit", _fake_emit)
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
+    results = soldier.run_once_with_review()
+
+    assert results == [("task-328-unit", MergeResult.FAILED)]
+
+    task_events = [c for c in captured if c[1] == "task-328-unit"]
+    types = [c[0] for c in task_events]
+    # Skip event must come BEFORE the new task_kicked_back event.
+    assert "merge_skipped" in types, types
+    assert "task_kicked_back" in types, types
+    assert types.index("merge_skipped") < types.index("task_kicked_back")
+    assert any(
+        c[0] == "task_kicked_back" and "reason=review:needs_changes" in c[2] for c in task_events
+    ), f"expected task_kicked_back with reason=review:needs_changes, got {task_events}"
+
+
+def test_kickback_cascade_on_needs_changes_includes_downstream(tmp_path, monkeypatch):
+    """A needs_changes kickback on a parent must cascade to a downstream
+    done task (depends_on=[parent]). Both should end up in ready/ with
+    their prior attempts marked superseded (#328)."""
+    sha = "c" * 40
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+
+    # Parent: done with needs_changes verdict.
+    _make_done_task_with_mission(backend, "task-328-parent", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-328-parent", sha)
+    _inject_verdict_on_current_attempt(backend, "task-328-parent", _needs_changes_verdict_dict(sha))
+
+    # Downstream: done, depends on parent (so cascade must fire).
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).isoformat()
+    child_raw = {
+        "id": "task-328-child",
+        "title": "child",
+        "spec": "depends on parent",
+        "complexity": "M",
+        "priority": 10,
+        "depends_on": ["task-328-parent"],
+        "touches": [],
+        "capabilities_required": [],
+        "mission_id": None,
+        "created_by": "test",
+        "status": "ready",
+        "current_attempt": None,
+        "attempts": [],
+        "trail": [],
+        "signals": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    backend.carry(child_raw)
+    backend.register_worker(
+        {
+            "worker_id": "w-child",
+            "node_id": "node-1",
+            "agent_type": "generic",
+            "workspace_root": "/tmp/ws",
+            "status": "idle",
+            "registered_at": now,
+            "last_heartbeat": now,
+        }
+    )
+    backend.pull("w-child")
+    child_pulled = backend.get_task("task-328-child")
+    child_attempt = child_pulled["current_attempt"]
+    backend.mark_harvested(
+        "task-328-child",
+        child_attempt,
+        pr="PR-child",
+        branch="feat/task-328-child",
+    )
+
+    parent_pre = backend.get_task("task-328-parent")
+    child_pre = backend.get_task("task-328-child")
+    assert parent_pre["status"] == "done"
+    assert child_pre["status"] == "done"
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
+    soldier.run_once_with_review()
+
+    parent_after = backend.get_task("task-328-parent")
+    child_after = backend.get_task("task-328-child")
+    assert parent_after["status"] == "ready", parent_after["status"]
+    assert parent_after["current_attempt"] is None
+    assert child_after["status"] == "ready", (
+        f"downstream not cascaded, status={child_after['status']}"
+    )
+    assert child_after["current_attempt"] is None
+
+    # Child's prior attempt is superseded.
+    assert any(
+        a["attempt_id"] == child_attempt and a["status"] == "superseded"
+        for a in child_after["attempts"]
+    ), f"expected superseded child attempt, got {child_after['attempts']}"
+
+
+def test_kickback_exception_surfaces_diagnostic_event(tmp_path, monkeypatch):
+    """If ``kickback_with_cascade`` raises inside the needs_changes branch,
+    a ``soldier_error`` event with ``op=kickback_needs_changes`` must be
+    emitted and the exception must propagate (fail-loud). #328."""
+    from antfarm.core import soldier as soldier_mod
+
+    sha = "d" * 40
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-328-err", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-328-err", sha)
+    _inject_verdict_on_current_attempt(backend, "task-328-err", _needs_changes_verdict_dict(sha))
+
+    captured: list[tuple[str, str, str]] = []
+
+    def _fake_emit(event_type, task_id, detail=""):
+        captured.append((event_type, task_id, detail))
+
+    monkeypatch.setattr(soldier_mod, "_emit", _fake_emit)
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
+
+    def _boom(self, task_id, reason):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(Soldier, "kickback_with_cascade", _boom)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        soldier.run_once_with_review()
+
+    errs = [c for c in captured if c[0] == "soldier_error" and c[1] == "task-328-err"]
+    assert errs, f"expected soldier_error event, captured={captured}"
+    assert any(
+        "op=kickback_needs_changes" in c[2] and "type=RuntimeError" in c[2] and "msg=boom" in c[2]
+        for c in errs
+    ), f"detail mismatch, got: {errs}"
+
+
+def test_run_preserves_passing_merge_path(tmp_path, monkeypatch):
+    """Regression guard for #328: require_review=True + a passing verdict
+    must still route through run_once_with_review and merge (not kickback).
+    Ensures the fix doesn't regress the happy path."""
+    sha = "e" * 40
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-328-pass", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-328-pass", sha)
+    _inject_verdict_on_current_attempt(backend, "task-328-pass", _pass_verdict_dict(sha))
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
+
+    merges: list[tuple[str, str]] = []
+    marked: list[tuple[str, str]] = []
+
+    def _fake_attempt_merge(self, task):
+        merges.append((task["id"], task["current_attempt"]))
+        return MergeResult.MERGED
+
+    monkeypatch.setattr(Soldier, "attempt_merge", _fake_attempt_merge)
+    monkeypatch.setattr(
+        Soldier,
+        "_safe_mark_merged",
+        lambda self, tid, aid: marked.append((tid, aid)),
+    )
+
+    _run_one_tick(soldier, monkeypatch)
+
+    assert merges, f"expected attempt_merge call, got merges={merges}"
+    assert merges[0][0] == "task-328-pass"
+    assert marked, f"expected _safe_mark_merged call, got {marked}"
+    assert marked[0][0] == "task-328-pass"
+
+    after = backend.get_task("task-328-pass")
+    # Task was not kicked back — still done with a current attempt.
+    assert after["status"] == "done"
+    assert after["current_attempt"] is not None
+
+
+def test_run_does_not_kickback_when_require_review_false(tmp_path, monkeypatch):
+    """Legacy-path guard: require_review=False deployments must not touch
+    needs_changes verdicts (the verdict system is off). Task stays in
+    done/ through the legacy inline merge loop. #328."""
+    sha = "f" * 40
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    _make_done_task_with_mission(backend, "task-328-legacy", mission_id=None)
+    _set_attempt_artifact_sha(backend, "task-328-legacy", sha)
+    _inject_verdict_on_current_attempt(backend, "task-328-legacy", _needs_changes_verdict_dict(sha))
+
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=False)
+    assert soldier.require_review is False
+
+    # Stub attempt_merge so we don't invoke real git from the legacy path.
+    # Without this, get_merge_queue would still skip due to verdict check
+    # under require_review=False (no verdict gating). We just need to
+    # confirm the inline path never kickbacks on needs_changes.
+    calls: list[str] = []
+
+    def _fake_attempt_merge(self, task):
+        calls.append(task["id"])
+        return MergeResult.MERGED
+
+    monkeypatch.setattr(Soldier, "attempt_merge", _fake_attempt_merge)
+    monkeypatch.setattr(Soldier, "_safe_mark_merged", lambda self, tid, aid: None)
+
+    _run_one_tick(soldier, monkeypatch)
+
+    after = backend.get_task("task-328-legacy")
+    # Legacy path merged (or at least did not kickback). Either way the
+    # task must NOT be in ready/ with a superseded attempt due to the
+    # verdict — that's the #328 bug path which is disabled here.
+    assert after["status"] != "ready", (
+        "require_review=False must not kickback on needs_changes, got ready"
+    )
+    # Either the task was merged (happy path) or stayed done — either is
+    # acceptable; the invariant is "no kickback on verdict" in legacy.
+    assert after["current_attempt"] is not None
