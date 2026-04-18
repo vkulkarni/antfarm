@@ -87,6 +87,45 @@ def _emit_event(event_type: str, task_id: str, detail: str = "", actor: str = "c
         )
 
 
+def _warn_if_data_dir_not_gitignored(repo_path: str, data_dir_name: str) -> None:
+    """Warn operator if target repo's .gitignore doesn't list the colony data dir.
+
+    Naive matcher — line-scan for literal variants. False negatives are benign
+    (the -e flag on git clean still protects state); false positives just skip
+    an unneeded warning.
+    """
+    from pathlib import Path
+
+    gitignore = Path(repo_path) / ".gitignore"
+    if not gitignore.exists():
+        has_entry = False
+    else:
+        try:
+            lines = gitignore.read_text().splitlines()
+        except OSError:
+            return  # unreadable — skip
+        stripped = {
+            line.strip().lstrip("/").rstrip("/")
+            for line in lines
+            if line.strip() and not line.strip().startswith("#")
+        }
+        has_entry = data_dir_name.lstrip("/").rstrip("/") in stripped
+    if not has_entry:
+        logger.warning(
+            "target repo %s lacks %s in .gitignore — soldier's git clean "
+            "now excludes it via -e, but consider adding the entry for "
+            "belt-and-suspenders.",
+            repo_path,
+            data_dir_name,
+        )
+        _emit_event(
+            "data_dir_not_gitignored",
+            "",
+            f"repo={repo_path} data_dir={data_dir_name}",
+            actor="soldier",
+        )
+
+
 def _start_soldier_thread(backend: TaskBackend, data_dir: str) -> None:
     """Start the Soldier as a daemon thread (singleton guard)."""
     global _soldier_thread, _soldier_status
@@ -102,11 +141,19 @@ def _start_soldier_thread(backend: TaskBackend, data_dir: str) -> None:
     # Resolve: if data_dir is inside a git repo, use its parent.
     data_path = Path(data_dir).resolve()
     repo_path = str(data_path.parent) if data_path.name == ".antfarm" else str(data_path)
+    data_dir_name = data_path.name  # e.g. ".antfarm"
+
+    _warn_if_data_dir_not_gitignored(repo_path, data_dir_name)
 
     # Explicit require_review=True guards against silent regressions like
     # issue #284 — if the Soldier default ever changes, production still
     # runs with review enabled.
-    soldier = Soldier.from_backend(backend, repo_path=repo_path, require_review=True)
+    soldier = Soldier.from_backend(
+        backend,
+        repo_path=repo_path,
+        require_review=True,
+        data_dir_name=data_dir_name,
+    )
 
     def _soldier_loop():
         global _soldier_status

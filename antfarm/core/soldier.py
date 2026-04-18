@@ -158,6 +158,7 @@ class Soldier:
         poll_interval: float = 30.0,
         require_review: bool = False,
         poll_external_merges: bool = True,
+        data_dir_name: str = ".antfarm",
         client=None,
     ):
         self.colony = ColonyClient(colony_url, client=client)
@@ -168,6 +169,11 @@ class Soldier:
         self.poll_interval = poll_interval
         self.require_review = require_review
         self.poll_external_merges = poll_external_merges
+        # Passed as -e <data_dir_name> to git clean so the colony's runtime
+        # state under repo_path is never wiped mid-mission (#323). Target repos
+        # whose .gitignore doesn't list the data dir were being reset to empty
+        # by _cleanup / _force_clean_repo.
+        self.data_dir_name = data_dir_name
         self.last_failure_reason = ""
         # Event cursor for /events SSE stream. In-memory only; never persists.
         self._event_cursor: int = 0
@@ -1128,8 +1134,11 @@ class Soldier:
            If the origin ref is missing (no fetch yet, or disconnected),
            fall back silently to ``git reset --hard HEAD`` so the routine
            still completes instead of failing hard.
-        4. ``git clean -fd`` — remove untracked files/dirs. NOTE: intentionally
-           NOT ``-fdx`` — we preserve ignored paths like ``.venv``.
+        4. ``git clean -fd -e <data_dir_name>`` — remove untracked files/dirs.
+           NOTE: intentionally NOT ``-fdx`` — we preserve ignored paths like
+           ``.venv``. The ``-e`` excludes the colony's data dir (default
+           ``.antfarm``) so target repos without a matching ``.gitignore``
+           entry don't lose runtime state mid-mission (#323).
         5. ``git branch -D antfarm/temp-merge`` — best-effort; tolerated if
            the branch does not exist.
 
@@ -1166,7 +1175,7 @@ class Soldier:
                     check=True,
                 )
             subprocess.run(
-                ["git", "clean", "-fd"],
+                ["git", "clean", "-fd", "-e", self.data_dir_name],
                 cwd=self.repo_path,
                 capture_output=True,
                 check=True,
@@ -1240,9 +1249,11 @@ class Soldier:
             capture_output=True,
             check=False,
         )
-        # 5) Remove untracked files and directories.
+        # 5) Remove untracked files and directories. -e excludes the colony's
+        # data dir so target repos without a matching .gitignore entry don't
+        # lose runtime state (#323).
         subprocess.run(
-            ["git", "clean", "-fd"],
+            ["git", "clean", "-fd", "-e", self.data_dir_name],
             cwd=self.repo_path,
             capture_output=True,
             check=False,
@@ -1792,6 +1803,7 @@ class Soldier:
         poll_interval: float = 30.0,
         require_review: bool = True,
         poll_external_merges: bool = True,
+        data_dir_name: str = ".antfarm",
     ) -> Soldier:
         """Create a Soldier that talks directly to a TaskBackend.
 
@@ -1809,6 +1821,7 @@ class Soldier:
         instance.poll_interval = poll_interval
         instance.require_review = require_review
         instance.poll_external_merges = poll_external_merges
+        instance.data_dir_name = data_dir_name
         instance.last_failure_reason = ""
         instance._event_cursor = 0
         return instance
