@@ -435,6 +435,55 @@ class FileBackend(TaskBackend):
         # stall every other worker for its duration.
         self._close_superseded_pr(superseded_attempt, reason)
 
+    def recover_stale_task_if_worker_dead(self, task_id: str, current_attempt_id: str) -> bool:
+        """Atomically recover a stale active task iff its worker is dead.
+
+        Re-validates all drift conditions under ``self._lock`` before moving
+        state forward. See the ABC docstring for the full contract.
+
+        Within-process only; cross-process racers are out of scope.
+        """
+        with self._lock:
+            active_path = self._active_path(task_id)
+            if not active_path.exists():
+                return False
+            try:
+                data = self._read_json(active_path)
+            except (json.JSONDecodeError, OSError):
+                return False
+            if data.get("current_attempt") != current_attempt_id:
+                return False
+
+            worker_id = next(
+                (
+                    a.get("worker_id")
+                    for a in data.get("attempts", [])
+                    if a.get("attempt_id") == current_attempt_id
+                ),
+                None,
+            )
+            if worker_id and self._worker_path(worker_id).exists():
+                return False
+
+            now = _now_iso()
+            for a in data.get("attempts", []):
+                if a.get("attempt_id") == current_attempt_id:
+                    a["status"] = AttemptStatus.SUPERSEDED.value
+                    a["completed_at"] = now
+                    break
+
+            data["status"] = TaskStatus.READY.value
+            data["current_attempt"] = None
+            data["updated_at"] = now
+            data.setdefault("trail", []).append(
+                {"ts": now, "worker_id": "doctor", "message": "recovered by doctor"}
+            )
+
+            ready_path = self._ready_path(task_id)
+            self._write_json(ready_path, data)
+            active_path.unlink()
+            return True
+
     def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
         """Transition task from ACTIVE to HARVEST_PENDING.
 
@@ -858,6 +907,45 @@ class FileBackend(TaskBackend):
             )
         guard_path.unlink()
 
+    def release_guard_if_owner_dead(self, resource: str) -> bool:
+        """Atomically release the guard only if its owner is no longer alive.
+
+        Reads the guard under ``self._lock``, records the owner and mtime,
+        verifies no worker file exists for that owner, re-stats the guard
+        under the same lock to defend against a release+re-acquire race,
+        then unlinks. Within-process only.
+
+        Returns:
+            True if the guard existed with a dead owner and was removed.
+            False if the guard was missing, unreadable, owned by a live
+            worker, or re-acquired concurrently (state changed — not an
+            error).
+        """
+        guard_path = self._guard_path(resource)
+        with self._lock:
+            try:
+                data = json.loads(guard_path.read_text())
+                stat_before = os.stat(str(guard_path))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                return False
+            owner = data.get("owner", "")
+            if not owner:
+                return False
+            if self._worker_path(owner).exists():
+                return False
+            # Re-stat under lock: belt-and-suspenders against release+re-acquire.
+            # Holding self._lock already prevents that inside this process, but
+            # the comparison stays as a safety net if future code paths widen
+            # guard mutations outside the lock.
+            try:
+                stat_now = os.stat(str(guard_path))
+            except FileNotFoundError:
+                return False
+            if stat_now.st_mtime != stat_before.st_mtime:
+                return False
+            guard_path.unlink(missing_ok=True)
+            return True
+
     # ------------------------------------------------------------------
     # Nodes
     # ------------------------------------------------------------------
@@ -927,6 +1015,30 @@ class FileBackend(TaskBackend):
         """Deregister a worker. No-op if not found (idempotent)."""
         worker_path = self._worker_path(worker_id)
         worker_path.unlink(missing_ok=True)
+
+    def deregister_worker_if_stale(self, worker_id: str, max_age: float) -> bool:
+        """Atomically delete the worker file only if its mtime is older than ``max_age``.
+
+        Re-checks the file's mtime under ``self._lock`` to close the TOCTOU
+        window between the doctor's initial stale detection and the delete.
+        Within-process only; an external process that writes between our stat
+        and our unlink can still race — but such peers are not expected in v0.1.
+
+        Returns:
+            True if the file was stale and removed. False if the file was
+            missing or fresh (state changed — not an error).
+        """
+        worker_path = self._worker_path(worker_id)
+        with self._lock:
+            try:
+                stat = os.stat(str(worker_path))
+            except FileNotFoundError:
+                return False
+            age = datetime.now(UTC).timestamp() - stat.st_mtime
+            if age <= max_age:
+                return False
+            worker_path.unlink(missing_ok=True)
+            return True
 
     def heartbeat(self, worker_id: str, status: dict) -> None:
         """Write/update worker file in workers/. mtime = heartbeat timestamp."""

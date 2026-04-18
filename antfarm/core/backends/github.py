@@ -589,6 +589,26 @@ class GitHubBackend(TaskBackend):
 
         self._close_superseded_pr(superseded_attempt, reason)
 
+    def recover_stale_task_if_worker_dead(self, task_id: str, current_attempt_id: str) -> bool:
+        """Not supported on GitHubBackend — logs a warning and returns False.
+
+        Task recovery requires a file-based state machine. GitHub Issues
+        labels and body JSON do not support the same atomic rename semantics
+        that the doctor's stale-task fixer relies on, and the doctor's
+        ``check_stale_tasks`` only inspects FileBackend directories. This
+        method exists to satisfy the ABC; operators running a GitHub-backed
+        colony should rely on manual intervention or a parallel FileBackend
+        for task recovery.
+        """
+        import logging
+
+        del task_id, current_attempt_id  # unused — no-op implementation
+        logging.getLogger(__name__).warning(
+            "recover_stale_task_if_worker_dead is not supported for GitHubBackend; "
+            "task recovery is a filesystem-only operation in v0.1."
+        )
+        return False
+
     def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
         """Mark task as harvest_pending. Updates status in issue body."""
         task, issue_number = self._get_task_issue(task_id)
@@ -881,6 +901,28 @@ class GitHubBackend(TaskBackend):
                 )
             del self._guards[resource]
 
+    def release_guard_if_owner_dead(self, resource: str) -> bool:
+        """Atomically release a guard iff its owner has no live worker record.
+
+        Within-process only. Checks ``self._workers`` under ``self._lock``.
+
+        Returns:
+            True if the guard existed with a dead owner and was removed.
+            False if the guard was missing, had no owner, or the owner was
+            still alive (state unchanged — not an error).
+        """
+        with self._lock:
+            existing = self._guards.get(resource)
+            if existing is None:
+                return False
+            owner = existing.get("owner", "")
+            if not owner:
+                return False
+            if owner in self._workers:
+                return False
+            del self._guards[resource]
+            return True
+
     # ------------------------------------------------------------------
     # Nodes
     # ------------------------------------------------------------------
@@ -929,6 +971,32 @@ class GitHubBackend(TaskBackend):
     def deregister_worker(self, worker_id: str) -> None:
         """Deregister a worker. No-op if not found."""
         self._workers.pop(worker_id, None)
+
+    def deregister_worker_if_stale(self, worker_id: str, max_age: float) -> bool:
+        """Atomically remove a worker iff its last heartbeat is older than ``max_age``.
+
+        Within-process only. Re-checks the heartbeat under ``self._lock`` so a
+        concurrent heartbeat between the doctor's detection and the delete is
+        honored.
+
+        Returns:
+            True if the worker was stale and removed.
+            False if the record was missing, malformed, or fresh.
+        """
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if worker is None:
+                return False
+            last_hb = worker.get("last_heartbeat", "")
+            try:
+                hb_dt = datetime.fromisoformat(last_hb)
+                age = (datetime.now(UTC) - hb_dt).total_seconds()
+            except (ValueError, TypeError):
+                return False
+            if age <= max_age:
+                return False
+            del self._workers[worker_id]
+            return True
 
     def heartbeat(self, worker_id: str, status: dict) -> None:
         """Update worker in-memory state with heartbeat."""

@@ -96,6 +96,43 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
+    def recover_stale_task_if_worker_dead(self, task_id: str, current_attempt_id: str) -> bool:
+        """Atomically recover a stale active task only if its worker is dead.
+
+        Under the backend lock, verify that the task is still in the active
+        state, the current attempt still matches ``current_attempt_id``, and
+        the attempt's worker has no live worker record. If any of those drift
+        conditions fire, return False without mutating — the caller's
+        observation was stale and another actor has already moved state
+        forward.
+
+        When the conditions hold, supersede the current attempt, reset the
+        task to READY with ``current_attempt=None``, append a doctor trail
+        entry ("recovered by doctor"), and move the JSON from ``active/`` to
+        ``ready/``.
+
+        Drift conditions that trigger a False return:
+
+        - Task is no longer in ``active/`` (already moved by another actor).
+        - ``current_attempt`` differs from ``current_attempt_id`` (another
+          actor rotated the attempt).
+        - The attempt's worker record exists (worker recovered between the
+          caller's check and our mutation).
+
+        Scope is within-process only; cross-process callers must rely on
+        filesystem atomicity primitives.
+
+        Args:
+            task_id: ID of the task suspected to be stale.
+            current_attempt_id: The attempt ID the caller observed as current.
+
+        Returns:
+            True if the task was recovered to READY.
+            False if any drift condition prevented the recovery.
+        """
+        ...
+
+    @abstractmethod
     def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
         """Transition task to READY (or BLOCKED if attempts exhausted).
 
@@ -356,6 +393,26 @@ class TaskBackend(ABC):
         """
         ...
 
+    @abstractmethod
+    def release_guard_if_owner_dead(self, resource: str) -> bool:
+        """Atomically release a guard only if its recorded owner is no longer alive.
+
+        Reads the guard's owner under the backend lock, verifies the owner has
+        no registered worker record, and re-checks that the guard has not been
+        replaced (re-acquired) before releasing. Scope is within-process only;
+        cross-process races (a peer process re-acquires between our check and
+        our release) are out of scope.
+
+        Args:
+            resource: Resource identifier whose guard may be stale.
+
+        Returns:
+            True if the guard existed with a dead owner and was released.
+            False if the guard was missing, unreadable, owned by a live worker,
+            or re-acquired concurrently (state changed — not an error).
+        """
+        ...
+
     # --- Nodes ---
 
     @abstractmethod
@@ -411,6 +468,29 @@ class TaskBackend(ABC):
 
         Args:
             worker_id: ID of the worker to deregister.
+        """
+        ...
+
+    @abstractmethod
+    def deregister_worker_if_stale(self, worker_id: str, max_age: float) -> bool:
+        """Atomically deregister a worker only if its heartbeat is older than ``max_age``.
+
+        The staleness check and the delete are performed under the backend's
+        internal lock so a concurrent heartbeat inside the same process cannot
+        slip between the check and the delete. Scope is within-process only;
+        cross-process callers must rely on ``os.unlink`` atomicity and accept
+        that a peer process may re-register between our check and our unlink.
+
+        Args:
+            worker_id: ID of the worker to deregister.
+            max_age: Minimum age (seconds) a heartbeat must have before the
+                worker is considered stale. Age is measured against the
+                backend's persisted heartbeat timestamp.
+
+        Returns:
+            True if the worker was stale and removed.
+            False if the worker file was missing or had a fresh heartbeat
+            (i.e. state changed before mutation — not an error).
         """
         ...
 
