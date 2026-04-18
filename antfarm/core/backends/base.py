@@ -155,6 +155,10 @@ class TaskBackend(ABC):
         Args:
             task_id: ID of the task.
             attempt_id: ID of the attempt that was merged.
+
+        Raises:
+            ValueError: If attempt_id is not the current attempt.
+            FileNotFoundError: If the task is not found in done/.
         """
         ...
 

@@ -1687,9 +1687,7 @@ def test_wait_for_event_wakes_on_harvested_under_one_second(monkeypatch):
     lines = [f"data: {json.dumps(wake)}", ""]
     fake_client = _FakeHttpxClient(lines=lines)
 
-    monkeypatch.setattr(
-        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr(soldier_module.httpx, "Client", lambda *a, **kw: fake_client)
 
     # If sleep is called here we fail — wake path must not sleep.
     sleep_calls: list[float] = []
@@ -1721,9 +1719,7 @@ def test_wait_for_event_ignores_unrelated_events_until_timeout(monkeypatch):
     # simulating server-side timeout.
     lines = [f"data: {json.dumps(unrelated)}", ""]
     fake_client = _FakeHttpxClient(lines=lines)
-    monkeypatch.setattr(
-        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr(soldier_module.httpx, "Client", lambda *a, **kw: fake_client)
 
     sleep_calls: list[float] = []
     monkeypatch.setattr(soldier_module.time, "sleep", lambda s: sleep_calls.append(s))
@@ -1742,9 +1738,7 @@ def test_wait_for_event_timeout_returns_false_without_crashing(monkeypatch):
     soldier = _make_soldier_for_event_tests(poll_interval=5.0)
 
     fake_client = _FakeHttpxClient(lines=[])
-    monkeypatch.setattr(
-        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr(soldier_module.httpx, "Client", lambda *a, **kw: fake_client)
     monkeypatch.setattr(soldier_module.time, "sleep", lambda s: None)
 
     woken = soldier._wait_for_event(timeout=5.0)
@@ -1757,9 +1751,7 @@ def test_wait_for_event_connection_error_falls_back_to_sleep(monkeypatch):
     soldier = _make_soldier_for_event_tests(poll_interval=5.0)
 
     fake_client = _FakeHttpxClient(stream_exc=httpx.ConnectError("boom"))
-    monkeypatch.setattr(
-        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr(soldier_module.httpx, "Client", lambda *a, **kw: fake_client)
 
     sleep_calls: list[float] = []
     monkeypatch.setattr(soldier_module.time, "sleep", lambda s: sleep_calls.append(s))
@@ -1777,9 +1769,7 @@ def test_wait_for_event_json_parse_error_falls_back_to_sleep(monkeypatch):
     # "data: not-json" will fail json.loads inside the helper.
     lines = ["data: not-json", ""]
     fake_client = _FakeHttpxClient(lines=lines)
-    monkeypatch.setattr(
-        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr(soldier_module.httpx, "Client", lambda *a, **kw: fake_client)
 
     sleep_calls: list[float] = []
     monkeypatch.setattr(soldier_module.time, "sleep", lambda s: sleep_calls.append(s))
@@ -1821,9 +1811,7 @@ def test_wait_for_event_passes_cursor_and_timeout_to_server(monkeypatch):
     soldier._event_cursor = 42
 
     fake_client = _FakeHttpxClient(lines=[])
-    monkeypatch.setattr(
-        soldier_module.httpx, "Client", lambda *a, **kw: fake_client
-    )
+    monkeypatch.setattr(soldier_module.httpx, "Client", lambda *a, **kw: fake_client)
     monkeypatch.setattr(soldier_module.time, "sleep", lambda s: None)
 
     soldier._wait_for_event(timeout=4.0)
@@ -1907,9 +1895,7 @@ def test_get_merge_queue_emits_skipped_for_unmerged_dep(soldier_env, captured_em
 
     # Harvest task-a (not merged) and task-b which depends on task-a.
     _carry_and_harvest(cc, repo, "task-dep-a", "feat/task-dep-a")
-    _carry_and_harvest(
-        cc, repo, "task-dep-b", "feat/task-dep-b", depends_on=["task-dep-a"]
-    )
+    _carry_and_harvest(cc, repo, "task-dep-b", "feat/task-dep-b", depends_on=["task-dep-a"])
 
     # Clear emits from any prior steps, then invoke the filter path.
     captured_emits.clear()
@@ -1998,9 +1984,7 @@ def test_run_once_with_review_emits_skipped_needs_changes_before_kickback(
     # Filter emissions for this task.
     task_events = [c for c in captured_emits if c[1] == "task-nc-001"]
     types = [c[0] for c in task_events]
-    assert "merge_skipped" in types, (
-        f"expected merge_skipped before kickback, got {types}"
-    )
+    assert "merge_skipped" in types, f"expected merge_skipped before kickback, got {types}"
     # Ordering: merge_skipped (with needs_changes reason) must be emitted
     # BEFORE any subsequent kickback-related event. Kickback itself is
     # emitted by colony (actor=colony) not by soldier, so just assert that
@@ -2024,10 +2008,7 @@ def test_run_once_with_review_emits_skipped_review_in_progress(soldier_env, capt
         json={
             "id": "review-task-rip-001",
             "title": "Review: task-rip-001",
-            "spec": (
-                "Review task-rip-001\n"
-                "Attempt-SHA: feat/task-rip-001\n"
-            ),
+            "spec": ("Review task-rip-001\nAttempt-SHA: feat/task-rip-001\n"),
             "depends_on": [],
             "priority": 1,
             "capabilities_required": ["review"],
@@ -2047,9 +2028,7 @@ def test_run_once_with_review_emits_skipped_review_in_progress(soldier_env, capt
     captured_emits.clear()
     review_soldier.run_once_with_review()
 
-    skipped = [
-        c for c in captured_emits if c[0] == "merge_skipped" and c[1] == "task-rip-001"
-    ]
+    skipped = [c for c in captured_emits if c[0] == "merge_skipped" and c[1] == "task-rip-001"]
     assert any("reason=review_in_progress" in c[2] for c in skipped), (
         f"expected review_in_progress skip, got {skipped}"
     )
@@ -2195,9 +2174,7 @@ def test_rebase_retry_merges_when_rebase_resolves_drift(tmp_path, monkeypatch):
         if "merge" in args and "--no-ff" in args and "feat/task-rb" in args:
             merge_call_count["n"] += 1
             if merge_call_count["n"] == 1:
-                return _sp.CompletedProcess(
-                    args, 1, stdout=b"", stderr=b"CONFLICT (content)"
-                )
+                return _sp.CompletedProcess(args, 1, stdout=b"", stderr=b"CONFLICT (content)")
             return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
         if "rebase" in args and "origin/main" in joined and "--abort" not in args:
             return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
@@ -2232,9 +2209,7 @@ def test_rebase_conflict_kicks_back_with_rebase_failed_reason(tmp_path, monkeypa
             rebase_abort_called["n"] += 1
             return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
         if "rebase" in args and "origin/main" in joined:
-            return _sp.CompletedProcess(
-                args, 1, stdout=b"", stderr=b"CONFLICT during rebase"
-            )
+            return _sp.CompletedProcess(args, 1, stdout=b"", stderr=b"CONFLICT during rebase")
         return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
 
     import antfarm.core.soldier as soldier_mod
@@ -2260,9 +2235,7 @@ def test_rebase_retry_does_not_loop(tmp_path, monkeypatch):
 
         if "merge" in args and "--no-ff" in args and "feat/task-rb" in args:
             merge_calls["n"] += 1
-            return _sp.CompletedProcess(
-                args, 1, stdout=b"", stderr=b"CONFLICT (content)"
-            )
+            return _sp.CompletedProcess(args, 1, stdout=b"", stderr=b"CONFLICT (content)")
         if "rebase" in args and "--abort" not in args:
             rebase_calls["n"] += 1
             return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
@@ -2274,12 +2247,9 @@ def test_rebase_retry_does_not_loop(tmp_path, monkeypatch):
 
     result = soldier.attempt_merge(task)
     assert result == MergeResult.FAILED
-    assert rebase_calls["n"] == 1, (
-        f"expected exactly 1 rebase invocation, got {rebase_calls['n']}"
-    )
+    assert rebase_calls["n"] == 1, f"expected exactly 1 rebase invocation, got {rebase_calls['n']}"
     assert merge_calls["n"] == 2, (
-        f"expected exactly 2 merge invocations (initial + one retry), "
-        f"got {merge_calls['n']}"
+        f"expected exactly 2 merge invocations (initial + one retry), got {merge_calls['n']}"
     )
     assert "rebase_retry_merge_failed" in soldier.last_failure_reason
 
@@ -2313,9 +2283,7 @@ def test_rebase_uses_force_with_lease_never_plain_force(tmp_path, monkeypatch):
     pr_pushes = [a for a in push_args if "feat/task-rb" in a]
     assert pr_pushes, "expected a push to the PR branch after rebase"
     for p in pr_pushes:
-        assert "--force-with-lease" in p, (
-            f"PR-branch push must use --force-with-lease: {p}"
-        )
+        assert "--force-with-lease" in p, f"PR-branch push must use --force-with-lease: {p}"
 
     # No plain '--force' token anywhere in any push invocation
     # ('--force-with-lease' is a different token and is allowed).
@@ -2339,9 +2307,7 @@ def test_test_failure_does_not_trigger_rebase(tmp_path, monkeypatch):
             rebase_calls["n"] += 1
             return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
         if args and args[0] == "pytest-stub":
-            return _sp.CompletedProcess(
-                args, 1, stdout=b"1 failed", stderr=b"tests failed"
-            )
+            return _sp.CompletedProcess(args, 1, stdout=b"1 failed", stderr=b"tests failed")
         return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
 
     import antfarm.core.soldier as soldier_mod
@@ -2350,9 +2316,7 @@ def test_test_failure_does_not_trigger_rebase(tmp_path, monkeypatch):
 
     result = soldier.attempt_merge(task)
     assert result == MergeResult.FAILED
-    assert rebase_calls["n"] == 0, (
-        "test failure must NOT trigger the rebase retry path"
-    )
+    assert rebase_calls["n"] == 0, "test failure must NOT trigger the rebase retry path"
     assert "tests failed" in soldier.last_failure_reason
 
 
@@ -2377,9 +2341,7 @@ def test_run_once_with_review_kickbacks_on_needs_changes_verdict(tmp_path):
     _set_attempt_artifact_sha(backend, "task-nc-284", "a" * 40)
 
     # 2. Soldier with require_review=True creates the review task.
-    soldier = Soldier.from_backend(
-        backend, repo_path=str(tmp_path), require_review=True
-    )
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
     assert soldier.require_review is True, (
         "pre-condition: Soldier.from_backend must default require_review=True"
     )
@@ -2482,8 +2444,7 @@ def test_start_soldier_thread_wires_require_review_true(tmp_path, monkeypatch):
 
     assert captured, "_start_soldier_thread did not build a Soldier instance"
     assert captured["kwargs"].get("require_review", False) is True, (
-        f"Soldier must be started with require_review=True, "
-        f"got kwargs={captured['kwargs']}"
+        f"Soldier must be started with require_review=True, got kwargs={captured['kwargs']}"
     )
 
 
@@ -2588,9 +2549,7 @@ def test_p3_identical_diff_carries_forward_pass_verdict(tmp_path, monkeypatch):
     soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
 
     # Force diffs equivalent; stub attempt_merge so no real git runs.
-    monkeypatch.setattr(
-        Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: True
-    )
+    monkeypatch.setattr(Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: True)
     merges: list[tuple[str, str]] = []
 
     def fake_attempt_merge(self, task):
@@ -2645,9 +2604,7 @@ def test_p3_code_change_falls_through_to_rereview(tmp_path, monkeypatch):
     )
 
     soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
-    monkeypatch.setattr(
-        Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: False
-    )
+    monkeypatch.setattr(Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: False)
 
     def fail_attempt_merge(self, task):  # pragma: no cover - sanity guard
         raise AssertionError("attempt_merge must NOT run when diffs differ")
@@ -2686,9 +2643,7 @@ def test_p3_needs_changes_verdict_always_rereviews(tmp_path, monkeypatch):
     soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
     # Diffs equivalent — carry-forward still must be skipped because verdict
     # is not 'pass'.
-    monkeypatch.setattr(
-        Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: True
-    )
+    monkeypatch.setattr(Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: True)
 
     def fail_attempt_merge(self, task):  # pragma: no cover - sanity guard
         raise AssertionError("attempt_merge must NOT run on needs_changes")
@@ -2786,9 +2741,15 @@ def test_p3_git_failure_falls_through_safely(tmp_path, monkeypatch):
     def fake_subprocess_run(*args, **kwargs):
         # Only intercept git merge-base / git diff calls from the P3 helper.
         cmd = args[0] if args else kwargs.get("args", [])
-        if isinstance(cmd, list) and len(cmd) >= 2 and cmd[0] == "git" and cmd[1] in (
-            "merge-base",
-            "diff",
+        if (
+            isinstance(cmd, list)
+            and len(cmd) >= 2
+            and cmd[0] == "git"
+            and cmd[1]
+            in (
+                "merge-base",
+                "diff",
+            )
         ):
             return _FakeCompleted(returncode=128, stderr="fatal: bad object")
         # Fallback: raise to ensure nothing else unexpectedly shells out.
@@ -2832,9 +2793,7 @@ def test_p3_carry_forward_is_idempotent(tmp_path, monkeypatch):
     )
 
     soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
-    monkeypatch.setattr(
-        Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: True
-    )
+    monkeypatch.setattr(Soldier, "_diffs_equivalent_after_rebase", lambda *a, **kw: True)
 
     merge_calls: list[str] = []
 
@@ -2865,3 +2824,74 @@ def test_p3_carry_forward_is_idempotent(tmp_path, monkeypatch):
     assert results2 == []
     # attempt_merge must not be called a second time for this task.
     assert merge_calls == [new_attempt_id]
+
+
+# ---------------------------------------------------------------------------
+# Issue #305: _safe_mark_merged re-fetches and skips on attempt drift
+# ---------------------------------------------------------------------------
+
+
+def test_safe_mark_merged_skips_on_attempt_drift(soldier_env, captured_emits):
+    """Issue #305: Soldier must re-fetch task before mark_merged and skip on
+    attempt drift (concurrent kickback + re-harvest).
+
+    Simulates the race: Soldier captured ``attempt_id = X`` from a stale
+    queue snapshot, but ``colony.get_task`` now returns a task whose
+    ``current_attempt`` is ``Y``. ``_safe_mark_merged`` must return False,
+    must NOT call ``colony.mark_merged``, and must emit merge_skipped with
+    reason=attempt_drift.
+    """
+    soldier = soldier_env["soldier"]
+
+    mark_merged_calls: list[tuple[str, str]] = []
+
+    def fake_get_task(task_id: str):
+        # Pretend the task's current attempt has rotated.
+        return {
+            "id": task_id,
+            "current_attempt": "att-002-new",
+            "attempts": [
+                {"attempt_id": "att-001-stale", "status": "superseded"},
+                {"attempt_id": "att-002-new", "status": "done"},
+            ],
+        }
+
+    def fake_mark_merged(task_id: str, attempt_id: str) -> None:
+        mark_merged_calls.append((task_id, attempt_id))
+
+    soldier.colony.get_task = fake_get_task  # type: ignore[method-assign]
+    soldier.colony.mark_merged = fake_mark_merged  # type: ignore[method-assign]
+
+    result = soldier._safe_mark_merged("task-drift", "att-001-stale")
+
+    assert result is False
+    assert mark_merged_calls == [], "mark_merged must not be called on drift"
+    drift_emits = [c for c in captured_emits if c[0] == "merge_skipped" and c[1] == "task-drift"]
+    assert any("reason=attempt_drift" in c[2] for c in drift_emits), (
+        f"expected merge_skipped with reason=attempt_drift, got {captured_emits}"
+    )
+
+
+def test_safe_mark_merged_proceeds_when_attempt_still_current(soldier_env):
+    """Issue #305 happy path: when current_attempt matches, call through."""
+    soldier = soldier_env["soldier"]
+
+    mark_merged_calls: list[tuple[str, str]] = []
+
+    def fake_get_task(task_id: str):
+        return {
+            "id": task_id,
+            "current_attempt": "att-001",
+            "attempts": [{"attempt_id": "att-001", "status": "done"}],
+        }
+
+    def fake_mark_merged(task_id: str, attempt_id: str) -> None:
+        mark_merged_calls.append((task_id, attempt_id))
+
+    soldier.colony.get_task = fake_get_task  # type: ignore[method-assign]
+    soldier.colony.mark_merged = fake_mark_merged  # type: ignore[method-assign]
+
+    result = soldier._safe_mark_merged("task-ok", "att-001")
+
+    assert result is True
+    assert mark_merged_calls == [("task-ok", "att-001")]
