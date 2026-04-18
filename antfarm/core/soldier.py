@@ -189,23 +189,33 @@ class Soldier:
         so it can wake immediately on ``harvested``/``kickback``/``merged``
         events. On any connection failure the loop falls back to the
         legacy polling behaviour (``time.sleep(self.poll_interval)``).
+
+        When ``require_review=True`` (the production configuration — see
+        ``serve._start_soldier_thread``) every tick dispatches through
+        ``run_once_with_review``, which is the single source of truth for
+        verdict-gated merges AND kickbacks on ``needs_changes``. The
+        legacy inline merge loop below is only used when review is
+        disabled (``require_review=False``), which no production deploy
+        sets today (see #328 for the bug this split was hiding).
         """
         while True:
             if self.require_review:
-                self.process_done_tasks()
-            queue = self.get_merge_queue()
-            if not queue:
-                self._wait_for_event(timeout=self.poll_interval)
-                continue
-            for task in queue:
-                if self._reconcile_external_merge(task):
-                    continue
-                result = self.attempt_merge(task)
-                attempt_id = task["current_attempt"]
-                if result == MergeResult.MERGED:
-                    self._safe_mark_merged(task["id"], attempt_id)
-                else:
-                    self.kickback_with_cascade(task["id"], self.last_failure_reason)
+                self.run_once_with_review()
+            else:
+                queue = self.get_merge_queue()
+                for task in queue:
+                    if self._reconcile_external_merge(task):
+                        continue
+                    result = self.attempt_merge(task)
+                    attempt_id = task["current_attempt"]
+                    if result == MergeResult.MERGED:
+                        self._safe_mark_merged(task["id"], attempt_id)
+                    else:
+                        self.kickback_with_cascade(task["id"], self.last_failure_reason)
+            # ``_wait_for_event`` handles sleeping regardless of whether
+            # the tick did any work — the previous early-continue on an
+            # empty queue was harmless but added an extra code path.
+            self._wait_for_event(timeout=self.poll_interval)
 
     def run_once(self) -> list[tuple[str, MergeResult]]:
         """Process the merge queue once and return results.
@@ -348,12 +358,37 @@ class Soldier:
                     if result == MergeResult.MERGED:
                         self._safe_mark_merged(task_id, attempt_id)
                     else:
-                        self.kickback_with_cascade(task_id, self.last_failure_reason)
+                        try:
+                            self.kickback_with_cascade(task_id, self.last_failure_reason)
+                        except Exception as exc:
+                            logger.exception("kickback failed for %s", task_id)
+                            _emit(
+                                "soldier_error",
+                                task_id,
+                                f"op=kickback_merge_failed type={type(exc).__name__} "
+                                f"msg={exc}",
+                            )
+                            raise
                     results.append((task_id, result))
                 else:
                     # Diagnostic skip before kickback: needs_changes verdict.
                     _emit("merge_skipped", task_id, "reason=needs_changes")
-                    self.kickback_with_cascade(task_id, f"review failed: {reason}")
+                    try:
+                        self.kickback_with_cascade(task_id, f"review failed: {reason}")
+                        _emit(
+                            "task_kicked_back",
+                            task_id,
+                            "reason=review:needs_changes",
+                        )
+                    except Exception as exc:
+                        logger.exception("kickback failed for %s", task_id)
+                        _emit(
+                            "soldier_error",
+                            task_id,
+                            f"op=kickback_needs_changes type={type(exc).__name__} "
+                            f"msg={exc}",
+                        )
+                        raise
                     results.append((task_id, MergeResult.FAILED))
                 continue
 
@@ -546,7 +581,12 @@ class Soldier:
             if not all(dep in merged_task_ids for dep in deps):
                 _emit("merge_skipped", task_id, "reason=dep_unmerged")
                 continue
-            # When review is required, gate on passing + fresh verdict
+            # When review is required, gate on passing + fresh verdict.
+            # NOTE: ``run_once_with_review`` is the primary enforcement
+            # point for review gating AND needs_changes kickbacks. This
+            # check is defense-in-depth for the legacy ``run_once``
+            # callers that do NOT go through review orchestration. Do
+            # NOT add a kickback here — that's #328's intended contract.
             if self.require_review:
                 passed, _reason = self.check_review_verdict(task)
                 if not passed:
