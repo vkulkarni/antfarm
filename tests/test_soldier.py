@@ -2660,13 +2660,15 @@ def test_p3_needs_changes_verdict_always_rereviews(tmp_path, monkeypatch):
 
 
 def test_p3_test_only_change_follows_pathspec_exclusion(tmp_path, monkeypatch):
-    """Test-file-only change between attempts: the ``:!**/tests/**`` and
-    ``:!**/test_*.py`` pathspec excludes strip test paths from the diff.
-    If the non-test portions are byte-identical, we carry forward the pass
-    verdict — this is intentional per the mission spec (test-only churn
-    should not trigger a full re-review). Verified here by asserting the
-    helper sees identical non-test diffs and the verdict is carried
-    forward without invoking rereview."""
+    """Test-file-only change between attempts: the ``:!**/test_*.py`` and
+    ``:!**/*_test.py`` pathspec excludes strip pytest-discovery files from
+    the diff. Note: ``conftest.py``, fixtures, and other test infrastructure
+    are NOT excluded and DO trigger re-review (see #304). If the non-test
+    portions are byte-identical, we carry forward the pass verdict — this
+    is intentional per the mission spec (pure test-impl churn should not
+    trigger a full re-review). Verified here by asserting the helper sees
+    identical non-test diffs and the verdict is carried forward without
+    invoking rereview."""
     backend = FileBackend(root=str(tmp_path / ".antfarm"))
     old_sha = "a" * 40
     new_sha = "b" * 40
@@ -2895,3 +2897,201 @@ def test_safe_mark_merged_proceeds_when_attempt_still_current(soldier_env):
 
     assert result is True
     assert mark_merged_calls == [("task-ok", "att-001")]
+
+
+# ---------------------------------------------------------------------------
+# Issue #304: conftest.py / test-infra changes must trigger re-review
+# ---------------------------------------------------------------------------
+
+
+def _make_repo_with_two_attempts(
+    tmp_path,
+    variant_a_files: dict[str, str],
+    variant_b_files: dict[str, str],
+    base_files: dict[str, str] | None = None,
+) -> tuple[Soldier, str, str]:
+    """Build a real git repo with two branches sharing a common base commit.
+
+    ``base_files`` are committed on ``dev`` and pushed to ``origin`` (the
+    merge-base). ``variant_a_files`` and ``variant_b_files`` are each
+    written/committed on their own branch off of that base. Returns
+    ``(soldier, sha_a, sha_b)`` where each SHA is the tip of its variant
+    branch and ``soldier.repo_path`` is the working clone.
+    """
+    origin = tmp_path / "origin.git"
+    clone = tmp_path / "clone"
+
+    _git(["git", "init", "--bare", str(origin)], cwd=str(tmp_path))
+    _git(["git", "clone", str(origin), str(clone)], cwd=str(tmp_path))
+    _configure_git(str(clone))
+
+    # Base commit on dev
+    _commit_file(str(clone), "README.md", "antfarm test repo\n", "init")
+    for rel, content in (base_files or {}).items():
+        full = clone / rel
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(content)
+        _git(["git", "add", rel], cwd=str(clone))
+    if base_files:
+        _git(["git", "commit", "-m", "base"], cwd=str(clone))
+    _git(["git", "push", "origin", "HEAD:dev"], cwd=str(clone))
+    _git(["git", "fetch", "origin"], cwd=str(clone))
+
+    base_sha = _git(["git", "rev-parse", "HEAD"], cwd=str(clone)).stdout.strip()
+
+    def _commit_variant(branch: str, files: dict[str, str]) -> str:
+        _git(["git", "checkout", "-B", branch, base_sha], cwd=str(clone))
+        for rel, content in files.items():
+            full = clone / rel
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content)
+            _git(["git", "add", rel], cwd=str(clone))
+        _git(["git", "commit", "-m", f"variant {branch}"], cwd=str(clone))
+        return _git(["git", "rev-parse", "HEAD"], cwd=str(clone)).stdout.strip()
+
+    sha_a = _commit_variant("variant-a", variant_a_files)
+    sha_b = _commit_variant("variant-b", variant_b_files)
+
+    soldier = Soldier(
+        colony_url="http://testserver",
+        repo_path=str(clone),
+        integration_branch="dev",
+        test_command=["true"],
+        poll_interval=0.0,
+    )
+    return soldier, sha_a, sha_b
+
+
+_TASK_STUB = {"id": "task-304", "current_attempt": "att-002", "attempts": []}
+
+
+def test_diffs_equivalent_conftest_change_triggers_rereview(tmp_path):
+    """Primary regression test for #304: a tests/conftest.py change between
+    attempts must cause the diff-equivalence check to return False even when
+    all non-test source files are identical."""
+    base = {"src/models.py": "x = 1\n", "tests/conftest.py": "FIXTURE = 1\n"}
+    # Variant A: same conftest as base
+    variant_a = {"src/models.py": "x = 2\n", "tests/conftest.py": "FIXTURE = 1\n"}
+    # Variant B: identical src change, but conftest.py is modified
+    variant_b = {"src/models.py": "x = 2\n", "tests/conftest.py": "FIXTURE = 2\n"}
+    soldier, sha_a, sha_b = _make_repo_with_two_attempts(
+        tmp_path, variant_a, variant_b, base_files=base
+    )
+    assert soldier._diffs_equivalent_after_rebase(_TASK_STUB, sha_a, sha_b) is False
+
+
+def test_diffs_equivalent_root_conftest_change_triggers_rereview(tmp_path):
+    """conftest.py at the repository root (not under tests/) must also
+    trigger re-review."""
+    base = {"src/models.py": "x = 1\n", "conftest.py": "ROOT = 1\n"}
+    variant_a = {"src/models.py": "x = 2\n", "conftest.py": "ROOT = 1\n"}
+    variant_b = {"src/models.py": "x = 2\n", "conftest.py": "ROOT = 2\n"}
+    soldier, sha_a, sha_b = _make_repo_with_two_attempts(
+        tmp_path, variant_a, variant_b, base_files=base
+    )
+    assert soldier._diffs_equivalent_after_rebase(_TASK_STUB, sha_a, sha_b) is False
+
+
+def test_diffs_equivalent_nested_conftest_change_triggers_rereview(tmp_path):
+    """A nested conftest.py (e.g. tests/integration/conftest.py) must also
+    trigger re-review — the pathspec must not match it."""
+    base = {
+        "src/models.py": "x = 1\n",
+        "tests/integration/conftest.py": "NESTED = 1\n",
+    }
+    variant_a = {
+        "src/models.py": "x = 2\n",
+        "tests/integration/conftest.py": "NESTED = 1\n",
+    }
+    variant_b = {
+        "src/models.py": "x = 2\n",
+        "tests/integration/conftest.py": "NESTED = 2\n",
+    }
+    soldier, sha_a, sha_b = _make_repo_with_two_attempts(
+        tmp_path, variant_a, variant_b, base_files=base
+    )
+    assert soldier._diffs_equivalent_after_rebase(_TASK_STUB, sha_a, sha_b) is False
+
+
+def test_diffs_equivalent_test_impl_change_is_ignored(tmp_path):
+    """Changes limited to pytest-discovery files (test_*.py) must NOT
+    trigger re-review when non-test paths are byte-identical. This is the
+    behavior that enables rebase-reharvest carry-forward."""
+    base = {"src/models.py": "x = 1\n", "tests/test_foo.py": "def test_foo(): pass\n"}
+    variant_a = {
+        "src/models.py": "x = 2\n",
+        "tests/test_foo.py": "def test_foo(): pass\n",
+    }
+    variant_b = {
+        "src/models.py": "x = 2\n",
+        "tests/test_foo.py": "def test_foo(): assert True\n",
+    }
+    soldier, sha_a, sha_b = _make_repo_with_two_attempts(
+        tmp_path, variant_a, variant_b, base_files=base
+    )
+    assert soldier._diffs_equivalent_after_rebase(_TASK_STUB, sha_a, sha_b) is True
+
+
+def test_diffs_equivalent_underscore_test_suffix_ignored(tmp_path):
+    """The ``*_test.py`` naming pattern (Go-style / alternative pytest
+    discovery) is also excluded and must not trigger re-review."""
+    base = {"src/models.py": "x = 1\n", "tests/widget_test.py": "def test_w(): pass\n"}
+    variant_a = {
+        "src/models.py": "x = 2\n",
+        "tests/widget_test.py": "def test_w(): pass\n",
+    }
+    variant_b = {
+        "src/models.py": "x = 2\n",
+        "tests/widget_test.py": "def test_w(): assert 1\n",
+    }
+    soldier, sha_a, sha_b = _make_repo_with_two_attempts(
+        tmp_path, variant_a, variant_b, base_files=base
+    )
+    assert soldier._diffs_equivalent_after_rebase(_TASK_STUB, sha_a, sha_b) is True
+
+
+def test_diffs_equivalent_non_test_change_detected(tmp_path):
+    """Baseline sanity: a non-test source change between otherwise
+    identical attempts must cause re-review."""
+    base = {"src/models.py": "x = 1\n"}
+    variant_a = {"src/models.py": "x = 2\n"}
+    variant_b = {"src/models.py": "x = 3\n"}
+    soldier, sha_a, sha_b = _make_repo_with_two_attempts(
+        tmp_path, variant_a, variant_b, base_files=base
+    )
+    assert soldier._diffs_equivalent_after_rebase(_TASK_STUB, sha_a, sha_b) is False
+
+
+def test_diffs_equivalent_identical_returns_true(tmp_path):
+    """Two attempts with byte-identical trees must report equivalent diffs
+    (no re-review needed)."""
+    base = {"src/models.py": "x = 1\n"}
+    variant_a = {"src/models.py": "x = 2\n"}
+    variant_b = {"src/models.py": "x = 2\n"}
+    soldier, sha_a, sha_b = _make_repo_with_two_attempts(
+        tmp_path, variant_a, variant_b, base_files=base
+    )
+    assert soldier._diffs_equivalent_after_rebase(_TASK_STUB, sha_a, sha_b) is True
+
+
+def test_diffs_equivalent_test_fixture_data_triggers_rereview(tmp_path):
+    """Conservative trade-off: fixture data under tests/data/ IS included
+    in the equivalence diff and therefore triggers re-review. Documents
+    the Option A decision for #304; a targeted ``:!**/tests/data/**``
+    exclusion can be added later if the churn cost outweighs correctness."""
+    base = {
+        "src/models.py": "x = 1\n",
+        "tests/data/sample.json": '{"v": 1}\n',
+    }
+    variant_a = {
+        "src/models.py": "x = 2\n",
+        "tests/data/sample.json": '{"v": 1}\n',
+    }
+    variant_b = {
+        "src/models.py": "x = 2\n",
+        "tests/data/sample.json": '{"v": 2}\n',
+    }
+    soldier, sha_a, sha_b = _make_repo_with_two_attempts(
+        tmp_path, variant_a, variant_b, base_files=base
+    )
+    assert soldier._diffs_equivalent_after_rebase(_TASK_STUB, sha_a, sha_b) is False

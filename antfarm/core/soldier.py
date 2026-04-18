@@ -1369,10 +1369,12 @@ class Soldier:
 
         Computes ``git diff <merge_base>..<head> --ignore-all-space`` for
         both ``existing_sha`` and ``current_sha`` against
-        ``origin/<integration_branch>``, with pathspec excludes for
-        ``tests/`` directories and ``test_*.py`` files. Returns True iff
-        both ``git merge-base`` + ``git diff`` invocations succeed AND
-        both stdouts are byte-identical.
+        ``origin/<integration_branch>``. The pathspec excludes only
+        pytest-discovery files (``test_*.py`` and ``*_test.py``).
+        ``conftest.py``, test fixtures, and test config are INCLUDED —
+        changes to test infrastructure must trigger a re-review (fixes
+        #304). Returns True iff both ``git merge-base`` + ``git diff``
+        invocations succeed AND both stdouts are byte-identical.
 
         Any subprocess error, non-zero return code, or empty merge-base
         output causes this method to return False (safe default → the
@@ -1403,6 +1405,11 @@ class Soldier:
         The ``--ignore-all-space`` flag is applied at the ``git diff``
         layer (not via post-processing) so identical-after-whitespace
         rebases are recognized as pure-rebase reharvests.
+
+        Pathspec excludes only pytest-discovery files (``test_*.py`` and
+        ``*_test.py``). ``conftest.py``, fixtures, and data under
+        ``tests/`` are INCLUDED — test infrastructure changes must
+        trigger a re-review (fixes #304).
         """
         mb = subprocess.run(
             ["git", "merge-base", sha, f"origin/{self.integration_branch}"],
@@ -1417,6 +1424,7 @@ class Soldier:
         if not merge_base:
             return None
 
+        # conftest.py etc. are test infrastructure — always re-review (fixes #304)
         diff = subprocess.run(
             [
                 "git",
@@ -1424,8 +1432,8 @@ class Soldier:
                 "--ignore-all-space",
                 f"{merge_base}..{sha}",
                 "--",
-                ":!**/tests/**",
                 ":!**/test_*.py",
+                ":!**/*_test.py",
             ],
             cwd=self.repo_path,
             capture_output=True,
