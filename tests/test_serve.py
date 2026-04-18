@@ -1229,3 +1229,91 @@ def test_events_epoch_endpoint(tmp_path):
     assert epoch.count("-") == 4
     _uuid.UUID(epoch)  # raises if not a valid UUID
     assert epoch == serve_mod._server_epoch
+
+
+# ---------------------------------------------------------------------------
+# _emit_event concurrency / locking (issue #309)
+# ---------------------------------------------------------------------------
+
+
+def test_emit_event_concurrent_ids_are_unique():
+    """Concurrent emits must produce strictly unique, monotonically-assigned ids.
+
+    Pre-fix, the `_event_counter += 1` and queue append were not serialized,
+    so two threads could read the same counter value, both increment to N+1,
+    and both append events with id=N+1. That breaks SSE cursor semantics
+    (after=N+1 would skip a real event). 10 threads x 100 emits = 1000 ids;
+    the deque has maxlen=1000, so all retained.
+    """
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    n_threads = 10
+    n_per_thread = 100
+    barrier = threading.Barrier(n_threads)
+    errors: list[BaseException] = []
+
+    def emit_burst() -> None:
+        try:
+            barrier.wait()
+            for i in range(n_per_thread):
+                serve_mod._emit_event("burst", f"task-{i}", "d")
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=emit_burst) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert serve_mod._event_counter == n_threads * n_per_thread
+    queued = list(serve_mod._event_queue)
+    assert len(queued) == n_threads * n_per_thread
+    ids = [e["id"] for e in queued]
+    assert len(set(ids)) == len(ids), "duplicate event ids under concurrent emits"
+    assert queued[-1]["id"] == n_threads * n_per_thread
+
+
+def test_emit_event_serial_still_works():
+    """Baseline preservation: serial emits still yield contiguous ids."""
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    serve_mod._emit_event("a", "t-1", "")
+    serve_mod._emit_event("b", "t-2", "")
+    serve_mod._emit_event("c", "t-3", "")
+
+    assert serve_mod._event_counter == 3
+    ids = [e["id"] for e in serve_mod._event_queue]
+    assert ids == [1, 2, 3]
+
+
+def test_emit_event_ordering_preserved_under_concurrency():
+    """Insertion order in the deque must be strictly monotonic.
+
+    Counter increment + queue append are inside the same critical section,
+    so the queue's recorded order matches the assigned id order.
+    """
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    n_threads = 4
+    n_per_thread = 50
+    barrier = threading.Barrier(n_threads)
+
+    def emit_burst() -> None:
+        barrier.wait()
+        for i in range(n_per_thread):
+            serve_mod._emit_event("burst", f"task-{i}", "d")
+
+    threads = [threading.Thread(target=emit_burst) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    ids = [e["id"] for e in serve_mod._event_queue]
+    assert len(set(ids)) == len(ids)
+    assert ids == sorted(ids), "deque insertion order does not match id order"

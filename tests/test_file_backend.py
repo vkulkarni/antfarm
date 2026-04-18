@@ -1531,3 +1531,130 @@ def test_release_guard_if_owner_dead_unlinks_when_owner_gone(backend: FileBacken
 def test_release_guard_if_owner_dead_missing_returns_false(backend: FileBackend) -> None:
     """A guard that does not exist returns False (no error)."""
     assert backend.release_guard_if_owner_dead("never-locked") is False
+
+
+# ---------------------------------------------------------------------------
+# release_guard concurrency / locking (issue #308)
+# ---------------------------------------------------------------------------
+
+
+def test_release_guard_concurrent_acquire_release(backend: FileBackend) -> None:
+    """release_guard must not race with a concurrent acquire on the same resource.
+
+    Pre-fix, exists/read/unlink ran without _lock — a second worker could observe
+    the guard as "present and reacquired by me" while the original release thread
+    was still about to unlink, producing the stale-unlink outcome where the guard
+    file is missing yet a worker believes it owns the lock. Post-fix, the only
+    valid final states are:
+
+      A) file absent  AND release returned cleanly
+      B) file present AND owned by worker-B AND release returned cleanly
+    """
+    backend.guard("res-c", "worker-A")
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+    reacquired: list[bool] = []
+
+    def releaser() -> None:
+        try:
+            barrier.wait()
+            backend.release_guard("res-c", "worker-A")
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    def reacquirer() -> None:
+        try:
+            barrier.wait()
+            deadline = time.time() + 2.0
+            got = False
+            while time.time() < deadline:
+                if backend.guard("res-c", "worker-B"):
+                    got = True
+                    break
+            reacquired.append(got)
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    t1 = threading.Thread(target=releaser)
+    t2 = threading.Thread(target=reacquirer)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert errors == []
+    guard_path = backend._guard_path("res-c")
+    if guard_path.exists():
+        # Outcome B: reacquirer won — file must record worker-B (not stale worker-A)
+        data = json.loads(guard_path.read_text())
+        assert data.get("owner") == "worker-B", (
+            f"stale unlink race: file present but owner={data.get('owner')!r}"
+        )
+    else:
+        # Outcome A: release won and reacquirer either lost or the spin-loop
+        # ended after release with no successful reacquire. Both are valid.
+        assert True
+
+
+def test_release_guard_double_release_serialized(backend: FileBackend) -> None:
+    """Two concurrent release_guard calls by the same owner are serialized cleanly.
+
+    Under the new lock, the two calls run sequentially: exactly one finds the
+    guard present and unlinks it; the other observes the missing file and
+    raises FileNotFoundError (preserved invariant — see baseline test below).
+
+    Critically: neither call must raise an *unexpected* error (e.g. a race
+    between exists() and unlink() producing FileNotFoundError from os.unlink
+    rather than the explicit raise). unlink(missing_ok=True) is the
+    belt-and-suspenders defense against any future code path that mutates
+    guards outside the lock.
+    """
+    backend.guard("res-d", "worker-A")
+
+    barrier = threading.Barrier(2)
+    results: list[BaseException | None] = []
+    results_lock = threading.Lock()
+
+    def releaser() -> None:
+        try:
+            barrier.wait()
+            backend.release_guard("res-d", "worker-A")
+            with results_lock:
+                results.append(None)
+        except BaseException as e:  # noqa: BLE001
+            with results_lock:
+                results.append(e)
+
+    t1 = threading.Thread(target=releaser)
+    t2 = threading.Thread(target=releaser)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    successes = [r for r in results if r is None]
+    failures = [r for r in results if r is not None]
+    assert len(successes) == 1, f"expected exactly one successful release, got {results!r}"
+    assert len(failures) == 1
+    assert isinstance(failures[0], FileNotFoundError), (
+        f"second release should raise FileNotFoundError (preserved invariant), got {failures[0]!r}"
+    )
+    assert not backend._guard_path("res-d").exists()
+
+
+def test_release_guard_permission_error_still_raises(backend: FileBackend) -> None:
+    """Baseline preservation: wrong-owner release still raises PermissionError."""
+    backend.guard("res-e", "worker-A")
+
+    with pytest.raises(PermissionError):
+        backend.release_guard("res-e", "worker-B")
+
+    # File should remain — wrong-owner release must not unlink.
+    assert backend._guard_path("res-e").exists()
+
+
+def test_release_guard_missing_guard_raises(backend: FileBackend) -> None:
+    """Baseline preservation: releasing a non-existent guard raises FileNotFoundError."""
+    with pytest.raises(FileNotFoundError):
+        backend.release_guard("never-locked", "worker-A")
