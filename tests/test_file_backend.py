@@ -1511,6 +1511,92 @@ def test_recover_stale_task_succeeds_when_worker_dead(backend: FileBackend) -> N
     assert any("recovered by doctor" in t["message"] for t in data.get("trail", []))
 
 
+def test_recover_stale_task_moves_to_blocked_after_max_attempts(
+    backend: FileBackend,
+) -> None:
+    """Repeated stale-recovery cycles must eventually route to blocked/ (issue #333)."""
+    backend.carry(_make_task("task-1"))
+
+    # Cycle 1: worker claims, dies, doctor recovers → ready/
+    backend.register_worker(_make_worker("w1"))
+    pulled = backend.pull("w1")
+    assert pulled is not None
+    attempt_id_1 = pulled["current_attempt"]
+    backend.deregister_worker("w1")
+    assert backend.recover_stale_task_if_worker_dead("task-1", attempt_id_1, max_attempts=3) is True
+    assert backend._ready_path("task-1").exists()
+
+    # Cycle 2: same pattern — still under max (2 finished < 3)
+    backend.register_worker(_make_worker("w2"))
+    pulled = backend.pull("w2")
+    assert pulled is not None
+    attempt_id_2 = pulled["current_attempt"]
+    backend.deregister_worker("w2")
+    assert backend.recover_stale_task_if_worker_dead("task-1", attempt_id_2, max_attempts=3) is True
+    assert backend._ready_path("task-1").exists()
+    assert not backend._blocked_path("task-1").exists()
+
+    # Cycle 3: 3rd supersede → finished=3 >= max=3 → blocked/
+    backend.register_worker(_make_worker("w3"))
+    pulled = backend.pull("w3")
+    assert pulled is not None
+    attempt_id_3 = pulled["current_attempt"]
+    backend.deregister_worker("w3")
+    assert backend.recover_stale_task_if_worker_dead("task-1", attempt_id_3, max_attempts=3) is True
+
+    assert not backend._active_path("task-1").exists()
+    assert not backend._ready_path("task-1").exists()
+    assert backend._blocked_path("task-1").exists()
+
+    data = json.loads(backend._blocked_path("task-1").read_text())
+    assert data["status"] == TaskStatus.BLOCKED.value
+    assert data["current_attempt"] is None
+    assert any(
+        "moved to blocked" in t["message"] and "max=3" in t["message"]
+        for t in data.get("trail", [])
+    )
+
+
+def test_recover_stale_task_respects_per_task_max_attempts(backend: FileBackend) -> None:
+    """Per-task ``max_attempts`` field overrides the function parameter (issue #333)."""
+    task = _make_task("task-1")
+    task["max_attempts"] = 5
+    backend.carry(task)
+
+    # 4 stale-recovery cycles: still ready (4 < 5)
+    for i in range(4):
+        worker = f"w{i}"
+        backend.register_worker(_make_worker(worker))
+        pulled = backend.pull(worker)
+        assert pulled is not None
+        attempt = pulled["current_attempt"]
+        backend.deregister_worker(worker)
+        assert (
+            backend.recover_stale_task_if_worker_dead(
+                "task-1",
+                attempt,
+                max_attempts=3,  # intentionally lower than per-task 5
+            )
+            is True
+        )
+        assert backend._ready_path("task-1").exists()
+        assert not backend._blocked_path("task-1").exists()
+
+    # 5th cycle: 5 finished >= per-task max=5 → blocked/
+    backend.register_worker(_make_worker("w-final"))
+    pulled = backend.pull("w-final")
+    assert pulled is not None
+    attempt_final = pulled["current_attempt"]
+    backend.deregister_worker("w-final")
+    assert (
+        backend.recover_stale_task_if_worker_dead("task-1", attempt_final, max_attempts=3) is True
+    )
+    assert backend._blocked_path("task-1").exists()
+
+    data = json.loads(backend._blocked_path("task-1").read_text())
+    assert any("max=5" in t["message"] for t in data.get("trail", []))
+
+
 def test_release_guard_if_owner_dead_skips_when_owner_alive(backend: FileBackend) -> None:
     """A live owner's guard must not be released — returns False."""
     backend.register_worker(_make_worker("w1"))
@@ -1774,12 +1860,8 @@ def test_heartbeat_serialized_with_updates(tmp_path: Path) -> None:
     backend = FileBackend(root=tmp_path / ".antfarm", guard_ttl=5)
     backend.register_worker(_make_worker("worker-1"))
 
-    t1 = threading.Thread(
-        target=backend.heartbeat, args=("worker-1", {"status": "active"})
-    )
-    t2 = threading.Thread(
-        target=backend.update_worker_activity, args=("worker-1", "tool:bash")
-    )
+    t1 = threading.Thread(target=backend.heartbeat, args=("worker-1", {"status": "active"}))
+    t2 = threading.Thread(target=backend.update_worker_activity, args=("worker-1", "tool:bash"))
     t1.start()
     t2.start()
     t1.join()

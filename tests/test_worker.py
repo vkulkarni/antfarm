@@ -229,7 +229,6 @@ def test_exit_deregisters_on_empty_queue(tc, backend):
     # Create a fresh runtime and run against empty queue
     import httpx
 
-
     transport = _StarletteTransport(tc.app)
     client = httpx.Client(transport=transport, base_url="http://test")
     rt = WorkerRuntime(
@@ -510,8 +509,12 @@ def test_build_failure_record():
     from antfarm.core.worker import build_failure_record
 
     rec = build_failure_record(
-        task_id="t1", attempt_id="a1", worker_id="w1",
-        returncode=1, stderr="connection refused", stdout="",
+        task_id="t1",
+        attempt_id="a1",
+        worker_id="w1",
+        returncode=1,
+        stderr="connection refused",
+        stdout="",
     )
     assert rec.failure_type == FailureType.INFRA_FAILURE
     assert rec.retryable is True
@@ -716,9 +719,7 @@ def test_build_artifact_collects_stats(tmp_path, http_client):
         return ""
 
     with patch.object(WorkerRuntime, "_git", side_effect=fake_git):
-        artifact = rt._build_artifact(
-            {"id": "t1"}, "att-001", str(tmp_path), "feat/t1-att-001"
-        )
+        artifact = rt._build_artifact({"id": "t1"}, "att-001", str(tmp_path), "feat/t1-att-001")
 
     assert artifact["lines_added"] == 7
     assert artifact["lines_removed"] == 3
@@ -746,9 +747,7 @@ def test_build_artifact_handles_git_failure(tmp_path, http_client):
         raise subprocess.CalledProcessError(1, ["git", *args])
 
     with patch.object(WorkerRuntime, "_git", side_effect=failing_git):
-        artifact = rt._build_artifact(
-            {"id": "t1"}, "att-001", str(tmp_path), "feat/t1-att-001"
-        )
+        artifact = rt._build_artifact({"id": "t1"}, "att-001", str(tmp_path), "feat/t1-att-001")
 
     assert artifact["diff_stat"] == ""
     assert artifact["lines_added"] == 0
@@ -764,12 +763,15 @@ def test_build_artifact_handles_git_failure(tmp_path, http_client):
 
 def _carry_plan(tc, task_id="plan-test", title="Plan Test", spec="decompose this"):
     """Carry a plan task with capabilities_required=["plan"]."""
-    r = tc.post("/tasks", json={
-        "id": task_id,
-        "title": title,
-        "spec": spec,
-        "capabilities_required": ["plan"],
-    })
+    r = tc.post(
+        "/tasks",
+        json={
+            "id": task_id,
+            "title": title,
+            "spec": spec,
+            "capabilities_required": ["plan"],
+        },
+    )
     assert r.status_code == 201
     return r.json()
 
@@ -802,10 +804,18 @@ def test_planner_mode_detects_plan_task(tc, tmp_path, http_client):
     _carry_plan(tc)
     rt = _make_planner_runtime(tmp_path, http_client)
 
-    plan_json = _json.dumps([
-        {"title": "Task A", "spec": "do A", "touches": ["api"],
-         "depends_on": [], "priority": 5, "complexity": "S"},
-    ])
+    plan_json = _json.dumps(
+        [
+            {
+                "title": "Task A",
+                "spec": "do A",
+                "touches": ["api"],
+                "depends_on": [],
+                "priority": 5,
+                "complexity": "S",
+            },
+        ]
+    )
 
     def plan_agent(task, workspace) -> AgentResult:
         return AgentResult(
@@ -835,16 +845,29 @@ def test_planner_creates_deterministic_child_ids(tc, tmp_path, http_client):
     _carry_plan(tc, task_id="plan-auth-system")
     rt = _make_planner_runtime(tmp_path, http_client)
 
-    plan_json = _json.dumps([
-        {"title": "Add middleware", "spec": "do middleware", "touches": ["api"],
-         "depends_on": [], "priority": 5, "complexity": "M"},
-        {"title": "Add routes", "spec": "do routes", "touches": ["api"],
-         "depends_on": [1], "priority": 10, "complexity": "M"},
-    ])
+    plan_json = _json.dumps(
+        [
+            {
+                "title": "Add middleware",
+                "spec": "do middleware",
+                "touches": ["api"],
+                "depends_on": [],
+                "priority": 5,
+                "complexity": "M",
+            },
+            {
+                "title": "Add routes",
+                "spec": "do routes",
+                "touches": ["api"],
+                "depends_on": [1],
+                "priority": 10,
+                "complexity": "M",
+            },
+        ]
+    )
 
     def plan_agent(task, workspace) -> AgentResult:
-        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
-                           stderr="", branch="")
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json), stderr="", branch="")
 
     rt._launch_agent = plan_agent
     rt.run()
@@ -867,15 +890,20 @@ def test_planner_rejects_more_than_10_tasks(tc, tmp_path, http_client):
     rt = _make_planner_runtime(tmp_path, http_client)
 
     tasks = [
-        {"title": f"Task {i}", "spec": f"do {i}", "touches": [],
-         "depends_on": [], "priority": 10, "complexity": "S"}
+        {
+            "title": f"Task {i}",
+            "spec": f"do {i}",
+            "touches": [],
+            "depends_on": [],
+            "priority": 10,
+            "complexity": "S",
+        }
         for i in range(11)
     ]
     plan_json = _json.dumps(tasks)
 
     def plan_agent(task, workspace) -> AgentResult:
-        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
-                           stderr="", branch="")
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json), stderr="", branch="")
 
     rt._launch_agent = plan_agent
     rt.run()
@@ -914,14 +942,21 @@ def test_planner_children_no_recursive_plans(tc, tmp_path, http_client):
     _carry_plan(tc)
     rt = _make_planner_runtime(tmp_path, http_client)
 
-    plan_json = _json.dumps([
-        {"title": "Sub task", "spec": "do sub", "touches": [],
-         "depends_on": [], "priority": 5, "complexity": "S"},
-    ])
+    plan_json = _json.dumps(
+        [
+            {
+                "title": "Sub task",
+                "spec": "do sub",
+                "touches": [],
+                "depends_on": [],
+                "priority": 5,
+                "complexity": "S",
+            },
+        ]
+    )
 
     def plan_agent(task, workspace) -> AgentResult:
-        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
-                           stderr="", branch="")
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json), stderr="", branch="")
 
     rt._launch_agent = plan_agent
     rt.run()
@@ -936,16 +971,29 @@ def test_planner_harvest_artifact(tc, tmp_path, http_client):
     _carry_plan(tc, task_id="plan-feat")
     rt = _make_planner_runtime(tmp_path, http_client)
 
-    plan_json = _json.dumps([
-        {"title": "A", "spec": "do A", "touches": [], "depends_on": [],
-         "priority": 5, "complexity": "S"},
-        {"title": "B", "spec": "do B", "touches": [], "depends_on": [1],
-         "priority": 10, "complexity": "M"},
-    ])
+    plan_json = _json.dumps(
+        [
+            {
+                "title": "A",
+                "spec": "do A",
+                "touches": [],
+                "depends_on": [],
+                "priority": 5,
+                "complexity": "S",
+            },
+            {
+                "title": "B",
+                "spec": "do B",
+                "touches": [],
+                "depends_on": [1],
+                "priority": 10,
+                "complexity": "M",
+            },
+        ]
+    )
 
     def plan_agent(task, workspace) -> AgentResult:
-        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
-                           stderr="", branch="")
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json), stderr="", branch="")
 
     rt._launch_agent = plan_agent
     rt.run()
@@ -964,14 +1012,21 @@ def test_planner_spawned_by_lineage(tc, tmp_path, http_client):
     _carry_plan(tc, task_id="plan-lineage")
     rt = _make_planner_runtime(tmp_path, http_client)
 
-    plan_json = _json.dumps([
-        {"title": "Child", "spec": "do child", "touches": [],
-         "depends_on": [], "priority": 5, "complexity": "S"},
-    ])
+    plan_json = _json.dumps(
+        [
+            {
+                "title": "Child",
+                "spec": "do child",
+                "touches": [],
+                "depends_on": [],
+                "priority": 5,
+                "complexity": "S",
+            },
+        ]
+    )
 
     def plan_agent(task, workspace) -> AgentResult:
-        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
-                           stderr="", branch="")
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json), stderr="", branch="")
 
     rt._launch_agent = plan_agent
     rt.run()
@@ -1002,23 +1057,33 @@ def test_planner_agent_failure_no_harvest(tc, tmp_path, http_client):
 def test_planner_409_idempotent(tc, tmp_path, http_client):
     """409 on child carry (already exists) is treated as idempotent success."""
     # Pre-create a child task that will collide
-    tc.post("/tasks", json={
-        "id": "task-idem-01",
-        "title": "Pre-existing",
-        "spec": "already here",
-    })
+    tc.post(
+        "/tasks",
+        json={
+            "id": "task-idem-01",
+            "title": "Pre-existing",
+            "spec": "already here",
+        },
+    )
 
     _carry_plan(tc, task_id="plan-idem")
     rt = _make_planner_runtime(tmp_path, http_client)
 
-    plan_json = _json.dumps([
-        {"title": "Child", "spec": "do child", "touches": [],
-         "depends_on": [], "priority": 5, "complexity": "S"},
-    ])
+    plan_json = _json.dumps(
+        [
+            {
+                "title": "Child",
+                "spec": "do child",
+                "touches": [],
+                "depends_on": [],
+                "priority": 5,
+                "complexity": "S",
+            },
+        ]
+    )
 
     def plan_agent(task, workspace) -> AgentResult:
-        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json),
-                           stderr="", branch="")
+        return AgentResult(returncode=0, stdout=_plan_agent_output(plan_json), stderr="", branch="")
 
     rt._launch_agent = plan_agent
     rt.run()
@@ -1089,18 +1154,22 @@ def test_planner_prompt_includes_plan_instructions(tmp_path, http_client):
 # ---------------------------------------------------------------------------
 
 
-def _carry_mission_plan(tc, task_id="plan-mission", title="Mission Plan", spec="plan this",
-                        mission_id="mission-001"):
+def _carry_mission_plan(
+    tc, task_id="plan-mission", title="Mission Plan", spec="plan this", mission_id="mission-001"
+):
     """Carry a plan task with mission_id set."""
     # First create the mission so link_task_to_mission works
     tc.post("/missions", json={"mission_id": mission_id, "spec": "test mission"})
-    r = tc.post("/tasks", json={
-        "id": task_id,
-        "title": title,
-        "spec": spec,
-        "capabilities_required": ["plan"],
-        "mission_id": mission_id,
-    })
+    r = tc.post(
+        "/tasks",
+        json={
+            "id": task_id,
+            "title": title,
+            "spec": spec,
+            "capabilities_required": ["plan"],
+            "mission_id": mission_id,
+        },
+    )
     assert r.status_code == 201
     return r.json()
 
@@ -1110,12 +1179,26 @@ def test_planner_mission_mode_stores_artifact(tc, tmp_path, http_client):
     _carry_mission_plan(tc, task_id="plan-m-001", mission_id="mission-art")
     rt = _make_planner_runtime(tmp_path, http_client)
 
-    plan_json = _json.dumps([
-        {"title": "Task A", "spec": "do A", "touches": ["api"],
-         "depends_on": [], "priority": 5, "complexity": "S"},
-        {"title": "Task B", "spec": "do B", "touches": ["db"],
-         "depends_on": [1], "priority": 10, "complexity": "M"},
-    ])
+    plan_json = _json.dumps(
+        [
+            {
+                "title": "Task A",
+                "spec": "do A",
+                "touches": ["api"],
+                "depends_on": [],
+                "priority": 5,
+                "complexity": "S",
+            },
+            {
+                "title": "Task B",
+                "spec": "do B",
+                "touches": ["db"],
+                "depends_on": [1],
+                "priority": 10,
+                "complexity": "M",
+            },
+        ]
+    )
 
     def plan_agent(task, workspace) -> AgentResult:
         return AgentResult(
@@ -1162,10 +1245,18 @@ def test_planner_legacy_mode_carries_children(tc, tmp_path, http_client):
     _carry_plan(tc, task_id="plan-legacy")
     rt = _make_planner_runtime(tmp_path, http_client)
 
-    plan_json = _json.dumps([
-        {"title": "Legacy Child", "spec": "do legacy", "touches": ["api"],
-         "depends_on": [], "priority": 5, "complexity": "S"},
-    ])
+    plan_json = _json.dumps(
+        [
+            {
+                "title": "Legacy Child",
+                "spec": "do legacy",
+                "touches": ["api"],
+                "depends_on": [],
+                "priority": 5,
+                "complexity": "S",
+            },
+        ]
+    )
 
     def plan_agent(task, workspace) -> AgentResult:
         return AgentResult(
@@ -1364,8 +1455,12 @@ def test_build_failure_record_silent():
     from antfarm.core.worker import build_failure_record, get_retry_policy
 
     rec = build_failure_record(
-        task_id="t1", attempt_id="a1", worker_id="w1",
-        returncode=0, stderr="", stdout="",
+        task_id="t1",
+        attempt_id="a1",
+        worker_id="w1",
+        returncode=0,
+        stderr="",
+        stdout="",
     )
     assert rec.failure_type == FailureType.SILENT_FAILURE
     assert rec.retryable is False
@@ -1404,10 +1499,9 @@ def test_process_one_task_silent_failure_trails_warning(tc, runtime):
     messages = [e["message"] for e in task["trail"]]
 
     # Human-readable warning present
-    assert any(
-        "silent_failure" in m or "empty stdout" in m
-        for m in messages
-    ), f"expected silent_failure trail entry, got: {messages}"
+    assert any("silent_failure" in m or "empty stdout" in m for m in messages), (
+        f"expected silent_failure trail entry, got: {messages}"
+    )
     # Structured FAILURE_RECORD emitted
     assert any("[FAILURE_RECORD]" in m for m in messages)
     # Harvest was NOT called — silent failure takes the failure branch
@@ -1503,7 +1597,8 @@ def test_process_one_task_emits_events_in_order(tc, runtime):
     runtime.run()
 
     lifecycle_types = [
-        e["type"] for e in _worker_events()
+        e["type"]
+        for e in _worker_events()
         if e["type"] in {"task_claimed", "workspace_created", "agent_launched"}
     ]
     assert lifecycle_types == ["task_claimed", "workspace_created", "agent_launched"]
@@ -1785,10 +1880,15 @@ def test_worker_passes_unmerged_dep_branch_to_workspace(tc, runtime):
     assert dep_branch, "dep attempt should have a branch after harvest"
 
     # Carry the child that depends on it
-    r = tc.post("/tasks", json={
-        "id": "task-child", "title": "Child", "spec": "c",
-        "depends_on": ["task-dep"],
-    })
+    r = tc.post(
+        "/tasks",
+        json={
+            "id": "task-child",
+            "title": "Child",
+            "spec": "c",
+            "depends_on": ["task-dep"],
+        },
+    )
     assert r.status_code == 201
 
     # Now forage the child — WorkspaceManager.create should be called with
@@ -1819,10 +1919,15 @@ def test_worker_skips_merged_deps(tc, runtime):
     assert r.status_code in (200, 201, 204)
 
     # Carry child
-    r = tc.post("/tasks", json={
-        "id": "task-child-merged", "title": "Child", "spec": "c",
-        "depends_on": ["task-dep-merged"],
-    })
+    r = tc.post(
+        "/tasks",
+        json={
+            "id": "task-child-merged",
+            "title": "Child",
+            "spec": "c",
+            "depends_on": ["task-dep-merged"],
+        },
+    )
     assert r.status_code == 201
 
     runtime.workspace_mgr.create.reset_mock()
@@ -2036,3 +2141,82 @@ def test_process_one_task_handles_timeout(tc, runtime):
     trail_msgs = [entry["message"] for entry in detail.get("trail", [])]
     assert any("[agent_timeout]" in m for m in trail_msgs)
     assert any("[FAILURE_RECORD]" in m for m in trail_msgs)
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat lifecycle (issue #333)
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_starts_once_per_run_not_per_task(tc, runtime):
+    """_start_heartbeat_loop is called exactly once per run() (not per task).
+
+    Before the #333 fix, the heartbeat was started/stopped around each
+    _launch_agent call, so two tasks meant two starts. After the fix,
+    the heartbeat spans the whole run() and fires exactly once.
+    """
+    _carry(tc, task_id="task-hb-001", title="hb-1", spec="x")
+    _carry(tc, task_id="task-hb-002", title="hb-2", spec="y")
+
+    start_calls = 0
+    stop_calls = 0
+    real_start = runtime._start_heartbeat_loop
+    real_stop = runtime._stop_heartbeat_loop
+
+    def counting_start():
+        nonlocal start_calls
+        start_calls += 1
+        real_start()
+
+    def counting_stop():
+        nonlocal stop_calls
+        stop_calls += 1
+        real_stop()
+
+    runtime._start_heartbeat_loop = counting_start
+    runtime._stop_heartbeat_loop = counting_stop
+    runtime._launch_agent = _good_agent
+    runtime.run()
+
+    # Two tasks processed, but heartbeat lifecycle fires exactly once.
+    assert start_calls == 1, f"expected 1 start, got {start_calls}"
+    assert stop_calls == 1, f"expected 1 stop, got {stop_calls}"
+
+
+def test_heartbeat_running_during_full_run_lifetime(tc, runtime, monkeypatch):
+    """Heartbeat thread is alive across workspace creation AND agent run.
+
+    Before the #333 fix, heartbeat started only after workspace creation.
+    A slow git fetch outside the window would let doctor reap the worker.
+    This test asserts the thread is alive at both points.
+    """
+    _carry(tc, task_id="task-hb-live", title="live", spec="x")
+
+    # Make workspace creation observably take some "time" and assert the
+    # heartbeat thread is alive at that point.
+    alive_at_workspace = []
+    alive_at_agent = []
+
+    real_create = runtime.workspace_mgr.create
+
+    def observing_create(*args, **kwargs):
+        alive_at_workspace.append(
+            runtime._heartbeat_thread is not None and runtime._heartbeat_thread.is_alive()
+        )
+        return real_create(*args, **kwargs)
+
+    runtime.workspace_mgr.create = observing_create
+
+    def observing_agent(task, workspace):
+        alive_at_agent.append(
+            runtime._heartbeat_thread is not None and runtime._heartbeat_thread.is_alive()
+        )
+        return _good_agent(task, workspace)
+
+    runtime._launch_agent = observing_agent
+    runtime.run()
+
+    assert alive_at_workspace == [True], "heartbeat thread must be alive during workspace creation"
+    assert alive_at_agent == [True], "heartbeat thread must be alive during agent run"
+    # After run() exits, the thread is stopped.
+    assert runtime._heartbeat_thread is None

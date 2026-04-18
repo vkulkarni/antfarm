@@ -589,7 +589,9 @@ class GitHubBackend(TaskBackend):
 
         self._close_superseded_pr(superseded_attempt, reason)
 
-    def recover_stale_task_if_worker_dead(self, task_id: str, current_attempt_id: str) -> bool:
+    def recover_stale_task_if_worker_dead(
+        self, task_id: str, current_attempt_id: str, max_attempts: int = 3
+    ) -> bool:
         """Not supported on GitHubBackend — logs a warning and returns False.
 
         Task recovery requires a file-based state machine. GitHub Issues
@@ -598,11 +600,12 @@ class GitHubBackend(TaskBackend):
         ``check_stale_tasks`` only inspects FileBackend directories. This
         method exists to satisfy the ABC; operators running a GitHub-backed
         colony should rely on manual intervention or a parallel FileBackend
-        for task recovery.
+        for task recovery. ``max_attempts`` is accepted for signature parity
+        but ignored.
         """
         import logging
 
-        del task_id, current_attempt_id  # unused — no-op implementation
+        del task_id, current_attempt_id, max_attempts  # no-op implementation
         logging.getLogger(__name__).warning(
             "recover_stale_task_if_worker_dead is not supported for GitHubBackend; "
             "task recovery is a filesystem-only operation in v0.1."

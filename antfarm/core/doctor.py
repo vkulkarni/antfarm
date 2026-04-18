@@ -446,6 +446,10 @@ def check_stale_tasks(backend, config: dict, fix: bool = False) -> list[Finding]
     data_dir = Path(config["data_dir"])
     active_dir = data_dir / "tasks" / "active"
     workers_dir = data_dir / "workers"
+    # Plumb max_attempts through so stale-recovery honors the same attempt
+    # budget as kickback(). Without this, a flapping worker loops through
+    # active→ready without the blocked/ routing kicking in (issue #333).
+    max_attempts = config.get("max_attempts", 3)
 
     if not active_dir.exists():
         return findings
@@ -493,7 +497,9 @@ def check_stale_tasks(backend, config: dict, fix: bool = False) -> list[Finding]
                 # attempt rotated between this check and the mutation, the
                 # backend returns False and we leave the finding as unfixed
                 # (issue #310).
-                if backend.recover_stale_task_if_worker_dead(task_id, current_attempt_id):
+                if backend.recover_stale_task_if_worker_dead(
+                    task_id, current_attempt_id, max_attempts=max_attempts
+                ):
                     f.fixed = True
                     _emit_event(
                         "stale_task_recovered",

@@ -1738,10 +1738,10 @@ def test_check_stale_tasks_fix_respects_late_heartbeat(setup, monkeypatch):
 
     real = backend.recover_stale_task_if_worker_dead
 
-    def wrapped(task_id: str, attempt_id: str) -> bool:
+    def wrapped(task_id: str, attempt_id: str, max_attempts: int = 3) -> bool:
         # Simulate the worker reviving between detection and mutation.
         backend.register_worker(_make_worker("worker-late"))
-        return real(task_id, attempt_id)
+        return real(task_id, attempt_id, max_attempts=max_attempts)
 
     monkeypatch.setattr(backend, "recover_stale_task_if_worker_dead", wrapped)
 
@@ -1777,3 +1777,42 @@ def test_check_stale_guards_fix_respects_owner_revival(setup, monkeypatch):
     assert stale[0].fixed is False
     assert "recovered" in stale[0].message
     assert guard_file.exists()
+
+
+def test_check_stale_tasks_fix_respects_max_attempts(setup):
+    """After max_attempts stale recoveries, doctor --fix routes task to blocked/ (issue #333).
+
+    This is the integration-level proof that doctor passes max_attempts through
+    to recover_stale_task_if_worker_dead so a flapping worker cannot bypass the
+    blocked/ routing that kickback() enforces.
+    """
+    backend, config = setup
+    config["max_attempts"] = 2  # smaller budget to keep the test compact
+
+    backend.carry(_make_task("task-runaway"))
+
+    # Cycle 1: worker claims, dies, doctor --fix recovers → ready/
+    backend.register_worker(_make_worker("w1"))
+    backend.pull("w1")
+    backend.deregister_worker("w1")
+    run_doctor(backend, config, fix=True)
+    assert (Path(config["data_dir"]) / "tasks" / "ready" / "task-runaway.json").exists()
+
+    # Cycle 2: same pattern. finished attempts now = 2, which hits max_attempts=2.
+    backend.register_worker(_make_worker("w2"))
+    backend.pull("w2")
+    backend.deregister_worker("w2")
+    findings = run_doctor(backend, config, fix=True)
+
+    stale = [f for f in findings if f.check == "stale_task"]
+    assert len(stale) == 1
+    assert stale[0].fixed is True
+
+    blocked_path = Path(config["data_dir"]) / "tasks" / "blocked" / "task-runaway.json"
+    ready_path = Path(config["data_dir"]) / "tasks" / "ready" / "task-runaway.json"
+    assert blocked_path.exists()
+    assert not ready_path.exists()
+
+    data = json.loads(blocked_path.read_text())
+    assert data["status"] == "blocked"
+    assert any("moved to blocked" in t["message"] for t in data.get("trail", []))

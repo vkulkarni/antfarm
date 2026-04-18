@@ -82,8 +82,12 @@ def classify_failure(returncode: int, stderr: str, stdout: str) -> FailureType:
 
     # 2. Infrastructure (clear external failures)
     infra_markers = [
-        "permission denied", "disk full", "connection refused",
-        "network unreachable", "enospc", "eacces",
+        "permission denied",
+        "disk full",
+        "connection refused",
+        "network unreachable",
+        "enospc",
+        "eacces",
     ]
     if any(m in combined for m in infra_markers):
         return FailureType.INFRA_FAILURE
@@ -95,8 +99,11 @@ def classify_failure(returncode: int, stderr: str, stdout: str) -> FailureType:
 
     # 4. Build (check before test — "pip install failed" is build, not test)
     build_markers = [
-        "build failed", "compilation error", "pip install",
-        "modulenotfounderror", "importerror",
+        "build failed",
+        "compilation error",
+        "pip install",
+        "modulenotfounderror",
+        "importerror",
     ]
     if any(m in combined for m in build_markers):
         return FailureType.BUILD_FAILURE
@@ -265,13 +272,9 @@ class WorkerRuntime:
         token: str | None = None,
     ):
         if poll_interval <= 0:
-            raise ValueError(
-                f"poll_interval must be > 0, got {poll_interval}"
-            )
+            raise ValueError(f"poll_interval must be > 0, got {poll_interval}")
         if agent_timeout <= 0:
-            raise ValueError(
-                f"agent_timeout must be > 0, got {agent_timeout}"
-            )
+            raise ValueError(f"agent_timeout must be > 0, got {agent_timeout}")
         self.worker_id = f"{node_id}/{name}"
         self.node_id = node_id
         self.agent_type = agent_type
@@ -301,9 +304,7 @@ class WorkerRuntime:
             role_max_idle_polls = 5  # 5 * 30s = 2.5min
 
         # Explicit CLI override wins over role default; None preserves it (#272).
-        self._max_idle_polls = (
-            role_max_idle_polls if max_empty_polls is None else max_empty_polls
-        )
+        self._max_idle_polls = role_max_idle_polls if max_empty_polls is None else max_empty_polls
 
         self.colony = ColonyClient(colony_url, client=client, token=token)
         self.workspace_mgr = WorkspaceManager(workspace_root, repo_path, integration_branch)
@@ -334,6 +335,13 @@ class WorkerRuntime:
         )
         logger.info("worker registered worker_id=%s", self.worker_id)
 
+        # Heartbeat spans the entire run() lifetime, not just the agent
+        # subprocess window. Previously it was started/stopped per-task
+        # around _launch_agent, leaving slow git fetches, harvest POSTs, and
+        # colony contention outside the coverage window — doctor could reap
+        # a still-alive worker (issue #333, M2 task-06 runaway).
+        self._start_heartbeat_loop()
+
         try:
             idle_polls = 0
             max_idle_polls = self._max_idle_polls  # 0 = exit immediately, >0 = poll
@@ -344,12 +352,22 @@ class WorkerRuntime:
                         logger.info("queue empty, worker exiting worker_id=%s", self.worker_id)
                         break
                     idle_polls += 1
-                    logger.debug("queue empty, polling (%d/%d) worker_id=%s role=%s",
-                                 idle_polls, max_idle_polls, self.worker_id, self._role)
+                    logger.debug(
+                        "queue empty, polling (%d/%d) worker_id=%s role=%s",
+                        idle_polls,
+                        max_idle_polls,
+                        self.worker_id,
+                        self._role,
+                    )
                     time.sleep(self.poll_interval)
                 else:
                     idle_polls = 0  # reset on successful forage
         finally:
+            # Stop the heartbeat before deregistering so no stray POST arrives
+            # after the worker record is gone. Guarded: if _start failed or
+            # was never reached, _stop is still a safe no-op.
+            with contextlib.suppress(Exception):
+                self._stop_heartbeat_loop()
             if self._last_task_id:
                 with contextlib.suppress(Exception):
                     self.colony.trail(
@@ -383,33 +401,23 @@ class WorkerRuntime:
         _emit("task_claimed", task_id, task.get("title", ""))
 
         with contextlib.suppress(Exception):
-            self.colony.trail(
-                task_id, self.worker_id, "task claimed, creating workspace"
-            )
+            self.colony.trail(task_id, self.worker_id, "task claimed, creating workspace")
 
         dep_branches = self._resolve_dep_branches(task)
-        workspace = self.workspace_mgr.create(
-            task_id, attempt_id, dep_branches=dep_branches
-        )
+        workspace = self.workspace_mgr.create(task_id, attempt_id, dep_branches=dep_branches)
         logger.info("workspace created path=%s", workspace)
         _emit("workspace_created", task_id, workspace)
 
         with contextlib.suppress(Exception):
-            self.colony.trail(
-                task_id, self.worker_id, "workspace ready, launching agent"
-            )
+            self.colony.trail(task_id, self.worker_id, "workspace ready, launching agent")
 
-        self._start_heartbeat_loop()
-        try:
-            _emit("agent_launched", task_id, self.agent_type)
-            result = self._launch_agent(task, workspace)
-        finally:
-            self._stop_heartbeat_loop()
+        # Heartbeat thread is managed by run() (issue #333) — coverage now
+        # spans the whole worker lifetime, not just the agent subprocess.
+        _emit("agent_launched", task_id, self.agent_type)
+        result = self._launch_agent(task, workspace)
 
         is_silent = (
-            result.returncode == 0
-            and not result.stdout.strip()
-            and not result.stderr.strip()
+            result.returncode == 0 and not result.stdout.strip() and not result.stderr.strip()
         )
 
         if result.returncode != 0 or is_silent:
@@ -454,8 +462,7 @@ class WorkerRuntime:
             self.colony.trail(
                 task_id,
                 self.worker_id,
-                f"[{failure.failure_type.value}] {failure.message}: "
-                f"{result.stderr[:200]}",
+                f"[{failure.failure_type.value}] {failure.message}: {result.stderr[:200]}",
             )
             # Persist structured failure record in trail for downstream consumers
             self.colony.trail(
@@ -466,17 +473,13 @@ class WorkerRuntime:
             return True
 
         with contextlib.suppress(Exception):
-            self.colony.trail(
-                task_id, self.worker_id, "agent completed, building artifact"
-            )
+            self.colony.trail(task_id, self.worker_id, "agent completed, building artifact")
 
         # Plan task: parse output, validate, carry children, harvest with plan artifact
         caps_req = set(task.get("capabilities_required", []))
         is_plan = "plan" in caps_req
         if is_plan:
-            plan_result = self._process_plan_output(
-                task, attempt_id, result.stdout + result.stderr
-            )
+            plan_result = self._process_plan_output(task, attempt_id, result.stdout + result.stderr)
             if plan_result:
                 is_mission_mode = plan_result.get("mission_mode", False)
                 if is_mission_mode:
@@ -499,30 +502,36 @@ class WorkerRuntime:
                         "warnings": plan_result["warnings"],
                         "dependency_summary": plan_result["dep_summary"],
                     }
-                    trail_msg = (
-                        f"plan complete: created {len(plan_result['created_ids'])} tasks"
-                    )
+                    trail_msg = f"plan complete: created {len(plan_result['created_ids'])} tasks"
                 try:
                     self.colony.mark_harvest_pending(task_id, attempt_id)
                 except Exception as exc:
                     logger.warning(
                         "mark_harvest_pending failed task_id=%s attempt_id=%s: %s",
-                        task_id, attempt_id, exc,
+                        task_id,
+                        attempt_id,
+                        exc,
                     )
                 try:
                     self.colony.harvest(
-                        task_id, attempt_id, pr="", branch="",
+                        task_id,
+                        attempt_id,
+                        pr="",
+                        branch="",
                         artifact=artifact,
                     )
                     logger.info("plan harvested task_id=%s", task_id)
                 except Exception as exc:
                     logger.error(
                         "plan harvest FAILED task_id=%s attempt_id=%s: %s",
-                        task_id, attempt_id, exc,
+                        task_id,
+                        attempt_id,
+                        exc,
                     )
                     with contextlib.suppress(Exception):
                         self.colony.trail(
-                            task_id, self.worker_id,
+                            task_id,
+                            self.worker_id,
                             f"plan harvest failed: {exc}",
                         )
                 with contextlib.suppress(Exception):
@@ -532,7 +541,8 @@ class WorkerRuntime:
             # Plan parsing failed — trail the error
             with contextlib.suppress(Exception):
                 self.colony.trail(
-                    task_id, self.worker_id,
+                    task_id,
+                    self.worker_id,
                     "plan failed: could not parse agent output into tasks",
                 )
             return True
@@ -566,10 +576,9 @@ class WorkerRuntime:
             )
 
         # For review tasks: parse verdict from output and store on original task
-        is_review_task = (
-            "review" in set(task.get("capabilities_required", []))
-            or task_id.startswith("review-")
-        )
+        is_review_task = "review" in set(
+            task.get("capabilities_required", [])
+        ) or task_id.startswith("review-")
         if is_review_task and result.returncode == 0:
             original_task_id = task_id.removeprefix("review-")
             verdict = _parse_review_verdict(result.stdout + result.stderr)
@@ -601,9 +610,7 @@ class WorkerRuntime:
                 # max_attempts — once exhausted, the review task moves to
                 # blocked and Soldier.run_once_with_review kicks back the
                 # *original* task with a clear reason.
-                logger.warning(
-                    "reviewer produced no verdict for %s", original_task_id
-                )
+                logger.warning("reviewer produced no verdict for %s", original_task_id)
                 with contextlib.suppress(Exception):
                     self.colony.trail(
                         task_id,
@@ -662,9 +669,7 @@ class WorkerRuntime:
             try:
                 dep = self.colony.get_task(dep_id)
             except Exception as exc:
-                logger.warning(
-                    "dep lookup failed dep_id=%s error=%s — skipping", dep_id, exc
-                )
+                logger.warning("dep lookup failed dep_id=%s error=%s — skipping", dep_id, exc)
                 continue
             if not dep or dep.get("status") != "done":
                 continue
@@ -702,7 +707,9 @@ class WorkerRuntime:
         # Find adapter agents relative to the antfarm package
         adapter_dir = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
-            "adapters", "claude_code", "agents",
+            "adapters",
+            "claude_code",
+            "agents",
         )
         if not os.path.isdir(adapter_dir):
             return
@@ -732,9 +739,7 @@ class WorkerRuntime:
             )
         return proc.stdout.strip()
 
-    def _build_artifact(
-        self, task: dict, attempt_id: str, workspace: str, branch: str
-    ) -> dict:
+    def _build_artifact(self, task: dict, attempt_id: str, workspace: str, branch: str) -> dict:
         """Collect git diff stats and commit metadata for the harvest payload."""
         artifact: dict = {}
         try:
@@ -777,10 +782,15 @@ class WorkerRuntime:
         try:
             proc = subprocess.run(
                 [
-                    "gh", "pr", "create",
-                    "--title", title,
-                    "--body", body,
-                    "--head", branch,
+                    "gh",
+                    "pr",
+                    "create",
+                    "--title",
+                    title,
+                    "--body",
+                    body,
+                    "--head",
+                    branch,
                     "--fill",
                 ],
                 cwd=workspace,
@@ -933,9 +943,12 @@ class WorkerRuntime:
         use_stdin = False
         if self.agent_type == "claude-code":
             cmd = [
-                "claude", "-p",
-                "--agent", agent_role,
-                "--permission-mode", "bypassPermissions",
+                "claude",
+                "-p",
+                "--agent",
+                agent_role,
+                "--permission-mode",
+                "bypassPermissions",
             ]
             # Pass prompt via stdin to avoid OS arg length limits on large specs
             use_stdin = True
@@ -976,20 +989,14 @@ class WorkerRuntime:
             # whether text=True was honored before the timeout fired. Normalize.
             raw_stdout = exc.stdout or ""
             stdout = (
-                raw_stdout
-                if isinstance(raw_stdout, str)
-                else raw_stdout.decode("utf-8", "replace")
+                raw_stdout if isinstance(raw_stdout, str) else raw_stdout.decode("utf-8", "replace")
             )
             raw_stderr = exc.stderr or ""
             stderr_partial = (
-                raw_stderr
-                if isinstance(raw_stderr, str)
-                else raw_stderr.decode("utf-8", "replace")
+                raw_stderr if isinstance(raw_stderr, str) else raw_stderr.decode("utf-8", "replace")
             )
             stderr = f"[TIMEOUT after {self.agent_timeout:.0f}s] {stderr_partial}"
-            return AgentResult(
-                returncode=-15, stdout=stdout, stderr=stderr, branch=branch
-            )
+            return AgentResult(returncode=-15, stdout=stdout, stderr=stderr, branch=branch)
 
         return AgentResult(
             returncode=proc.returncode,
@@ -1003,7 +1010,10 @@ class WorkerRuntime:
     # ------------------------------------------------------------------
 
     def _process_plan_output(
-        self, task: dict, attempt_id: str, output: str,
+        self,
+        task: dict,
+        attempt_id: str,
+        output: str,
     ) -> dict | None:
         """Parse plan output, validate, and carry child tasks.
 
@@ -1015,7 +1025,8 @@ class WorkerRuntime:
         # Extract JSON from [PLAN_RESULT]...[/PLAN_RESULT] tags
         match = re.search(
             r"\[PLAN_RESULT\]\s*(.*?)\s*\[/PLAN_RESULT\]",
-            output, re.DOTALL,
+            output,
+            re.DOTALL,
         )
         if not match:
             logger.warning("no [PLAN_RESULT] tags in planner output")
@@ -1031,7 +1042,8 @@ class WorkerRuntime:
             logger.warning("plan produced no tasks")
             with contextlib.suppress(Exception):
                 self.colony.trail(
-                    task["id"], self.worker_id,
+                    task["id"],
+                    self.worker_id,
                     "plan produced no tasks"
                     + (f": {plan_result.warnings[0]}" if plan_result.warnings else ""),
                 )
@@ -1043,7 +1055,8 @@ class WorkerRuntime:
                 logger.warning("plan validation error: %s", err)
                 with contextlib.suppress(Exception):
                     self.colony.trail(
-                        task["id"], self.worker_id,
+                        task["id"],
+                        self.worker_id,
                         f"plan validation error: {err}",
                     )
             return None
@@ -1055,7 +1068,8 @@ class WorkerRuntime:
             logger.warning("plan has %d tasks, max 10", len(tasks))
             with contextlib.suppress(Exception):
                 self.colony.trail(
-                    task["id"], self.worker_id,
+                    task["id"],
+                    self.worker_id,
                     f"plan rejected: {len(tasks)} tasks exceeds max 10",
                 )
             return None
@@ -1087,8 +1101,7 @@ class WorkerRuntime:
                 plan_task_id=task["id"],
                 attempt_id=attempt_id,
                 proposed_tasks=[
-                    t.to_carry_dict(child_ids[i])
-                    for i, t in enumerate(resolved_tasks)
+                    t.to_carry_dict(child_ids[i]) for i, t in enumerate(resolved_tasks)
                 ],
                 task_count=len(resolved_tasks),
                 warnings=warn_strs,
@@ -1144,11 +1157,13 @@ class WorkerRuntime:
         if failed_ids:
             logger.warning(
                 "plan partial failure: %d/%d tasks failed",
-                len(failed_ids), len(resolved_tasks),
+                len(failed_ids),
+                len(resolved_tasks),
             )
             with contextlib.suppress(Exception):
                 self.colony.trail(
-                    task["id"], self.worker_id,
+                    task["id"],
+                    self.worker_id,
                     f"plan partial failure: {len(created_ids)} created, "
                     f"{len(failed_ids)} failed: {', '.join(failed_ids)}",
                 )

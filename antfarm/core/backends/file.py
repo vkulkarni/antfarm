@@ -450,11 +450,15 @@ class FileBackend(TaskBackend):
         # stall every other worker for its duration.
         self._close_superseded_pr(superseded_attempt, reason)
 
-    def recover_stale_task_if_worker_dead(self, task_id: str, current_attempt_id: str) -> bool:
+    def recover_stale_task_if_worker_dead(
+        self, task_id: str, current_attempt_id: str, max_attempts: int = 3
+    ) -> bool:
         """Atomically recover a stale active task iff its worker is dead.
 
         Re-validates all drift conditions under ``self._lock`` before moving
-        state forward. See the ABC docstring for the full contract.
+        state forward. Honors ``max_attempts`` so unbounded stale-recovery
+        loops cannot bypass the blocked/ routing that ``kickback()`` enforces
+        (issue #333). See the ABC docstring for the full contract.
 
         Within-process only; cross-process racers are out of scope.
         """
@@ -487,13 +491,40 @@ class FileBackend(TaskBackend):
                     a["completed_at"] = now
                     break
 
-            data["status"] = TaskStatus.READY.value
             data["current_attempt"] = None
             data["updated_at"] = now
             data.setdefault("trail", []).append(
                 {"ts": now, "worker_id": "doctor", "message": "recovered by doctor"}
             )
 
+            # Respect max_attempts — same routing logic as kickback(). Without
+            # this, a flapping worker can loop through active→ready unbounded
+            # times past the configured attempt cap (issue #333, M2 task-06).
+            effective_max = data.get("max_attempts") or max_attempts
+            finished = sum(
+                1
+                for a in data.get("attempts", [])
+                if a.get("status") in (AttemptStatus.DONE.value, AttemptStatus.SUPERSEDED.value)
+            )
+
+            if finished >= effective_max:
+                data["status"] = TaskStatus.BLOCKED.value
+                data["trail"].append(
+                    {
+                        "ts": now,
+                        "worker_id": "doctor",
+                        "message": (
+                            f"moved to blocked: {finished} finished attempts "
+                            f"exceeds max={effective_max}"
+                        ),
+                    }
+                )
+                blocked_path = self._blocked_path(task_id)
+                self._write_json(blocked_path, data)
+                active_path.unlink()
+                return True
+
+            data["status"] = TaskStatus.READY.value
             ready_path = self._ready_path(task_id)
             self._write_json(ready_path, data)
             active_path.unlink()
@@ -1070,9 +1101,7 @@ class FileBackend(TaskBackend):
         worker_path = self._worker_path(worker_id)
         with self._lock:
             data = (
-                self._read_json(worker_path)
-                if worker_path.exists()
-                else {"worker_id": worker_id}
+                self._read_json(worker_path) if worker_path.exists() else {"worker_id": worker_id}
             )
             data.update(status)
             data["last_heartbeat"] = _now_iso()
