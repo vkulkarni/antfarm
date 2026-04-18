@@ -3136,6 +3136,35 @@ def test_assert_clean_repo_temp_branch_survives(soldier_env):
     assert soldier._assert_clean_repo() is False
 
 
+def test_assert_clean_repo_ignores_untracked_files(soldier_env):
+    """#338: untracked files (e.g. .claude/ worktrees) do not mark the
+    repo dirty. The tracked-state check uses ``git diff-index`` and
+    deliberately ignores anything git has never seen."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+    with open(f"{repo}/only-untracked.txt", "w") as f:
+        f.write("noise\n")
+    # A directory of untracked files — mirrors the .claude/ worktree
+    # pattern that triggered the original spurious cleanup_incomplete.
+    import os
+
+    os.makedirs(f"{repo}/.claude/worktrees/scratch", exist_ok=True)
+    with open(f"{repo}/.claude/worktrees/scratch/junk.txt", "w") as f:
+        f.write("more noise\n")
+    assert soldier._assert_clean_repo() is True
+
+
+def test_assert_clean_repo_still_detects_tracked_modifications(soldier_env):
+    """Modifications to tracked files (no commit) still fail the check,
+    even though the switch to ``git diff-index`` drops the untracked
+    signal. Tracked-state correctness is the whole point."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+    with open(f"{repo}/README.md", "w") as f:
+        f.write("tracked file mutated in place\n")
+    assert soldier._assert_clean_repo() is False
+
+
 def test_force_clean_repo_recovers_dirty(soldier_env):
     """Destructive recovery fixes dirty tree + untracked file + on temp-merge."""
     soldier = soldier_env["soldier"]

@@ -839,7 +839,19 @@ def doctor(fix: bool, data_dir: str, sweep_legacy_tmux: bool, yes: bool):
         return
 
     backend = FileBackend(data_dir)
-    config = {"data_dir": data_dir}
+    # Start from the colony's persisted config so checks like
+    # ``check_stale_tasks`` honor operator-configured values (e.g.
+    # ``max_attempts``). Missing or malformed config.json falls back to
+    # defaults silently — doctor is diagnostic, not authoritative. See #344.
+    config: dict = {}
+    _config_path = os.path.join(data_dir, "config.json")
+    if os.path.exists(_config_path):
+        try:
+            with open(_config_path) as _f:
+                config = json.load(_f)
+        except (json.JSONDecodeError, OSError):
+            config = {}
+    config["data_dir"] = data_dir
     findings = run_doctor(backend, config, fix=fix)
 
     if not findings:

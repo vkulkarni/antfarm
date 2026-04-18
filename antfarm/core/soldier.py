@@ -1136,8 +1136,15 @@ class Soldier:
 
         Returns True iff all three are simultaneously true:
         1. HEAD is attached and points at ``self.integration_branch``.
-        2. Working tree is clean (``git status --porcelain`` empty).
+        2. Tracked files are clean (``git diff-index --quiet HEAD``).
         3. No ``antfarm/temp-merge`` branch exists.
+
+        Untracked files are intentionally ignored: the soldier repo commonly
+        carries untracked artifacts (e.g. ``.claude/`` worktrees, test
+        scratch) that are orthogonal to merge safety. ``git status
+        --porcelain`` treats these as "dirty" and produced spurious
+        ``cleanup_incomplete`` events during #338 dogfood; the tracked-state
+        check via ``git diff-index`` is the correct primitive here.
 
         Any subprocess error is treated as "not clean" — the caller is
         expected to recover via ``_force_clean_repo``. Never raises.
@@ -1155,15 +1162,16 @@ class Soldier:
             if head != self.integration_branch:
                 return False
 
+            # diff-index --quiet exits 0 when tracked files are clean against
+            # HEAD, 1 when they have modifications. Untracked files are
+            # invisible to this check — that is the point.
             r = subprocess.run(
-                ["git", "status", "--porcelain"],
+                ["git", "diff-index", "--quiet", "HEAD", "--"],
                 cwd=self.repo_path,
                 capture_output=True,
                 check=False,
             )
             if r.returncode != 0:
-                return False
-            if r.stdout.decode().strip() != "":
                 return False
 
             r = subprocess.run(
