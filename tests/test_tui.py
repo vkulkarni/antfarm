@@ -858,6 +858,56 @@ def test_tui_mission_panel_overflow():
     assert result.row_count == 6
 
 
+def _render_to_text(renderable) -> str:
+    """Render a rich renderable to plain text for assertions."""
+    from io import StringIO
+
+    from rich.console import Console
+
+    buf = StringIO()
+    Console(file=buf, width=120, force_terminal=False).print(renderable)
+    return buf.getvalue()
+
+
+def test_tui_mission_panel_live_merged_count_from_tasks():
+    """In-flight mission (report=None) shows merged count derived from task attempts (#331)."""
+    tui = _make_tui()
+    missions = [
+        {
+            "mission_id": "m-x",
+            "status": "building",
+            "task_ids": ["task-x-01", "task-x-02", "task-x-03"],
+            "blocked_task_ids": [],
+            "report": None,
+        }
+    ]
+    tasks = [
+        _task(task_id="task-x-01", attempts=[_attempt(status="merged")]),
+        _task(task_id="task-x-02", attempts=[_attempt(status="merged")]),
+        _task(task_id="task-x-03", attempts=[_attempt(status="done")]),
+        # Non-mission task with a merged attempt must not be counted.
+        _task(task_id="other-task", attempts=[_attempt(status="merged")]),
+    ]
+    rendered = _render_to_text(tui._render_missions(missions, tasks=tasks))
+    assert "2/3" in rendered
+
+
+def test_tui_mission_panel_falls_back_to_report_when_no_tasks():
+    """Legacy callers (no tasks arg) still read merged count from mission report."""
+    tui = _make_tui()
+    missions = [
+        {
+            "mission_id": "m-y",
+            "status": "complete",
+            "task_ids": ["task-y-01", "task-y-02"],
+            "blocked_task_ids": [],
+            "report": {"merged_tasks": 2},
+        }
+    ]
+    rendered = _render_to_text(tui._render_missions(missions))
+    assert "2/2" in rendered
+
+
 # ---------------------------------------------------------------------------
 # Connection error handling
 # ---------------------------------------------------------------------------
