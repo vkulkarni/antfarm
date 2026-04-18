@@ -318,14 +318,19 @@ def check_stale_workers(backend, config: dict, fix: bool = False) -> list[Findin
                     auto_fixable=True,
                 )
                 if fix:
-                    backend.deregister_worker(worker_id)
-                    f.fixed = True
-                    _emit_event(
-                        "stale_worker_recovered",
-                        "",
-                        f"worker={worker_id}",
-                        actor="doctor",
-                    )
+                    # Atomic re-check-and-delete under the backend lock so a
+                    # late heartbeat between our stat and deregister cannot
+                    # silently evict a live worker (issue #310).
+                    if backend.deregister_worker_if_stale(worker_id, worker_ttl):
+                        f.fixed = True
+                        _emit_event(
+                            "stale_worker_recovered",
+                            "",
+                            f"worker={worker_id}",
+                            actor="doctor",
+                        )
+                    else:
+                        f.message += " (worker recovered before fix)"
                 findings.append(f)
         except FileNotFoundError:
             # File disappeared between glob and stat
@@ -482,66 +487,25 @@ def check_stale_tasks(backend, config: dict, fix: bool = False) -> list[Finding]
                 auto_fixable=True,
             )
             if fix:
-                _recover_stale_task(data_dir, task_file, data, current_attempt_id)
-                f.fixed = True
-                _emit_event(
-                    "stale_task_recovered",
-                    task_id,
-                    f"worker={worker_id}",
-                    actor="doctor",
-                )
+                # Atomic re-check-and-recover under the backend lock. We pass
+                # the UNENCODED worker_id (backend's _worker_path handles the
+                # %2F encoding). If the worker's heartbeat returned, or the
+                # attempt rotated between this check and the mutation, the
+                # backend returns False and we leave the finding as unfixed
+                # (issue #310).
+                if backend.recover_stale_task_if_worker_dead(task_id, current_attempt_id):
+                    f.fixed = True
+                    _emit_event(
+                        "stale_task_recovered",
+                        task_id,
+                        f"worker={worker_id}",
+                        actor="doctor",
+                    )
+                else:
+                    f.message += " (worker recovered or task drifted; no action taken)"
             findings.append(f)
 
     return findings
-
-
-def _recover_stale_task(
-    data_dir: Path,
-    task_file: Path,
-    data: dict,
-    current_attempt_id: str,
-) -> None:
-    """Raw file recovery for a stale active task.
-
-    Supersedes the current attempt, resets status to ready, adds a trail
-    entry, writes to ready/, and deletes from active/.
-
-    Args:
-        data_dir: Root .antfarm directory.
-        task_file: Path to the active task JSON file.
-        data: Parsed task dict.
-        current_attempt_id: The attempt ID to supersede.
-    """
-    now = datetime.now(UTC).isoformat()
-
-    # Supersede the current attempt
-    for attempt in data.get("attempts", []):
-        if attempt.get("attempt_id") == current_attempt_id:
-            attempt["status"] = "superseded"
-            attempt["completed_at"] = now
-            break
-
-    # Reset task to ready
-    data["status"] = "ready"
-    data["current_attempt"] = None
-    data["updated_at"] = now
-
-    # Add trail entry
-    data.setdefault("trail", [])
-    data["trail"].append(
-        {
-            "ts": now,
-            "worker_id": "doctor",
-            "message": "recovered by doctor",
-        }
-    )
-
-    # Write to ready/ atomically, then delete from active/
-    ready_path = data_dir / "tasks" / "ready" / task_file.name
-    tmp_path = ready_path.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(data, indent=2))
-    tmp_path.replace(ready_path)
-    task_file.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -649,14 +613,20 @@ def check_stale_guards(backend, config: dict, fix: bool = False) -> list[Finding
             auto_fixable=True,
         )
         if fix:
-            guard_file.unlink(missing_ok=True)
-            f.fixed = True
-            _emit_event(
-                "stale_guard_cleared",
-                "",
-                f"resource={resource}",
-                actor="doctor",
-            )
+            # Atomic re-check-and-release under the backend lock. If the owner
+            # reappeared or the guard was re-acquired by another worker between
+            # our observation and the mutation, the backend returns False and
+            # we leave the finding unfixed (issue #310).
+            if backend.release_guard_if_owner_dead(resource):
+                f.fixed = True
+                _emit_event(
+                    "stale_guard_cleared",
+                    "",
+                    f"resource={resource}",
+                    actor="doctor",
+                )
+            else:
+                f.message += " (owner recovered before fix)"
         findings.append(f)
 
     return findings

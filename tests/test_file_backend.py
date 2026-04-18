@@ -1425,3 +1425,109 @@ def test_mark_merged_accepts_current_attempt(backend: FileBackend) -> None:
     assert data is not None
     attempts_by_id = {a["attempt_id"]: a for a in data["attempts"]}
     assert attempts_by_id[attempt_id]["status"] == AttemptStatus.MERGED.value
+
+
+# ---------------------------------------------------------------------------
+# Issue #310: doctor --fix TOCTTOU-safe backend helpers
+# ---------------------------------------------------------------------------
+
+
+def _backdate(path: Path, seconds: int = 600) -> None:
+    """Rewind a file's mtime by ``seconds`` seconds."""
+    old_time = time.time() - seconds
+    os.utime(str(path), (old_time, old_time))
+
+
+def test_deregister_worker_if_stale_skips_fresh(backend: FileBackend) -> None:
+    """Fresh heartbeat must not be evicted — returns False and leaves file intact."""
+    backend.register_worker(_make_worker("w1"))
+    assert backend.deregister_worker_if_stale("w1", max_age=300) is False
+    assert backend._worker_path("w1").exists()
+
+
+def test_deregister_worker_if_stale_removes_old(backend: FileBackend) -> None:
+    """Stale heartbeat is evicted and returns True."""
+    backend.register_worker(_make_worker("w1"))
+    _backdate(backend._worker_path("w1"), seconds=600)
+    assert backend.deregister_worker_if_stale("w1", max_age=300) is True
+    assert not backend._worker_path("w1").exists()
+
+
+def test_deregister_worker_if_stale_missing_returns_false(backend: FileBackend) -> None:
+    """A missing worker file returns False (no error)."""
+    assert backend.deregister_worker_if_stale("never-registered", max_age=300) is False
+
+
+def test_recover_stale_task_skips_when_worker_alive(backend: FileBackend) -> None:
+    """A live worker record must block recovery — caller observation was stale."""
+    backend.register_worker(_make_worker("w1"))
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("w1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+
+    # Worker is still registered (alive). Recovery must be a no-op.
+    assert backend.recover_stale_task_if_worker_dead("task-1", attempt_id) is False
+    # Task stays in active/
+    assert backend._active_path("task-1").exists()
+    assert not backend._ready_path("task-1").exists()
+
+
+def test_recover_stale_task_skips_when_attempt_drifted(backend: FileBackend) -> None:
+    """If current_attempt no longer matches the caller's observation, no action."""
+    backend.register_worker(_make_worker("w1"))
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("w1")
+    assert pulled is not None
+    stale_attempt = "att-does-not-match"
+
+    # Caller's observation is wrong (different attempt_id).
+    assert backend.recover_stale_task_if_worker_dead("task-1", stale_attempt) is False
+    assert backend._active_path("task-1").exists()
+
+
+def test_recover_stale_task_succeeds_when_worker_dead(backend: FileBackend) -> None:
+    """Worker file gone → task is recovered to ready/ with trail entry."""
+    backend.register_worker(_make_worker("w1"))
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("w1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+
+    # Kill the worker
+    backend.deregister_worker("w1")
+
+    assert backend.recover_stale_task_if_worker_dead("task-1", attempt_id) is True
+    assert not backend._active_path("task-1").exists()
+    assert backend._ready_path("task-1").exists()
+
+    data = json.loads(backend._ready_path("task-1").read_text())
+    assert data["status"] == "ready"
+    assert data["current_attempt"] is None
+    superseded = [a for a in data["attempts"] if a["attempt_id"] == attempt_id]
+    assert len(superseded) == 1
+    assert superseded[0]["status"] == AttemptStatus.SUPERSEDED.value
+    assert any("recovered by doctor" in t["message"] for t in data.get("trail", []))
+
+
+def test_release_guard_if_owner_dead_skips_when_owner_alive(backend: FileBackend) -> None:
+    """A live owner's guard must not be released — returns False."""
+    backend.register_worker(_make_worker("w1"))
+    backend.guard("resource-a", "w1")
+
+    assert backend.release_guard_if_owner_dead("resource-a") is False
+    assert backend._guard_path("resource-a").exists()
+
+
+def test_release_guard_if_owner_dead_unlinks_when_owner_gone(backend: FileBackend) -> None:
+    """An owner with no worker file → guard is released, returns True."""
+    backend.guard("resource-b", "worker-gone")
+    assert backend._guard_path("resource-b").exists()
+
+    assert backend.release_guard_if_owner_dead("resource-b") is True
+    assert not backend._guard_path("resource-b").exists()
+
+
+def test_release_guard_if_owner_dead_missing_returns_false(backend: FileBackend) -> None:
+    """A guard that does not exist returns False (no error)."""
+    assert backend.release_guard_if_owner_dead("never-locked") is False

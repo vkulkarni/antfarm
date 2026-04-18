@@ -1692,3 +1692,88 @@ def test_check_no_reviewer_capacity_silent_when_no_ready_review_tasks(setup):
 
     capacity_findings = [f for f in findings if f.check == "no_reviewer_capacity"]
     assert len(capacity_findings) == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #310: doctor --fix must re-check state atomically before mutating.
+# Simulate a late heartbeat arriving between the doctor's stale detection and
+# the backend-side mutation by monkeypatching each *_if_* helper.
+# ---------------------------------------------------------------------------
+
+
+def test_check_stale_workers_fix_respects_late_heartbeat(setup, monkeypatch):
+    """Late heartbeat → backend refuses to deregister → finding reports unfixed."""
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-late"))
+    _backdate(Path(config["data_dir"]) / "workers" / "worker-late.json", seconds=600)
+
+    real = backend.deregister_worker_if_stale
+
+    def wrapped(wid: str, max_age: float) -> bool:
+        # Simulate a concurrent heartbeat landing just before the backend
+        # re-checks staleness under its lock.
+        backend.heartbeat(wid, {})
+        return real(wid, max_age)
+
+    monkeypatch.setattr(backend, "deregister_worker_if_stale", wrapped)
+
+    findings = run_doctor(backend, config, fix=True)
+    stale = [f for f in findings if f.check == "stale_worker"]
+    assert len(stale) == 1
+    assert stale[0].fixed is False
+    assert "recovered" in stale[0].message
+    # Worker file must still exist — the late heartbeat kept it alive.
+    assert (Path(config["data_dir"]) / "workers" / "worker-late.json").exists()
+
+
+def test_check_stale_tasks_fix_respects_late_heartbeat(setup, monkeypatch):
+    """Late worker re-registration → backend refuses recovery → finding reports unfixed."""
+    backend, config = setup
+    backend.register_worker(_make_worker("worker-late"))
+    backend.carry(_make_task("task-racey"))
+    backend.pull("worker-late")
+
+    # Kill the worker so the doctor detects the stale task.
+    backend.deregister_worker("worker-late")
+
+    real = backend.recover_stale_task_if_worker_dead
+
+    def wrapped(task_id: str, attempt_id: str) -> bool:
+        # Simulate the worker reviving between detection and mutation.
+        backend.register_worker(_make_worker("worker-late"))
+        return real(task_id, attempt_id)
+
+    monkeypatch.setattr(backend, "recover_stale_task_if_worker_dead", wrapped)
+
+    findings = run_doctor(backend, config, fix=True)
+    stale = [f for f in findings if f.check == "stale_task"]
+    assert len(stale) == 1
+    assert stale[0].fixed is False
+    assert "no action taken" in stale[0].message
+    # Task must still be in active/ since recovery was refused.
+    assert (Path(config["data_dir"]) / "tasks" / "active" / "task-racey.json").exists()
+    assert not (Path(config["data_dir"]) / "tasks" / "ready" / "task-racey.json").exists()
+
+
+def test_check_stale_guards_fix_respects_owner_revival(setup, monkeypatch):
+    """Owner revives between detection and release → backend refuses → finding unfixed."""
+    backend, config = setup
+    backend.guard("resource/lock", "owner-gone")
+    guard_file = Path(config["data_dir"]) / "guards" / "resource__lock.lock"
+    _backdate(guard_file, seconds=600)
+
+    real = backend.release_guard_if_owner_dead
+
+    def wrapped(resource: str) -> bool:
+        # Simulate owner coming back online right as doctor --fix acts.
+        backend.register_worker(_make_worker("owner-gone"))
+        return real(resource)
+
+    monkeypatch.setattr(backend, "release_guard_if_owner_dead", wrapped)
+
+    findings = run_doctor(backend, config, fix=True)
+    stale = [f for f in findings if f.check == "stale_guard"]
+    assert len(stale) == 1
+    assert stale[0].fixed is False
+    assert "recovered" in stale[0].message
+    assert guard_file.exists()
