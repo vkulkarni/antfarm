@@ -70,27 +70,27 @@ WAKE_EVENT_TYPES: frozenset[str] = frozenset({"harvested", "kickback", "merged"}
 
 _MERGE_SKIP_REASONS = frozenset(
     {
-        "dep_unmerged",        # a dependency has not yet merged
-        "no_pr",               # current attempt has no branch/PR
-        "review_pending",      # review task was just created this tick
+        "dep_unmerged",  # a dependency has not yet merged
+        "no_pr",  # current attempt has no branch/PR
+        "review_pending",  # review task was just created this tick
         "review_in_progress",  # review task exists but is not done yet
-        "review_stale_sha",    # review verdict is for an older attempt SHA
-        "needs_changes",       # review verdict is not 'pass'
-        "already_merged",      # current_attempt is already MERGED
-        "superseded",          # current_attempt is None (post-kickback)
+        "review_stale_sha",  # review verdict is for an older attempt SHA
+        "needs_changes",  # review verdict is not 'pass'
+        "already_merged",  # current_attempt is already MERGED
+        "superseded",  # current_attempt is None (post-kickback)
     }
 )
 
 _MERGE_FAILED_REASONS = frozenset(
     {
-        "merge_conflict",   # git merge reported a conflict
-        "test_failed",      # test_command returned non-zero
-        "rebase_failed",    # rebase/fast-forward failed
-        "push_failed",      # git push origin failed
-        "no_pr",            # current attempt has no branch
-        "fetch_failed",     # git fetch origin failed
+        "merge_conflict",  # git merge reported a conflict
+        "test_failed",  # test_command returned non-zero
+        "rebase_failed",  # rebase/fast-forward failed
+        "push_failed",  # git push origin failed
+        "no_pr",  # current attempt has no branch
+        "fetch_failed",  # git fetch origin failed
         "checkout_failed",  # could not checkout integration branch / temp
-        "unknown",          # catch-all for unclassified failures
+        "unknown",  # catch-all for unclassified failures
     }
 )
 
@@ -113,9 +113,7 @@ def _emit(event_type: str, task_id: str, detail: str = "") -> None:
     try:
         _emit_event(event_type, task_id, detail, actor="soldier")
     except Exception:
-        logger.debug(
-            "soldier _emit: _emit_event(%s) raised", event_type, exc_info=True
-        )
+        logger.debug("soldier _emit: _emit_event(%s) raised", event_type, exc_info=True)
 
 
 class MergeResult(StrEnum):
@@ -187,7 +185,7 @@ class Soldier:
                 result = self.attempt_merge(task)
                 attempt_id = task["current_attempt"]
                 if result == MergeResult.MERGED:
-                    self.colony.mark_merged(task["id"], attempt_id)
+                    self._safe_mark_merged(task["id"], attempt_id)
                 else:
                     self.kickback_with_cascade(task["id"], self.last_failure_reason)
 
@@ -208,7 +206,7 @@ class Soldier:
             result = self.attempt_merge(task)
             attempt_id = task["current_attempt"]
             if result == MergeResult.MERGED:
-                self.colony.mark_merged(task["id"], attempt_id)
+                self._safe_mark_merged(task["id"], attempt_id)
             else:
                 self.kickback_with_cascade(task["id"], self.last_failure_reason)
             results.append((task["id"], result))
@@ -330,7 +328,7 @@ class Soldier:
                 if passed:
                     result = self.attempt_merge(task)
                     if result == MergeResult.MERGED:
-                        self.colony.mark_merged(task_id, attempt_id)
+                        self._safe_mark_merged(task_id, attempt_id)
                     else:
                         self.kickback_with_cascade(task_id, self.last_failure_reason)
                     results.append((task_id, result))
@@ -381,13 +379,10 @@ class Soldier:
                     carried = dict(prior_verdict)
                     carried["reviewed_commit_sha"] = current_sha
                     try:
-                        self.colony.store_review_verdict(
-                            task_id, attempt_id, carried
-                        )
+                        self.colony.store_review_verdict(task_id, attempt_id, carried)
                     except Exception:
                         logger.exception(
-                            "failed to carry forward verdict for %s; "
-                            "falling through to re-review",
+                            "failed to carry forward verdict for %s; falling through to re-review",
                             task_id,
                         )
                     else:
@@ -406,17 +401,13 @@ class Soldier:
                         if passed:
                             result = self.attempt_merge(task_updated)
                             if result == MergeResult.MERGED:
-                                self.colony.mark_merged(task_id, attempt_id)
+                                self._safe_mark_merged(task_id, attempt_id)
                             else:
-                                self.kickback_with_cascade(
-                                    task_id, self.last_failure_reason
-                                )
+                                self.kickback_with_cascade(task_id, self.last_failure_reason)
                             results.append((task_id, result))
                         else:
                             _emit("merge_skipped", task_id, "reason=needs_changes")
-                            self.kickback_with_cascade(
-                                task_id, f"review failed: {reason}"
-                            )
+                            self.kickback_with_cascade(task_id, f"review failed: {reason}")
                             results.append((task_id, MergeResult.FAILED))
                         continue
 
@@ -475,7 +466,7 @@ class Soldier:
             if passed:
                 result = self.attempt_merge(task_updated)
                 if result == MergeResult.MERGED:
-                    self.colony.mark_merged(task_id, attempt_id)
+                    self._safe_mark_merged(task_id, attempt_id)
                 else:
                     self.kickback_with_cascade(task_id, self.last_failure_reason)
                 results.append((task_id, result))
@@ -830,9 +821,7 @@ class Soldier:
                 # Stream closed cleanly (server-side timeout). Act as a tick.
                 return False
         except Exception as exc:
-            logger.warning(
-                "soldier event wait failed (%s); falling back to poll sleep", exc
-            )
+            logger.warning("soldier event wait failed (%s); falling back to poll sleep", exc)
             time.sleep(timeout)
             return False
 
@@ -969,9 +958,7 @@ class Soldier:
             check=False,
         )
         if r.returncode != 0:
-            self.last_failure_reason = (
-                f"rebase_retry_merge_failed: {r.stderr.decode().strip()}"
-            )
+            self.last_failure_reason = f"rebase_retry_merge_failed: {r.stderr.decode().strip()}"
             _emit("merge_failed", task_id, f"reason={self.last_failure_reason}")
             return MergeResult.FAILED
 
@@ -1154,6 +1141,35 @@ class Soldier:
             return False
         return None
 
+    def _safe_mark_merged(self, task_id: str, expected_attempt_id: str) -> bool:
+        """Re-fetch task and mark_merged only if expected_attempt_id is still current.
+
+        This guards against attempt drift — a concurrent doctor ``--fix``
+        kickback + worker re-harvest can rotate ``current_attempt`` to a new
+        ID between the moment Soldier captured the merge queue and the moment
+        it calls ``mark_merged``. Backend now validates currency, but we also
+        skip here with a diagnostic event so the drifted attempt's new cycle
+        can own its own merge decision.
+
+        Returns True on success; False if the attempt drifted (emits
+        ``merge_skipped`` with ``reason=attempt_drift``) or the task
+        disappeared.
+        """
+        fresh = self.colony.get_task(task_id)
+        current = (fresh or {}).get("current_attempt")
+        if current != expected_attempt_id:
+            logger.warning(
+                "skipping mark_merged for %s: attempt drift "
+                "(expected=%s current=%s); new attempt will own its merge cycle",
+                task_id,
+                expected_attempt_id,
+                current,
+            )
+            _emit("merge_skipped", task_id, "reason=attempt_drift")
+            return False
+        self.colony.mark_merged(task_id, expected_attempt_id)
+        return True
+
     def _reconcile_external_merge(self, task: dict) -> bool:
         """Mark the task as merged if its PR was merged on origin.
 
@@ -1171,9 +1187,13 @@ class Soldier:
             return False
         task_id = task["id"]
         attempt_id = task["current_attempt"]
-        # ValueError means already merged — idempotent no-op.
+        # ValueError means already merged or drifted — idempotent no-op.
+        # ``_safe_mark_merged`` already handles drift by emitting merge_skipped
+        # and returning False without raising; the suppress remains as defense
+        # for a rare case where the fresh task still has the current attempt
+        # but the backend write races with a kickback (very narrow window).
         with contextlib.suppress(ValueError):
-            self.colony.mark_merged(task_id, attempt_id)
+            self._safe_mark_merged(task_id, attempt_id)
         logger.info("reconciled externally-merged PR %s for %s", pr, task_id)
         _emit("reconciled_external", task_id, f"pr={pr}")
         return True

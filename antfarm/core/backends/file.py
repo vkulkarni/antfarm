@@ -480,13 +480,25 @@ class FileBackend(TaskBackend):
             self._write_json(done_path, data)
 
     def mark_merged(self, task_id: str, attempt_id: str) -> None:
-        """Update attempt status to MERGED in done/ task file. Task stays DONE."""
+        """Update attempt status to MERGED in done/ task file. Task stays DONE.
+
+        Raises:
+            ValueError: If attempt_id is not the current attempt (or not found
+                on the task at all — defense against internal corruption).
+            FileNotFoundError: If the task is not found in done/.
+        """
         with self._lock:
             done_path = self._done_path(task_id)
             if not done_path.exists():
                 raise FileNotFoundError(f"Task '{task_id}' not found in done/")
 
             data = self._read_json(done_path)
+            current = data.get("current_attempt")
+            if current != attempt_id:
+                raise ValueError(
+                    f"attempt_id '{attempt_id}' is not the current attempt (got '{current}')"
+                )
+
             matched = False
             for a in data["attempts"]:
                 if a["attempt_id"] == attempt_id:
@@ -1160,6 +1172,4 @@ class FileBackend(TaskBackend):
 
     def _has_merged_attempt(self, task: dict) -> bool:
         """Return True if any attempt on the task has status=merged."""
-        return any(
-            a.get("status") == AttemptStatus.MERGED.value for a in task.get("attempts", [])
-        )
+        return any(a.get("status") == AttemptStatus.MERGED.value for a in task.get("attempts", []))

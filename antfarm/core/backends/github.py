@@ -607,11 +607,19 @@ class GitHubBackend(TaskBackend):
         """Close the issue, add antfarm:merged label.
 
         Raises:
-            ValueError: If attempt_id not found on task.
+            ValueError: If attempt_id is not the current attempt (or not found
+                on the task at all).
+            FileNotFoundError: If the task is not found in done.
         """
         task, issue_number = self._get_task_issue(task_id)
         if issue_number is None:
             raise FileNotFoundError(f"Task '{task_id}' not found in done")
+
+        current = task.get("current_attempt")
+        if current != attempt_id:
+            raise ValueError(
+                f"attempt_id '{attempt_id}' is not the current attempt (got '{current}')"
+            )
 
         matched = False
         for a in task["attempts"]:

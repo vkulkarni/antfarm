@@ -475,7 +475,14 @@ def test_mark_harvested_idempotent_wrong_attempt_rejects(backend: FileBackend) -
 
 
 def test_mark_merged_unknown_attempt_rejects(backend: FileBackend) -> None:
-    """BUG 3 regression: mark_merged with unknown attempt_id must raise ValueError."""
+    """BUG 3 regression: mark_merged with unknown attempt_id must raise ValueError.
+
+    With the #305 currency check in place, an attempt_id that is both
+    non-existent AND not the current attempt trips the currency guard first
+    ("not the current attempt"); that is the expected behaviour. The
+    "not found on task" branch remains as defense-in-depth against internal
+    corruption — see ``test_mark_merged_rejects_stale_attempt_id`` below.
+    """
     backend.carry(_make_task("task-1"))
     pulled = backend.pull("worker-1")
     assert pulled is not None
@@ -483,7 +490,7 @@ def test_mark_merged_unknown_attempt_rejects(backend: FileBackend) -> None:
     attempt_id = pulled["current_attempt"]
     backend.mark_harvested("task-1", attempt_id, pr="pr", branch="branch")
 
-    with pytest.raises(ValueError, match="not found on task"):
+    with pytest.raises(ValueError, match="not the current attempt|not found on task"):
         backend.mark_merged("task-1", "nonexistent-attempt-id")
 
 
@@ -1359,3 +1366,62 @@ def test_kickback_does_not_hold_lock_during_pr_close(tmp_path: Path) -> None:
     backend.kickback("task-1", reason="tests failed")
 
     assert probe.acquired, "kickback held self._lock during PR close (deadlock risk)"
+
+
+# ---------------------------------------------------------------------------
+# Issue #305: mark_merged must validate attempt currency
+# ---------------------------------------------------------------------------
+
+
+def test_mark_merged_rejects_stale_attempt_id(backend: FileBackend) -> None:
+    """Issue #305: a stale attempt_id (from before a kickback) must raise.
+
+    Simulates the race where Soldier captured ``attempt_id = X`` from a merge
+    queue snapshot, then a concurrent doctor --fix kickback + worker re-harvest
+    rotated ``current_attempt`` to ``Y``. Calling ``mark_merged(task, X)`` at
+    that point must not silently flip the SUPERSEDED old attempt to MERGED.
+    """
+    backend.carry(_make_task("task-1"))
+
+    # First lifecycle: pull (creates attempt X), harvest.
+    pulled1 = backend.pull("worker-1")
+    assert pulled1 is not None
+    stale_attempt = pulled1["current_attempt"]
+    backend.mark_harvested("task-1", stale_attempt, pr="pr-1", branch="br-1")
+
+    # Concurrent doctor --fix would kick this back; we simulate that.
+    backend.kickback("task-1", reason="concurrent recovery")
+
+    # Worker re-harvests: new attempt Y becomes current.
+    pulled2 = backend.pull("worker-2")
+    assert pulled2 is not None
+    current_attempt = pulled2["current_attempt"]
+    assert current_attempt != stale_attempt
+    backend.mark_harvested("task-1", current_attempt, pr="pr-2", branch="br-2")
+
+    # Soldier now tries to mark the STALE attempt as merged — must be rejected.
+    with pytest.raises(ValueError, match="not the current attempt"):
+        backend.mark_merged("task-1", stale_attempt)
+
+    # The current attempt is untouched (still DONE, not MERGED).
+    data = backend.get_task("task-1")
+    assert data is not None
+    attempts_by_id = {a["attempt_id"]: a for a in data["attempts"]}
+    assert attempts_by_id[stale_attempt]["status"] == AttemptStatus.SUPERSEDED.value
+    assert attempts_by_id[current_attempt]["status"] == AttemptStatus.DONE.value
+
+
+def test_mark_merged_accepts_current_attempt(backend: FileBackend) -> None:
+    """Issue #305 happy path: mark_merged with the current attempt_id succeeds."""
+    backend.carry(_make_task("task-1"))
+    pulled = backend.pull("worker-1")
+    assert pulled is not None
+    attempt_id = pulled["current_attempt"]
+    backend.mark_harvested("task-1", attempt_id, pr="pr-1", branch="br-1")
+
+    backend.mark_merged("task-1", attempt_id)
+
+    data = backend.get_task("task-1")
+    assert data is not None
+    attempts_by_id = {a["attempt_id"]: a for a in data["attempts"]}
+    assert attempts_by_id[attempt_id]["status"] == AttemptStatus.MERGED.value
