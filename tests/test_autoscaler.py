@@ -854,13 +854,6 @@ class TestDepthAwareScaleDown:
         pm = _mock_pm()
         pm.is_alive.return_value = True
 
-        # Deterministic clock: current time is t0 + 10s (10s idle window).
-        t0 = 1_000_000.0
-        clock_val = {"t": t0}
-
-        def clock() -> float:
-            return clock_val["t"]
-
         backend = MagicMock()
         config = AutoscalerConfig(
             max_builders=5,
@@ -869,7 +862,7 @@ class TestDepthAwareScaleDown:
             builder_scale_down_idle_seconds=30.0,
             poll_interval=30.0,
         )
-        a = Autoscaler(backend, config, clock=clock, _pm=pm)
+        a = Autoscaler(backend, config, _pm=pm)
 
         # 3 builders, all idle, all with aged heartbeats (so they register as
         # "confirmed idle" in the tracker).
@@ -886,15 +879,15 @@ class TestDepthAwareScaleDown:
             for i in range(1, 4)
         ]
 
-        # First reconcile: idle_since is stamped at t0. target=1 (ceil(1*0.5)),
+        # First reconcile: idle_since is stamped at ~now. target=1 (ceil(1*0.5)),
         # current=3, so delta=-2, but we only retire 1/tick AND only after
-        # idle_since has aged >= 30s. At t0 the delta between now and
-        # idle_since is 0, so no retirement.
+        # idle_since has aged >= 30s. idle age is 0, so no retirement.
         a._reconcile()
         assert pm.stop.call_count == 0
 
-        # Advance 10s (still < 30s window). Still no retirement.
-        clock_val["t"] = t0 + 10
+        # Simulate "10s ago" by rewinding idle_since (still < 30s window).
+        for mw in a.managed.values():
+            mw.idle_since = datetime.now(UTC) - timedelta(seconds=10)
         a._reconcile()
         assert pm.stop.call_count == 0
 
@@ -902,12 +895,6 @@ class TestDepthAwareScaleDown:
         """current=5, target=1, all idle 60s -> retire exactly 1."""
         pm = _mock_pm()
         pm.is_alive.return_value = True
-
-        t0 = 1_000_000.0
-        clock_val = {"t": t0}
-
-        def clock() -> float:
-            return clock_val["t"]
 
         backend = MagicMock()
         config = AutoscalerConfig(
@@ -917,7 +904,7 @@ class TestDepthAwareScaleDown:
             builder_scale_down_idle_seconds=30.0,
             poll_interval=30.0,
         )
-        a = Autoscaler(backend, config, clock=clock, _pm=pm)
+        a = Autoscaler(backend, config, _pm=pm)
 
         # 5 managed builders, all idle with aged heartbeats.
         for i in range(1, 6):
@@ -933,17 +920,21 @@ class TestDepthAwareScaleDown:
             for i in range(1, 6)
         ]
 
-        # First tick: stamps idle_since = t0 for every builder. No retirements
-        # yet because t0 - t0 < 30s.
+        # First tick: stamps idle_since ~ now for every builder. No retirements
+        # yet because idle age < 30s.
         a._reconcile()
         assert pm.stop.call_count == 0
 
-        # Jump forward past the idle window. Exactly ONE retirement per tick.
-        clock_val["t"] = t0 + 60.0
+        # Rewind idle_since past the idle window for every builder. Exactly
+        # ONE retirement per tick (deterministic).
+        for mw in a.managed.values():
+            mw.idle_since = datetime.now(UTC) - timedelta(seconds=60)
         a._reconcile()
         assert pm.stop.call_count == 1
 
-        # Next tick: one more retirement (deterministic: one per tick).
+        # Keep the remaining builders aged, take another tick.
+        for mw in a.managed.values():
+            mw.idle_since = datetime.now(UTC) - timedelta(seconds=60)
         a._reconcile()
         assert pm.stop.call_count == 2
 

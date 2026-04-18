@@ -109,9 +109,16 @@ def test_e2e_multi_node_placement(tmp_path):
 
     # Post-#320 depth-aware scaling: target = ceil(ready_unblocked * 0.5)
     # = ceil(4 * 0.5) = 2 builders total across all nodes. Threshold (2) is
-    # met so both builders are placed.
+    # met so both builders are placed. With 2 reachable nodes and round-robin
+    # placement (see placement.compute_placement), those 2 builders land one
+    # per node — we must never send both builders to a single node when
+    # capacity is available elsewhere.
     total_builders = sum(d.get("builder", 0) for d in node_desired.values())
     assert total_builders == 2
+    builders_per_node = [d.get("builder", 0) for d in node_desired.values()]
+    assert all(count >= 1 for count in builders_per_node), (
+        f"expected at least 1 builder on each of 2 nodes, got {node_desired}"
+    )
 
 
 def test_e2e_prompt_cache_roundtrip(tmp_path):

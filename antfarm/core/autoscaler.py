@@ -241,11 +241,13 @@ class ManagedWorker:
     name: str
     role: str  # "planner" | "builder" | "reviewer"
     worker_id: str
-    # Wall-clock seconds at which this worker was first observed idle in
-    # the current idle run. Reset to None whenever the worker is seen
-    # active (or its heartbeat is fresher than the scale-down window).
-    # Used exclusively by the depth-aware builder scale-down path.
-    idle_since: float | None = field(default=None)
+    # UTC datetime at which this worker was first observed idle in the
+    # current idle run. Reset to None whenever the worker is seen active
+    # (or its heartbeat is fresher than the scale-down window). Used
+    # exclusively by the depth-aware builder scale-down path. Tests that
+    # need to exercise the retirement path manipulate this field directly
+    # (e.g. set it to ``datetime.now(UTC) - timedelta(seconds=N)``).
+    idle_since: datetime | None = field(default=None)
 
 
 class Autoscaler:
@@ -469,7 +471,12 @@ class Autoscaler:
         (active, offline, fresh heartbeat) resets the timer.
         """
         colony_status_map = {w["worker_id"]: w for w in colony_workers}
-        now = self._clock()
+        # Idle tracking uses wall-clock UTC on both sides (heartbeat age and
+        # ``idle_since`` stamp). ``self._clock()`` is reserved for cooldowns
+        # and retirement elsewhere. Tests that need to exercise the
+        # scale-down path seed ``mw.idle_since`` directly rather than
+        # driving time via the clock.
+        now = datetime.now(UTC)
         idle_window = self.config.builder_scale_down_idle_seconds
 
         for mw in self.managed.values():
@@ -482,7 +489,7 @@ class Autoscaler:
                 if last_hb:
                     try:
                         hb_dt = datetime.fromisoformat(last_hb)
-                        age = (datetime.now(UTC) - hb_dt).total_seconds()
+                        age = (now - hb_dt).total_seconds()
                         if age >= idle_window:
                             confirmed_idle = True
                     except (ValueError, TypeError):
@@ -500,7 +507,7 @@ class Autoscaler:
         one whose ``idle_since`` is at least ``builder_scale_down_idle_seconds``
         old. Returns True if a builder was retired.
         """
-        now = self._clock()
+        now = datetime.now(UTC)
         idle_window = self.config.builder_scale_down_idle_seconds
 
         for name, mw in list(self.managed.items()):
@@ -510,13 +517,14 @@ class Autoscaler:
                 continue
             if mw.idle_since is None:
                 continue
-            if now - mw.idle_since < idle_window:
+            idle_for = (now - mw.idle_since).total_seconds()
+            if idle_for < idle_window:
                 continue
             self._pm.stop(name)
             logger.info(
                 "autoscaler retired idle builder name=%s idle_for=%.1fs",
                 name,
-                now - mw.idle_since,
+                idle_for,
             )
             del self.managed[name]
             _emit("worker_retired", "", f"role=builder name={name}")
