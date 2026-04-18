@@ -6,6 +6,7 @@ plus edge case invariants from the Edge Cases section.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
@@ -1658,3 +1659,143 @@ def test_release_guard_missing_guard_raises(backend: FileBackend) -> None:
     """Baseline preservation: releasing a non-existent guard raises FileNotFoundError."""
     with pytest.raises(FileNotFoundError):
         backend.release_guard("never-locked", "worker-A")
+
+
+# ---------------------------------------------------------------------------
+# Issue #302 — _write_json must fsync before rename
+# ---------------------------------------------------------------------------
+
+
+def test_write_json_atomic_on_partial_write_failure(
+    backend: FileBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial write that errors must NOT corrupt the destination file.
+
+    Because _write_json writes to a tmp file and renames, a failure during
+    write should leave the original (v=1) intact.
+    """
+    target = tmp_path / ".antfarm" / "nodes" / "x.json"
+    backend._write_json(target, {"v": 1})
+
+    real_write = os.write
+
+    def bad_write(fd: int, buf: bytes) -> int:
+        real_write(fd, buf[: len(buf) // 2])
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "write", bad_write)
+
+    with pytest.raises(OSError):
+        backend._write_json(target, {"v": 2})
+
+    assert json.loads(target.read_text()) == {"v": 1}
+
+
+def test_write_json_fsyncs_before_rename(
+    backend: FileBackend, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fsync must happen on the temp fd BEFORE the rename, for crash safety."""
+    calls: list[str] = []
+    real_fsync = os.fsync
+    real_replace = Path.replace
+
+    def recording_fsync(fd: int) -> None:
+        calls.append("fsync")
+        real_fsync(fd)
+
+    def recording_replace(self: Path, target: Path) -> Path:
+        calls.append("replace")
+        return real_replace(self, target)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    monkeypatch.setattr(Path, "replace", recording_replace)
+
+    backend._write_json(tmp_path / ".antfarm" / "nodes" / "y.json", {"k": "v"})
+
+    assert "fsync" in calls
+    assert "replace" in calls
+    assert calls.index("fsync") < calls.index("replace")
+
+
+def test_write_json_round_trip(backend: FileBackend, tmp_path: Path) -> None:
+    """Baseline: written JSON is byte-for-byte readable back."""
+    p = tmp_path / ".antfarm" / "nodes" / "rt.json"
+    backend._write_json(p, {"a": 1, "b": [1, 2, 3]})
+    assert json.loads(p.read_text()) == {"a": 1, "b": [1, 2, 3]}
+
+
+def test_write_json_handles_non_ascii(backend: FileBackend, tmp_path: Path) -> None:
+    """UTF-8 encoding of json.dumps output is lossless for non-ASCII data."""
+    p = tmp_path / ".antfarm" / "nodes" / "u.json"
+    backend._write_json(p, {"name": "café", "emoji": "🐜"})
+    data = json.loads(p.read_text())
+    assert data["emoji"] == "🐜"
+    assert data["name"] == "café"
+
+
+# ---------------------------------------------------------------------------
+# Issue #303 — heartbeat must hold self._lock during read-modify-write
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_concurrent_with_register_worker(tmp_path: Path) -> None:
+    """Heartbeats hammering during/after register_worker must not clobber
+    fields written by the register call (e.g. capabilities)."""
+    backend = FileBackend(root=tmp_path / ".antfarm", guard_ttl=5)
+    worker = _make_worker("worker-1")
+    worker["capabilities"] = ["python", "rust"]
+
+    # Register first so the worker file exists with capabilities.
+    # Then pound it with heartbeats and confirm the read-modify-write
+    # path doesn't drop the capabilities field.
+    backend.register_worker(worker)
+
+    stop = threading.Event()
+
+    def pound() -> None:
+        while not stop.is_set():
+            with contextlib.suppress(Exception):
+                backend.heartbeat("worker-1", {"status": "active"})
+
+    t = threading.Thread(target=pound)
+    t.start()
+    try:
+        # Let many concurrent heartbeats run.
+        time.sleep(0.05)
+        data = json.loads(backend._worker_path("worker-1").read_text())
+        assert data["capabilities"] == ["python", "rust"]
+    finally:
+        stop.set()
+        t.join()
+
+
+def test_heartbeat_serialized_with_updates(tmp_path: Path) -> None:
+    """heartbeat and update_worker_activity must not lose each other's writes."""
+    backend = FileBackend(root=tmp_path / ".antfarm", guard_ttl=5)
+    backend.register_worker(_make_worker("worker-1"))
+
+    t1 = threading.Thread(
+        target=backend.heartbeat, args=("worker-1", {"status": "active"})
+    )
+    t2 = threading.Thread(
+        target=backend.update_worker_activity, args=("worker-1", "tool:bash")
+    )
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    data = json.loads(backend._worker_path("worker-1").read_text())
+    assert data["status"] == "active"
+    assert data["current_action"] == "tool:bash"
+
+
+def test_heartbeat_baseline_still_works(backend: FileBackend) -> None:
+    """Baseline preservation: heartbeat updates status and last_heartbeat."""
+    backend.register_worker(_make_worker("worker-1"))
+
+    before = _iso_now()
+    backend.heartbeat("worker-1", {"status": "idle"})
+    data = json.loads(backend._worker_path("worker-1").read_text())
+    assert data["status"] == "idle"
+    assert data["last_heartbeat"] >= before
