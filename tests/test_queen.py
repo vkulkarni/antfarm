@@ -1447,3 +1447,101 @@ def test_queen_does_not_emit_mission_complete_on_failed_transition(env, event_bu
 
     assert backend.get_mission(mission["mission_id"])["status"] == "failed"
     assert _find_events(event_bus, type_="mission_complete") == []
+
+
+# ---------------------------------------------------------------------------
+# Planner prompt parallelism directives (issue #322)
+# ---------------------------------------------------------------------------
+
+
+def test_planner_directives_helper_includes_parallelism_guidance():
+    """The shared directive string must name parallelism explicitly and cite
+    the concrete builder cap so the planner can target the first wave size.
+
+    Prompt text is the product here — regressing any of these substrings
+    regresses the fix for issue #322.
+    """
+    from antfarm.core.queen import _planner_parallelism_directives
+
+    text = _planner_parallelism_directives(4)
+
+    assert "PARALLELISM" in text
+    assert "max_parallel_builders" in text
+    assert "4" in text  # the cap is interpolated verbatim
+    assert "first wave" in text.lower()
+    assert "MANY SMALL INDEPENDENT" in text
+    # Lower-bound guardrail
+    assert "15-30" in text
+    assert "complexity" in text.lower()
+    # Explicitly asks the planner to explain when fewer tasks are possible
+    assert "explain why" in text.lower()
+
+
+def test_plan_task_spec_embeds_parallelism_directives(env):
+    """The plan task spec handed to the planner worker must contain the new
+    parallelism directives and the mission's configured builder cap.
+    """
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend, config_overrides={"max_parallel_builders": 6})
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    plan_task = backend.get_task(f"plan-{mission['mission_id']}")
+    spec = plan_task["spec"]
+
+    assert "PARALLELISM" in spec
+    assert "MANY SMALL INDEPENDENT" in spec
+    # The configured cap (6) must be present, not just the default (4).
+    assert "6" in spec
+    assert "15-30" in spec
+    # Original instruction is still there.
+    assert "JSON array of tasks" in spec
+    # Mission spec body is still appended after the directives.
+    assert mission["spec"] in spec
+
+
+def test_re_plan_task_spec_embeds_parallelism_directives(env):
+    """Re-plan tasks created after a needs_changes verdict must also carry
+    the parallelism directives — the bug is just as likely to reappear on
+    the second pass.
+    """
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(
+        backend,
+        config_overrides={"max_parallel_builders": 3, "require_plan_review": True},
+    )
+
+    # Drive mission: PLANNING → REVIEWING_PLAN → PLANNING (via needs_changes)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # create plan task
+
+    artifact = _make_plan_artifact(plan_task_id=f"plan-{mission['mission_id']}")
+    _harvest_plan_task_with_artifact(backend, f"plan-{mission['mission_id']}", artifact)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # → REVIEWING_PLAN (creates review task)
+
+    review_task_id = f"review-plan-{mission['mission_id']}"
+    _set_review_verdict_on_task(
+        backend,
+        review_task_id,
+        _make_review_verdict(verdict="needs_changes", summary="split more"),
+    )
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # consume needs_changes → back to PLANNING, creates re-plan task
+
+    m = backend.get_mission(mission["mission_id"])
+    re_plan_task_id = f"plan-{mission['mission_id']}-re1"
+    re_plan_task = backend.get_task(re_plan_task_id)
+
+    assert re_plan_task is not None, "re-plan task should have been created"
+    spec = re_plan_task["spec"]
+    assert "PARALLELISM" in spec
+    assert "MANY SMALL INDEPENDENT" in spec
+    assert "3" in spec  # configured cap survives into the re-plan prompt
+    assert "split more" in spec  # reviewer feedback preserved

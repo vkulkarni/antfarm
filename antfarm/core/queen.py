@@ -36,6 +36,40 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _planner_parallelism_directives(max_parallel_builders: int) -> str:
+    """Shared directives that steer the planner toward parallelizable plans.
+
+    The default planner decomposition tends to produce sequential chains
+    (task-02 depends on task-01, task-03 on task-02, etc.) even when feature
+    parts are loosely coupled. That clamps wall-clock throughput to the
+    critical path — observed in mission M1 where 3 builders ended up
+    serialized. These directives explicitly reframe the goal as MAXIMIZING
+    the number of independent first-wave tasks so the autoscaler can fan out.
+
+    See issue #322 for the motivating data.
+    """
+    return (
+        "PARALLELISM IS A FIRST-CLASS GOAL.\n"
+        f"- The colony can run up to {max_parallel_builders} builders in "
+        "parallel (max_parallel_builders). Plan for that.\n"
+        "- Prefer MANY SMALL INDEPENDENT tasks over a few large sequential "
+        "ones. When a feature has loosely-coupled parts (e.g. helper + CLI "
+        "flags + tests + docs), split them if they can be completed without "
+        "sharing branches or stepping on the same files.\n"
+        f"- Target: the first wave (tasks with empty depends_on) should "
+        f"contain at least {max_parallel_builders} tasks whenever the spec "
+        "allows. If fewer tasks can run in the first wave, explain why in "
+        "the plan summary / warnings (e.g. 'scaffolding must land first').\n"
+        "- Only add a dependency when the downstream task cannot start "
+        "without the upstream output. Shared final integration or review is "
+        "NOT a reason to chain tasks.\n"
+        "- LOWER BOUND on task size: no task should be smaller than ~15-30 "
+        "minutes of expected work. Use the `complexity` field (S/M/L) as "
+        "the signal — S = 15-30 min, M = 30-90 min, L = 90+ min. Do not "
+        "split work so fine that tasks become trivial."
+    )
+
+
 def _parse_iso(ts: str) -> float:
     """Parse an ISO 8601 timestamp to a Unix timestamp."""
     try:
@@ -373,13 +407,15 @@ class Queen:
         """Create the plan task for a mission. Returns the task ID."""
         mission_id = mission["mission_id"]
         plan_task_id = f"plan-{mission_id}"
+        max_parallel = int(mission["config"].get("max_parallel_builders", 4))
 
         now = _now_iso()
         task = {
             "id": plan_task_id,
             "title": f"Plan mission {mission_id}",
             "spec": (
-                "You are a planner. Decompose the following spec into tasks.\n"
+                "You are a planner. Decompose the following spec into tasks.\n\n"
+                f"{_planner_parallelism_directives(max_parallel)}\n\n"
                 "Output a JSON array of tasks with max 10 tasks.\n\n"
                 "---\n\n"
                 f"{mission['spec']}"
@@ -464,6 +500,7 @@ class Queen:
 
         summary = verdict.get("summary", "")
         feedback = verdict.get("feedback", "")
+        max_parallel = int(mission["config"].get("max_parallel_builders", 4))
 
         now = _now_iso()
         task = {
@@ -472,6 +509,7 @@ class Queen:
             "spec": (
                 "You are a planner. The previous plan was rejected.\n\n"
                 f"Reviewer feedback:\n{summary}\n{feedback}\n\n"
+                f"{_planner_parallelism_directives(max_parallel)}\n\n"
                 "Original spec:\n"
                 f"{mission['spec']}\n\n"
                 "Revise the plan and output a JSON array of tasks with max 10 tasks.\n"
