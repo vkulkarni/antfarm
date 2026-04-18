@@ -3095,3 +3095,147 @@ def test_diffs_equivalent_test_fixture_data_triggers_rereview(tmp_path):
         tmp_path, variant_a, variant_b, base_files=base
     )
     assert soldier._diffs_equivalent_after_rebase(_TASK_STUB, sha_a, sha_b) is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #311: _cleanup used to silently swallow git failures. The three-pronged
+# fix is: (a) pre-flight assert, (b) destructive force-recover, (c) reordered
+# cleanup with post-check diagnostic. The following nine tests pin the
+# contract.
+# ---------------------------------------------------------------------------
+
+
+def test_assert_clean_repo_positive(soldier_env):
+    """Fresh soldier_env is on integration branch, clean, no temp branch."""
+    soldier = soldier_env["soldier"]
+    assert soldier._assert_clean_repo() is True
+
+
+def test_assert_clean_repo_wrong_branch(soldier_env):
+    """HEAD not on integration branch fails the assertion."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+    _git(["git", "checkout", "-b", "some-other-branch"], cwd=repo)
+    assert soldier._assert_clean_repo() is False
+
+
+def test_assert_clean_repo_dirty_tree(soldier_env):
+    """Uncommitted change to a tracked file fails the assertion."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+    with open(f"{repo}/README.md", "w") as f:
+        f.write("mutated without commit\n")
+    assert soldier._assert_clean_repo() is False
+
+
+def test_assert_clean_repo_temp_branch_survives(soldier_env):
+    """Leftover antfarm/temp-merge branch fails the assertion."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+    _git(["git", "branch", "antfarm/temp-merge"], cwd=repo)
+    assert soldier._assert_clean_repo() is False
+
+
+def test_force_clean_repo_recovers_dirty(soldier_env):
+    """Destructive recovery fixes dirty tree + untracked file + on temp-merge."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+
+    # Mess the repo up in three ways at once.
+    _git(["git", "checkout", "-b", "antfarm/temp-merge"], cwd=repo)
+    with open(f"{repo}/README.md", "w") as f:
+        f.write("dirty tracked change\n")
+    with open(f"{repo}/junk.txt", "w") as f:
+        f.write("untracked noise\n")
+
+    assert soldier._assert_clean_repo() is False
+    assert soldier._force_clean_repo() is True
+    assert soldier._assert_clean_repo() is True
+
+
+def test_force_clean_repo_handles_missing_temp_branch(soldier_env):
+    """Missing antfarm/temp-merge is tolerated by the terminal branch -D."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+    # No temp branch; small dirty state to force all other steps to run.
+    with open(f"{repo}/README.md", "w") as f:
+        f.write("dirty\n")
+    assert soldier._force_clean_repo() is True
+    assert soldier._assert_clean_repo() is True
+
+
+def test_attempt_merge_preflight_detects_dirty_repo(soldier_env, monkeypatch):
+    """Pre-flight emits repo_dirty and either recovers or fails cleanly."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    # Carry + harvest a normal task so there's something to attempt.
+    task = _carry_and_harvest(cc, repo, "task-pf", "feat/task-pf")
+
+    # Dirty the repo after harvest but before attempt_merge.
+    with open(f"{repo}/README.md", "w") as f:
+        f.write("pre-flight corruption\n")
+
+    events: list[tuple[str, str, str]] = []
+
+    def _capture(event_type, task_id, detail=""):
+        events.append((event_type, task_id, detail))
+
+    monkeypatch.setattr(soldier_module, "_emit", _capture)
+
+    result = soldier.attempt_merge(task)
+
+    # repo_dirty event must have fired on the pre-flight path.
+    repo_dirty_events = [e for e in events if e[0] == "repo_dirty"]
+    assert repo_dirty_events, f"expected repo_dirty event, got {events}"
+
+    if result == MergeResult.FAILED:
+        # Recovery path failed: merge_failed with reason=repo_dirty must fire,
+        # and last_failure_reason must explain it.
+        assert "repo not in clean state" in soldier.last_failure_reason
+        failed_events = [
+            e for e in events if e[0] == "merge_failed" and "reason=repo_dirty" in e[2]
+        ]
+        assert failed_events, f"expected merge_failed repo_dirty, got {events}"
+    else:
+        # Recovery succeeded and merge completed normally.
+        assert result == MergeResult.MERGED
+
+
+def test_cleanup_reordering_handles_dirty_tree_before_checkout(soldier_env):
+    """Reordered _cleanup (reset --hard first) recovers from dirty-on-temp-merge."""
+    soldier = soldier_env["soldier"]
+    repo = soldier_env["repo_path"]
+
+    # Simulate the failure mode: on temp-merge branch with a dirty tree.
+    _git(["git", "checkout", "-b", "antfarm/temp-merge"], cwd=repo)
+    with open(f"{repo}/README.md", "w") as f:
+        f.write("mid-merge corruption\n")
+
+    soldier._cleanup()
+
+    assert soldier._assert_clean_repo() is True
+
+
+def test_cleanup_emits_diagnostic_when_incomplete(soldier_env, monkeypatch, tmp_path):
+    """_cleanup emits cleanup_incomplete and does not raise when git is unusable."""
+    soldier = soldier_env["soldier"]
+
+    # Point the soldier at a non-git directory so every git command fails.
+    non_git = tmp_path / "not-a-repo"
+    non_git.mkdir()
+    soldier.repo_path = str(non_git)
+
+    events: list[tuple[str, str, str]] = []
+
+    def _capture(event_type, task_id, detail=""):
+        events.append((event_type, task_id, detail))
+
+    monkeypatch.setattr(soldier_module, "_emit", _capture)
+
+    # Must not raise — _cleanup is called from finally blocks.
+    soldier._cleanup()
+
+    incomplete = [e for e in events if e[0] == "cleanup_incomplete"]
+    assert incomplete, f"expected cleanup_incomplete event, got {events}"

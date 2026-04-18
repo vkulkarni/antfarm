@@ -44,7 +44,7 @@ WAKE_EVENT_TYPES: frozenset[str] = frozenset({"harvested", "kickback", "merged"}
 # ---------------------------------------------------------------------------
 # Merge diagnostic event vocabulary (v0.6.7)
 #
-# Soldier emits three diagnostic event types to the SSE bus so operators can
+# Soldier emits diagnostic event types to the SSE bus so operators can
 # answer "why is this task still sitting in done/?" without reading soldier
 # logs. All are emitted with actor="soldier" via ``_emit``.
 #
@@ -62,6 +62,17 @@ WAKE_EVENT_TYPES: frozenset[str] = frozenset({"harvested", "kickback", "merged"}
 #   BEFORE the caller invokes ``kickback_with_cascade``. Detail format:
 #   ``reason=<short-code>: <human message>`` where ``<short-code>`` is one of
 #   ``_MERGE_FAILED_REASONS``.
+#
+# - repo_dirty: Fires when ``attempt_merge`` pre-flight ``_assert_clean_repo``
+#   detects the soldier clone is not in a clean state (wrong branch, dirty
+#   working tree, or leftover ``antfarm/temp-merge`` branch). Soldier then
+#   invokes ``_force_clean_repo`` to recover; if recovery fails a follow-up
+#   ``merge_failed`` event with ``reason=repo_dirty`` is emitted.
+#
+# - cleanup_incomplete: Fires from ``_cleanup`` when the post-check
+#   assertion after the five cleanup commands still finds the repo dirty.
+#   Never raises (``_cleanup`` runs in a ``finally`` block) — only emits
+#   the event and logs at ERROR so the condition is not silent.
 #
 # Emit failures are best-effort: a broken event bus MUST NEVER break merge
 # logic. Failures below the ``_emit`` surface are swallowed and logged at
@@ -90,6 +101,7 @@ _MERGE_FAILED_REASONS = frozenset(
         "no_pr",  # current attempt has no branch
         "fetch_failed",  # git fetch origin failed
         "checkout_failed",  # could not checkout integration branch / temp
+        "repo_dirty",  # soldier clone was dirty and recovery failed
         "unknown",  # catch-all for unclassified failures
     }
 )
@@ -589,6 +601,25 @@ class Soldier:
         # Dual-emit legacy event for 0.6.x back-compat. TODO: remove in 0.7.0.
         _emit("merge_started", task_id, branch)
 
+        # Pre-flight: refuse to proceed on a dirty clone. Issue #311 —
+        # previously ``_cleanup`` silently swallowed git failures, which
+        # could leave the soldier stuck on ``antfarm/temp-merge`` with
+        # every subsequent merge failing noisily (cascading kickback
+        # storm). Assert the clone is clean, and if not, attempt a
+        # destructive recovery before giving up on this tick.
+        if not self._assert_clean_repo():
+            _emit("repo_dirty", task_id, "preflight=fail attempting=recover")
+            if not self._force_clean_repo():
+                self.last_failure_reason = (
+                    "repo not in clean state and recovery failed"
+                )
+                _emit(
+                    "merge_failed",
+                    task_id,
+                    f"reason=repo_dirty: {self.last_failure_reason}",
+                )
+                return MergeResult.FAILED
+
         temp_branch = "antfarm/temp-merge"
         try:
             # Fetch latest state from origin
@@ -1032,52 +1063,228 @@ class Soldier:
         _emit("merge_succeeded", task_id, branch)
         return MergeResult.MERGED
 
+    def _assert_clean_repo(self) -> bool:
+        """Read-only check that the soldier clone is in a pristine state.
+
+        Returns True iff all three are simultaneously true:
+        1. HEAD is attached and points at ``self.integration_branch``.
+        2. Working tree is clean (``git status --porcelain`` empty).
+        3. No ``antfarm/temp-merge`` branch exists.
+
+        Any subprocess error is treated as "not clean" — the caller is
+        expected to recover via ``_force_clean_repo``. Never raises.
+        """
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=False,
+            )
+            if r.returncode != 0:
+                return False
+            head = r.stdout.decode().strip()
+            if head != self.integration_branch:
+                return False
+
+            r = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=False,
+            )
+            if r.returncode != 0:
+                return False
+            if r.stdout.decode().strip() != "":
+                return False
+
+            r = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", "antfarm/temp-merge"],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=False,
+            )
+            # Non-zero = branch does NOT exist = good. Zero = branch
+            # exists = dirty state.
+            return r.returncode != 0
+        except OSError:
+            return False
+
+    def _force_clean_repo(self) -> bool:
+        """Destructive recovery routine to restore a pristine clone.
+
+        DESTRUCTIVE: discards uncommitted work in the soldier clone. The
+        soldier clone is dedicated — soldier itself never commits there
+        (it only merges existing branches and pushes), so normal operation
+        is safe. Operators manually debugging in the soldier clone WILL
+        lose their changes when this routine runs.
+
+        Sequence (each step aborts recovery on failure, except the
+        terminal temp-branch delete which is best-effort):
+
+        1. ``git reset --hard HEAD`` — clean tree regardless of current branch.
+        2. ``git checkout <integration_branch>`` — reattach detached HEAD.
+        3. ``git reset --hard origin/<integration_branch>`` — align to remote.
+           If the origin ref is missing (no fetch yet, or disconnected),
+           fall back silently to ``git reset --hard HEAD`` so the routine
+           still completes instead of failing hard.
+        4. ``git clean -fd`` — remove untracked files/dirs. NOTE: intentionally
+           NOT ``-fdx`` — we preserve ignored paths like ``.venv``.
+        5. ``git branch -D antfarm/temp-merge`` — best-effort; tolerated if
+           the branch does not exist.
+
+        Returns True on full success, False if any mandatory step failed.
+        Never raises.
+        """
+        try:
+            subprocess.run(
+                ["git", "reset", "--hard", "HEAD"],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "checkout", self.integration_branch],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=True,
+            )
+            try:
+                subprocess.run(
+                    ["git", "reset", "--hard", f"origin/{self.integration_branch}"],
+                    cwd=self.repo_path,
+                    capture_output=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError:
+                # Origin ref missing (no fetch yet, or disconnected). Fall
+                # back to HEAD so recovery still completes.
+                subprocess.run(
+                    ["git", "reset", "--hard", "HEAD"],
+                    cwd=self.repo_path,
+                    capture_output=True,
+                    check=True,
+                )
+            subprocess.run(
+                ["git", "clean", "-fd"],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=True,
+            )
+        except (subprocess.CalledProcessError, OSError):
+            return False
+
+        # Best-effort: temp branch may or may not exist.
+        with contextlib.suppress(OSError):
+            subprocess.run(
+                ["git", "branch", "-D", "antfarm/temp-merge"],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=False,
+            )
+
+        return True
+
     def _cleanup(self) -> None:
         """Restore repo to a clean state after a merge attempt (success or failure).
 
         Must be bulletproof — called in finally blocks. All commands use
-        check=False so failures don't cascade.
+        check=False so failures don't cascade and this method never
+        raises (the ``finally`` contract).
 
-        Invariant after cleanup:
+        Ordering (#311): ``git reset --hard HEAD`` runs FIRST so any
+        conflict markers or partial merge state are discarded before we
+        try to change branches. Historically ``git merge --abort`` ran
+        first, which is a no-op outside an in-progress merge and did
+        nothing to rescue a dirty working tree after a partial rebase
+        or a failed checkout mid-loop. With the hard reset up front the
+        subsequent ``checkout`` reliably succeeds.
+
+        After the five commands run we re-assert the invariant with
+        ``_assert_clean_repo``. On failure we emit ``cleanup_incomplete``
+        to the SSE bus and log at ERROR — but we do NOT raise, because
+        this runs inside a ``finally`` block and raising would shadow the
+        original merge exception.
+
+        Invariant after cleanup (on success):
         - On integration_branch
         - No temp branch
         - Clean working tree matching origin/{integration_branch}
         """
-        # Abort any in-progress merge
+        # 1) Hard reset first — wipes conflict state / partial merge.
+        subprocess.run(
+            ["git", "reset", "--hard", "HEAD"],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        # 2) Abort any in-progress merge (now mostly a no-op; still
+        #    tolerated for belt-and-braces on older git versions).
         subprocess.run(
             ["git", "merge", "--abort"],
             cwd=self.repo_path,
             capture_output=True,
             check=False,
         )
-        # Return to integration branch
+        # 3) Return to integration branch.
         subprocess.run(
             ["git", "checkout", self.integration_branch],
             cwd=self.repo_path,
             capture_output=True,
             check=False,
         )
-        # Delete temp branch
+        # 4) Delete temp branch.
         subprocess.run(
             ["git", "branch", "-D", "antfarm/temp-merge"],
             cwd=self.repo_path,
             capture_output=True,
             check=False,
         )
-        # Remove untracked files and directories
+        # 5) Remove untracked files and directories.
         subprocess.run(
             ["git", "clean", "-fd"],
             cwd=self.repo_path,
             capture_output=True,
             check=False,
         )
-        # Hard reset to remote integration branch
+        # 6) Hard reset to remote integration branch.
         subprocess.run(
             ["git", "reset", "--hard", f"origin/{self.integration_branch}"],
             cwd=self.repo_path,
             capture_output=True,
             check=False,
         )
+
+        # 7) Post-check: emit diagnostic if we failed to reach clean state.
+        #    Never raise — ``finally`` contract.
+        if not self._assert_clean_repo():
+            try:
+                branch_r = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=self.repo_path,
+                    capture_output=True,
+                    check=False,
+                )
+                head = branch_r.stdout.decode().strip() if branch_r.returncode == 0 else "?"
+            except OSError:
+                head = "?"
+            try:
+                status_r = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=self.repo_path,
+                    capture_output=True,
+                    check=False,
+                )
+                dirty = (
+                    "yes"
+                    if status_r.returncode != 0 or status_r.stdout.decode().strip()
+                    else "no"
+                )
+            except OSError:
+                dirty = "yes"
+            detail = f"branch={head} dirty={dirty}"
+            _emit("cleanup_incomplete", "", detail)
+            logger.error("soldier cleanup incomplete: %s", detail)
 
     def _get_attempt_branch(self, task: dict) -> str | None:
         """Extract the branch from the task's current attempt.
