@@ -3524,18 +3524,14 @@ def test_run_kickbacks_on_needs_changes_when_require_review(tmp_path, monkeypatc
     backend = FileBackend(root=str(tmp_path / ".antfarm"))
     _make_done_task_with_mission(backend, "task-328-prod", mission_id=None)
     _set_attempt_artifact_sha(backend, "task-328-prod", sha)
-    _inject_verdict_on_current_attempt(
-        backend, "task-328-prod", _needs_changes_verdict_dict(sha)
-    )
+    _inject_verdict_on_current_attempt(backend, "task-328-prod", _needs_changes_verdict_dict(sha))
 
     pre = backend.get_task("task-328-prod")
     pre_attempt_id = pre["current_attempt"]
     assert pre["status"] == "done"
     assert pre_attempt_id is not None
 
-    soldier = Soldier.from_backend(
-        backend, repo_path=str(tmp_path), require_review=True
-    )
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
     assert soldier.require_review is True
     # Idempotence guard from the plan: _get_done_candidates skips
     # current_attempt=None tasks, so a post-kickback re-tick is a no-op.
@@ -3549,12 +3545,11 @@ def test_run_kickbacks_on_needs_changes_when_require_review(tmp_path, monkeypatc
 
     # The prior attempt must be marked superseded.
     superseded = [
-        a for a in after["attempts"]
+        a
+        for a in after["attempts"]
         if a["attempt_id"] == pre_attempt_id and a["status"] == "superseded"
     ]
-    assert superseded, (
-        f"expected superseded attempt, attempts={after['attempts']}"
-    )
+    assert superseded, f"expected superseded attempt, attempts={after['attempts']}"
 
     trail_msgs = [e["message"] for e in after.get("trail", [])]
     assert any("review failed" in m.lower() for m in trail_msgs), (
@@ -3562,9 +3557,7 @@ def test_run_kickbacks_on_needs_changes_when_require_review(tmp_path, monkeypatc
     )
 
 
-def test_run_once_with_review_kickbacks_on_needs_changes(
-    tmp_path, monkeypatch
-):
+def test_run_once_with_review_kickbacks_on_needs_changes(tmp_path, monkeypatch):
     """Unit coverage for the new task_kicked_back emission in
     run_once_with_review's needs_changes branch (#328)."""
     from antfarm.core import soldier as soldier_mod
@@ -3573,9 +3566,7 @@ def test_run_once_with_review_kickbacks_on_needs_changes(
     backend = FileBackend(root=str(tmp_path / ".antfarm"))
     _make_done_task_with_mission(backend, "task-328-unit", mission_id=None)
     _set_attempt_artifact_sha(backend, "task-328-unit", sha)
-    _inject_verdict_on_current_attempt(
-        backend, "task-328-unit", _needs_changes_verdict_dict(sha)
-    )
+    _inject_verdict_on_current_attempt(backend, "task-328-unit", _needs_changes_verdict_dict(sha))
 
     captured: list[tuple[str, str, str]] = []
 
@@ -3584,9 +3575,7 @@ def test_run_once_with_review_kickbacks_on_needs_changes(
 
     monkeypatch.setattr(soldier_mod, "_emit", _fake_emit)
 
-    soldier = Soldier.from_backend(
-        backend, repo_path=str(tmp_path), require_review=True
-    )
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
     results = soldier.run_once_with_review()
 
     assert results == [("task-328-unit", MergeResult.FAILED)]
@@ -3598,14 +3587,11 @@ def test_run_once_with_review_kickbacks_on_needs_changes(
     assert "task_kicked_back" in types, types
     assert types.index("merge_skipped") < types.index("task_kicked_back")
     assert any(
-        c[0] == "task_kicked_back" and "reason=review:needs_changes" in c[2]
-        for c in task_events
+        c[0] == "task_kicked_back" and "reason=review:needs_changes" in c[2] for c in task_events
     ), f"expected task_kicked_back with reason=review:needs_changes, got {task_events}"
 
 
-def test_kickback_cascade_on_needs_changes_includes_downstream(
-    tmp_path, monkeypatch
-):
+def test_kickback_cascade_on_needs_changes_includes_downstream(tmp_path, monkeypatch):
     """A needs_changes kickback on a parent must cascade to a downstream
     done task (depends_on=[parent]). Both should end up in ready/ with
     their prior attempts marked superseded (#328)."""
@@ -3615,9 +3601,7 @@ def test_kickback_cascade_on_needs_changes_includes_downstream(
     # Parent: done with needs_changes verdict.
     _make_done_task_with_mission(backend, "task-328-parent", mission_id=None)
     _set_attempt_artifact_sha(backend, "task-328-parent", sha)
-    _inject_verdict_on_current_attempt(
-        backend, "task-328-parent", _needs_changes_verdict_dict(sha)
-    )
+    _inject_verdict_on_current_attempt(backend, "task-328-parent", _needs_changes_verdict_dict(sha))
 
     # Downstream: done, depends on parent (so cascade must fire).
     from datetime import UTC, datetime
@@ -3669,9 +3653,7 @@ def test_kickback_cascade_on_needs_changes_includes_downstream(
     assert parent_pre["status"] == "done"
     assert child_pre["status"] == "done"
 
-    soldier = Soldier.from_backend(
-        backend, repo_path=str(tmp_path), require_review=True
-    )
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
     soldier.run_once_with_review()
 
     parent_after = backend.get_task("task-328-parent")
@@ -3700,9 +3682,7 @@ def test_kickback_exception_surfaces_diagnostic_event(tmp_path, monkeypatch):
     backend = FileBackend(root=str(tmp_path / ".antfarm"))
     _make_done_task_with_mission(backend, "task-328-err", mission_id=None)
     _set_attempt_artifact_sha(backend, "task-328-err", sha)
-    _inject_verdict_on_current_attempt(
-        backend, "task-328-err", _needs_changes_verdict_dict(sha)
-    )
+    _inject_verdict_on_current_attempt(backend, "task-328-err", _needs_changes_verdict_dict(sha))
 
     captured: list[tuple[str, str, str]] = []
 
@@ -3711,9 +3691,7 @@ def test_kickback_exception_surfaces_diagnostic_event(tmp_path, monkeypatch):
 
     monkeypatch.setattr(soldier_mod, "_emit", _fake_emit)
 
-    soldier = Soldier.from_backend(
-        backend, repo_path=str(tmp_path), require_review=True
-    )
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
 
     def _boom(self, task_id, reason):
         raise RuntimeError("boom")
@@ -3726,9 +3704,7 @@ def test_kickback_exception_surfaces_diagnostic_event(tmp_path, monkeypatch):
     errs = [c for c in captured if c[0] == "soldier_error" and c[1] == "task-328-err"]
     assert errs, f"expected soldier_error event, captured={captured}"
     assert any(
-        "op=kickback_needs_changes" in c[2]
-        and "type=RuntimeError" in c[2]
-        and "msg=boom" in c[2]
+        "op=kickback_needs_changes" in c[2] and "type=RuntimeError" in c[2] and "msg=boom" in c[2]
         for c in errs
     ), f"detail mismatch, got: {errs}"
 
@@ -3741,13 +3717,9 @@ def test_run_preserves_passing_merge_path(tmp_path, monkeypatch):
     backend = FileBackend(root=str(tmp_path / ".antfarm"))
     _make_done_task_with_mission(backend, "task-328-pass", mission_id=None)
     _set_attempt_artifact_sha(backend, "task-328-pass", sha)
-    _inject_verdict_on_current_attempt(
-        backend, "task-328-pass", _pass_verdict_dict(sha)
-    )
+    _inject_verdict_on_current_attempt(backend, "task-328-pass", _pass_verdict_dict(sha))
 
-    soldier = Soldier.from_backend(
-        backend, repo_path=str(tmp_path), require_review=True
-    )
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=True)
 
     merges: list[tuple[str, str]] = []
     marked: list[tuple[str, str]] = []
@@ -3784,13 +3756,9 @@ def test_run_does_not_kickback_when_require_review_false(tmp_path, monkeypatch):
     backend = FileBackend(root=str(tmp_path / ".antfarm"))
     _make_done_task_with_mission(backend, "task-328-legacy", mission_id=None)
     _set_attempt_artifact_sha(backend, "task-328-legacy", sha)
-    _inject_verdict_on_current_attempt(
-        backend, "task-328-legacy", _needs_changes_verdict_dict(sha)
-    )
+    _inject_verdict_on_current_attempt(backend, "task-328-legacy", _needs_changes_verdict_dict(sha))
 
-    soldier = Soldier.from_backend(
-        backend, repo_path=str(tmp_path), require_review=False
-    )
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), require_review=False)
     assert soldier.require_review is False
 
     # Stub attempt_merge so we don't invoke real git from the legacy path.
@@ -3804,9 +3772,7 @@ def test_run_does_not_kickback_when_require_review_false(tmp_path, monkeypatch):
         return MergeResult.MERGED
 
     monkeypatch.setattr(Soldier, "attempt_merge", _fake_attempt_merge)
-    monkeypatch.setattr(
-        Soldier, "_safe_mark_merged", lambda self, tid, aid: None
-    )
+    monkeypatch.setattr(Soldier, "_safe_mark_merged", lambda self, tid, aid: None)
 
     _run_one_tick(soldier, monkeypatch)
 

@@ -365,8 +365,7 @@ class Soldier:
                             _emit(
                                 "soldier_error",
                                 task_id,
-                                f"op=kickback_merge_failed type={type(exc).__name__} "
-                                f"msg={exc}",
+                                f"op=kickback_merge_failed type={type(exc).__name__} msg={exc}",
                             )
                             raise
                     results.append((task_id, result))
@@ -385,8 +384,7 @@ class Soldier:
                         _emit(
                             "soldier_error",
                             task_id,
-                            f"op=kickback_needs_changes type={type(exc).__name__} "
-                            f"msg={exc}",
+                            f"op=kickback_needs_changes type={type(exc).__name__} msg={exc}",
                         )
                         raise
                     results.append((task_id, MergeResult.FAILED))
@@ -656,9 +654,7 @@ class Soldier:
         if not self._assert_clean_repo():
             _emit("repo_dirty", task_id, "preflight=fail attempting=recover")
             if not self._force_clean_repo():
-                self.last_failure_reason = (
-                    "repo not in clean state and recovery failed"
-                )
+                self.last_failure_reason = "repo not in clean state and recovery failed"
                 _emit(
                     "merge_failed",
                     task_id,
@@ -1327,9 +1323,7 @@ class Soldier:
                     check=False,
                 )
                 dirty = (
-                    "yes"
-                    if status_r.returncode != 0 or status_r.stdout.decode().strip()
-                    else "no"
+                    "yes" if status_r.returncode != 0 or status_r.stdout.decode().strip() else "no"
                 )
             except OSError:
                 dirty = "yes"
