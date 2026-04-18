@@ -422,7 +422,7 @@ def worker():
     default=None,
     help=(
         "Max consecutive empty forages before exit. "
-        "Unset = role-based default (reviewer=10, builder=5, planner=0). "
+        "Unset = role-based default (reviewer=10, builder=20, planner=0). "
         "0 = exit on first empty."
     ),
 )

@@ -247,7 +247,7 @@ class WorkerRuntime:
             retry policy applies (see #301).
         max_empty_polls: Max consecutive empty forages before the worker exits.
             When None (default), the role-based default applies:
-            reviewer=10, builder=5, planner=0 (exit on first empty). An explicit
+            reviewer=10, builder=20, planner=0 (exit on first empty). An explicit
             integer overrides the role default; 0 preserves the original
             "exit immediately on first empty" semantics as an opt-in.
         client: Optional httpx.Client for dependency injection in tests.
@@ -298,10 +298,11 @@ class WorkerRuntime:
             self._role = "planner"
             role_max_idle_polls = 0
         else:
-            # Builders wait up to 2.5min so they outlast a typical planner run
-            # and don't race the planner when started together (#144).
+            # Builders wait up to 10min so they amortize Claude Code subprocess
+            # and worktree setup cost across tasks during long missions, and
+            # give the autoscaler time to propagate scaling signals (#321).
             self._role = "builder"
-            role_max_idle_polls = 5  # 5 * 30s = 2.5min
+            role_max_idle_polls = 20  # 20 * 30s = 10min
 
         # Explicit CLI override wins over role default; None preserves it (#272).
         self._max_idle_polls = role_max_idle_polls if max_empty_polls is None else max_empty_polls
