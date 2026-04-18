@@ -76,6 +76,7 @@ def run_doctor(
     findings.extend(check_stale_workers(backend, config, fix))
     findings.extend(check_stuck_workers(backend, config, fix))
     findings.extend(check_stale_tasks(backend, config, fix))
+    findings.extend(check_retry_patterns(backend, config))
     findings.extend(check_no_reviewer_capacity(backend, config))
     findings.extend(check_stale_guards(backend, config, fix))
     findings.extend(check_workspace_conflicts(backend))
@@ -510,6 +511,130 @@ def check_stale_tasks(backend, config: dict, fix: bool = False) -> list[Finding]
                 else:
                     f.message += " (worker recovered or task drifted; no action taken)"
             findings.append(f)
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 5a: Retry patterns (#325)
+# ---------------------------------------------------------------------------
+
+
+_RETRY_INFRA_ID_PREFIXES = ("plan-", "review-", "review-plan-")
+
+
+def _is_retry_infra_task(task: dict) -> bool:
+    """Return True for plan/review infrastructure tasks.
+
+    The doctor check filters these out because operators care about
+    implementation retry failures, not scaffolding turnover.
+    """
+    task_id = task.get("id", "") or ""
+    title = task.get("title", "") or ""
+    for prefix in _RETRY_INFRA_ID_PREFIXES:
+        if task_id.startswith(prefix) or title.startswith(prefix):
+            return True
+    return False
+
+
+def _extract_last_failure_reason(task: dict) -> str:
+    """Return a human-readable reason for the task's most recent failure.
+
+    Scans the trail in reverse for the first entry with
+    ``action_type=='kickback'``; falls back to the last trail entry whose
+    message mentions ``stderr``; finally falls back to the last trail
+    message. Returns an empty string when no trail exists.
+    """
+    trail = task.get("trail") or []
+    for entry in reversed(trail):
+        if entry.get("action_type") == "kickback":
+            return str(entry.get("message") or "")
+    for entry in reversed(trail):
+        msg = str(entry.get("message") or "")
+        if "stderr" in msg:
+            return msg
+    if trail:
+        return str(trail[-1].get("message") or "")
+    return ""
+
+
+def check_retry_patterns(backend, config: dict) -> list[Finding]:
+    """Surface tasks that are retrying or at the retry ceiling.
+
+    For each non-infra task, count finished attempts (DONE or SUPERSEDED —
+    the same definition ``kickback()`` uses). The effective attempt budget
+    is the task's ``max_attempts`` override, else ``config['max_attempts']``,
+    else ``3``.
+
+    - ``finished >= effective_max`` AND ``status == 'blocked'`` →
+      ``error`` severity, ``retry_ceiling`` check.
+    - ``finished >= effective_max - 1`` AND ``status != 'blocked'`` AND
+      ``finished > 0`` → ``warning`` severity, ``retrying`` check.
+
+    Both findings are report-only (``auto_fixable=False``). Operators
+    resolve them by inspecting the trail or calling ``antfarm kickback``.
+
+    Args:
+        backend: TaskBackend instance.
+        config: Doctor config dict (``max_attempts`` optional, default 3).
+
+    Returns:
+        List of findings, one per flagged task.
+    """
+    findings: list[Finding] = []
+
+    try:
+        tasks = backend.list_tasks()
+    except Exception:
+        return findings
+
+    default_max = config.get("max_attempts", 3)
+    finished_statuses = {"done", "superseded"}
+
+    for task in tasks:
+        if _is_retry_infra_task(task):
+            continue
+
+        attempts = task.get("attempts") or []
+        finished = sum(1 for a in attempts if a.get("status") in finished_statuses)
+        if finished == 0:
+            continue
+
+        effective_max = task.get("max_attempts") or default_max
+        status = task.get("status", "")
+        task_id = task.get("id", "")
+        reason = _extract_last_failure_reason(task)
+
+        if finished >= effective_max and status == "blocked":
+            message = (
+                f"Task '{task_id}' has failed {finished}/{effective_max} attempts."
+            )
+            if reason:
+                message += f" Last failure: {reason}"
+            findings.append(
+                Finding(
+                    severity="error",
+                    check="retry_ceiling",
+                    message=message,
+                    auto_fixable=False,
+                )
+            )
+            continue
+
+        if finished >= effective_max - 1 and status != "blocked":
+            message = (
+                f"Task '{task_id}' has failed {finished} of max {effective_max} attempts."
+            )
+            if reason:
+                message += f" Last failure: {reason}"
+            findings.append(
+                Finding(
+                    severity="warning",
+                    check="retrying",
+                    message=message,
+                    auto_fixable=False,
+                )
+            )
 
     return findings
 
