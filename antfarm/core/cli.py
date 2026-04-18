@@ -426,6 +426,16 @@ def worker():
         "0 = exit on first empty."
     ),
 )
+@click.option(
+    "--agent-timeout",
+    type=float,
+    default=7200.0,
+    show_default=True,
+    help=(
+        "Seconds before the agent subprocess is killed. Default 2h. "
+        "Set lower for tight loops, higher for long missions."
+    ),
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def worker_start(
@@ -439,6 +449,7 @@ def worker_start(
     capabilities: str | None,
     poll_interval: float,
     max_empty_polls: int | None,
+    agent_timeout: float,
     colony_url: str,
     token: str | None,
 ):
@@ -466,6 +477,7 @@ def worker_start(
         integration_branch=integration_branch,
         poll_interval=poll_interval,
         max_empty_polls=max_empty_polls,
+        agent_timeout=agent_timeout,
         capabilities=caps,
         token=token,
     )

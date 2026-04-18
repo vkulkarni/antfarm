@@ -573,6 +573,7 @@ def _make_worker_with_fake_colony(fake: _FakeColony) -> WorkerRuntime:
     runtime.agent_type = "claude-code"
     runtime.workspace_root = "/tmp/ws"
     runtime.heartbeat_interval = 30.0
+    runtime.agent_timeout = 7200.0
     runtime.capabilities = ["review"]
     runtime._token = None
     runtime._last_task_id = None

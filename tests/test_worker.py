@@ -1832,3 +1832,207 @@ def test_worker_skips_merged_deps(tc, runtime):
     _, kwargs = runtime.workspace_mgr.create.call_args
     # Merged dep must NOT be included — falls back to integration
     assert kwargs.get("dep_branches") == []
+
+
+# ---------------------------------------------------------------------------
+# #301: agent_timeout — bound subprocess.run so a hung agent can't block forever
+# ---------------------------------------------------------------------------
+
+
+def test_agent_timeout_default_is_2_hours(tmp_path, http_client):
+    """WorkerRuntime defaults agent_timeout to 7200s (2 hours)."""
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-default-timeout",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        client=http_client,
+    )
+    assert rt.agent_timeout == 7200.0
+
+
+def test_agent_timeout_rejects_non_positive(tmp_path, http_client):
+    """agent_timeout must be > 0; non-positive raises ValueError."""
+    with pytest.raises(ValueError, match="agent_timeout must be > 0"):
+        WorkerRuntime(
+            colony_url="http://test",
+            node_id="node-1",
+            name="worker-bad-timeout",
+            agent_type="generic",
+            workspace_root=str(tmp_path / "workspaces"),
+            repo_path=str(tmp_path),
+            integration_branch="main",
+            heartbeat_interval=999.0,
+            client=http_client,
+            agent_timeout=0,
+        )
+
+
+def test_launch_agent_passes_timeout_to_subprocess(tmp_path, http_client):
+    """_launch_agent forwards self.agent_timeout to subprocess.run."""
+    import subprocess
+    import threading
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-tx",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        agent_timeout=42.0,
+        client=http_client,
+    )
+    rt.workspace_mgr.create = MagicMock(return_value=str(tmp_path / "ws"))
+
+    task = {
+        "id": "task-tx-001",
+        "title": "Test",
+        "spec": "do",
+        "current_attempt": 1,
+    }
+
+    captured_kwargs: dict = {}
+    main_thread = threading.current_thread()
+
+    def fake_run(cmd, **kwargs):
+        if threading.current_thread() is main_thread:
+            captured_kwargs.update(kwargs)
+        return MagicMock(returncode=0, stdout="ok", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        rt._launch_agent(task, str(tmp_path / "ws"))
+
+    assert captured_kwargs.get("timeout") == 42.0
+
+
+def test_launch_agent_normal_exit_not_affected(tmp_path, http_client):
+    """A normal subprocess exit returns AgentResult unchanged (regression
+    guard: timeout plumbing must not alter the success path)."""
+    import subprocess
+    import threading
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-ok",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        client=http_client,
+    )
+    rt.workspace_mgr.create = MagicMock(return_value=str(tmp_path / "ws"))
+
+    task = {
+        "id": "task-ok-001",
+        "title": "Test",
+        "spec": "do",
+        "current_attempt": 1,
+    }
+
+    captured_kwargs: dict = {}
+    main_thread = threading.current_thread()
+
+    def fake_run(cmd, **kwargs):
+        if threading.current_thread() is main_thread:
+            captured_kwargs.update(kwargs)
+        return MagicMock(returncode=0, stdout="ok", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        result = rt._launch_agent(task, str(tmp_path / "ws"))
+
+    assert result.returncode == 0
+    assert result.stdout == "ok"
+    assert result.stderr == ""
+    assert captured_kwargs.get("timeout") == rt.agent_timeout
+
+
+def test_launch_agent_timeout_returns_failure_result(tmp_path, http_client):
+    """TimeoutExpired → synthetic AgentResult(returncode=-15) classifiable
+    as AGENT_TIMEOUT."""
+    import subprocess
+    import threading
+    from unittest.mock import patch
+
+    from antfarm.core.worker import classify_failure
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-timeout",
+        agent_type="generic",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        agent_timeout=0.5,
+        client=http_client,
+    )
+    rt.workspace_mgr.create = MagicMock(return_value=str(tmp_path / "ws"))
+
+    task = {
+        "id": "task-timeout-001",
+        "title": "Hangs",
+        "spec": "sleep forever",
+        "current_attempt": 1,
+    }
+
+    main_thread = threading.current_thread()
+
+    def fake_run(cmd, **kwargs):
+        if threading.current_thread() is main_thread:
+            raise subprocess.TimeoutExpired(
+                cmd=cmd, timeout=0.5, output="partial-stdout", stderr="hung-stderr"
+            )
+        return MagicMock(returncode=0, stdout="bg", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        result = rt._launch_agent(task, str(tmp_path / "ws"))
+
+    assert result.returncode == -15
+    assert "[TIMEOUT after" in result.stderr
+    assert "hung-stderr" in result.stderr
+    assert result.stdout == "partial-stdout"
+    # The standard failure pipeline must classify this as AGENT_TIMEOUT,
+    # which is the whole point — retry policy then drives recovery.
+    assert (
+        classify_failure(result.returncode, result.stderr, result.stdout)
+        == FailureType.AGENT_TIMEOUT
+    )
+
+
+def test_process_one_task_handles_timeout(tc, runtime):
+    """A timed-out agent surfaces as a tagged trail entry + FAILURE_RECORD,
+    the loop proceeds (returns True), and the task is NOT harvested."""
+    _carry(tc, task_id="task-timeout-loop")
+
+    def timeout_agent(task, workspace) -> AgentResult:
+        branch = f"feat/{task['id']}-{task['current_attempt']}"
+        return AgentResult(
+            returncode=-15,
+            stdout="",
+            stderr="[TIMEOUT after 1s] hung",
+            branch=branch,
+        )
+
+    runtime._launch_agent = timeout_agent
+    had_task = runtime._process_one_task()
+    assert had_task is True
+
+    detail = tc.get("/tasks/task-timeout-loop").json()
+    # Task must NOT be harvested — it stays active so doctor/retry handles it.
+    assert detail["status"] != "done"
+
+    trail_msgs = [entry["message"] for entry in detail.get("trail", [])]
+    assert any("[agent_timeout]" in m for m in trail_msgs)
+    assert any("[FAILURE_RECORD]" in m for m in trail_msgs)
