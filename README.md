@@ -2,7 +2,7 @@
 
 *Self-hosted coordinator for parallel AI coding agents.*
 
-v0.6.7 · Python 3.12+ · MIT
+v0.6.12 · Python 3.12+ · MIT
 
 ---
 
@@ -217,7 +217,7 @@ Full CLI: `antfarm --help` and `antfarm <command> --help`.
 
 ## Status and license
 
-v0.6.7 is the efficiency pass on the v0.6 mission pipeline. CI-green on `main`. Breaking changes and upgrade notes live in [CHANGELOG.md](CHANGELOG.md) and [UPGRADE.md](UPGRADE.md).
+v0.6.12 is the latest stable release. CI-green on `main`. Breaking changes and upgrade notes live in [CHANGELOG.md](CHANGELOG.md) and [UPGRADE.md](UPGRADE.md).
 
 License: MIT.
 

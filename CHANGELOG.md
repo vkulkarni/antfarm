@@ -6,6 +6,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.12] - 2026-04-19
+
+### Fixed
+- **#338: Soldier dirty-check now untracked-safe** — dirty detection uses `git diff --quiet HEAD` instead of `git status --porcelain`, so untracked files (e.g. `.antfarm/`) no longer cause false-dirty false alarms that blocked merges. (#345)
+- **#344: Doctor reads colony URL from `config.json`** — `check_colony_reachable` now reads `{data_dir}/config.json` for `colony_url` instead of falling back to a hardcoded localhost default, so remote colonies are probed correctly. (#345)
+
+## [0.6.11] - 2026-04-19
+
+### Changed
+- **Queen instructs planner to maximize parallelizable task count** — system prompt updated to explicitly direct the planner agent to decompose work into the maximum number of independently-executable tasks, reducing sequential bottlenecks in mission execution. (#343, closes #322)
+
+## [0.6.10] - 2026-04-19
+
+### Changed
+- **Builder idle-poll limit raised to 20** — `max_empty_polls` default for builder workers increased from 5 to 20, amortizing the one-time workspace setup cost across more forage cycles before exit. (#342, refs #321)
+
+## [0.6.9] - 2026-04-19
+
+### Added
+- **Autoscaler depth-aware scaling with hysteresis** — autoscaler now considers queue depth (ready + active task counts) when computing target worker count; a hysteresis band prevents rapid scale-up/down oscillation on transient queue fluctuations. (#341, closes #320)
+
+## [0.6.8] - 2026-04-18
+
+### Added
+- **Retry-pattern surfacing in doctor** — `doctor` now detects tasks that have been kicked back repeatedly and reports them as `retry_pattern` findings with kick count and last failure reason. (#325)
+- **Retry-pattern failures in inbox** — inbox view surfaces tasks with high kick counts so operators can spot stuck work without reading the full task trail. (#325)
+
+### Fixed
+- **#333: `recover` honors `max_attempts`** — stale-task recovery no longer re-queues tasks that have already exhausted their attempt budget; heartbeat now spans the full `worker.run()` lifecycle instead of stopping before the loop. (#334)
+- **#331: TUI mission merged count** — merged-task count is now computed from live task attempt statuses rather than a stale cached counter, fixing the count going stale mid-mission. (#332)
+- **#327/#326: Activity log surfaces type+task_id; preflight validates `test_command`** — Soldier activity log entries now include event type and task ID for traceability; colony preflight asserts `test_command` is configured before starting the Soldier. (#330)
+- **Soldier `run()` routes through `run_once_with_review`** — ensured `require_review=True` flows correctly so `needs_changes` verdicts reliably trigger kickbacks; added kickback observability. (#329)
+- **Soldier/server preserve `.antfarm/` under `git clean`** — data directory is added to `.gitignore` on colony start, and Soldier cleans only tracked files, preventing accidental data loss on `git clean -fd`. (#324)
+- **#302/#303: Atomic `_write_json` with fsync + locked heartbeat** — task-file writes now use a write-rename-fsync pattern to eliminate torn writes; heartbeat updates are serialized under `_lock`. (#319)
+- **#301: Configurable `agent_timeout`** — `antfarm worker start` accepts `--agent-timeout` (seconds) passed to `subprocess.run`, preventing hung agent processes from blocking the worker loop. (#318)
+- **#308/#309: Lock `release_guard` and `_emit_event`** — both methods now acquire `_lock`, closing a race where concurrent releases or event emissions could corrupt guard state or drop events. (#317)
+- **#311: Soldier pre-flight clean-state assert + force-recover** — Soldier asserts repo is in a clean state before each merge attempt; a `_force_recover()` routine resets dirty state (aborts in-progress merge/rebase, checks out integration branch) so transient git failures don't wedge the loop. (#316)
+- **Soldier diff-equivalence check includes `conftest.py`** — byte-identical diff check for skip-re-review now includes `conftest.py` so test-fixture-only changes are not incorrectly skipped. (#315)
+- **#314: Epoch-tagged SSE events + TUI backoff** — SSE events carry a monotonic epoch so TUI consumers can detect stream restarts and reconnect with exponential backoff instead of spinning. (#314)
+- **Doctor `--fix` closes TOCTTOU races** — stale-guard and stale-worker cleanup now re-validates staleness after acquiring the file lock, preventing double-fix races under concurrent doctor runs. (#313)
+- **#305: Validate attempt currency in `mark_merged`** — `mark_merged` rejects attempts that are no longer `current_attempt`, preventing a race where a superseded attempt is marked merged after a kickback. (#312)
+- **#296: Mission cancel purges live tasks** — cancelling a mission now moves all in-flight tasks to `done/` with cancellation metadata rather than leaving them stranded in `active/`. (#296)
+- **#266: Doctor warns on no reviewer capacity** — doctor now reports a warning when tasks in `ready/` have `role=reviewer` but no reviewer workers are registered. (#297)
+
 ## [0.6.7] - 2026-04-17
 
 Efficiency pass (P1–P6): eliminates the ~40% of mission wall-clock that was being lost to avoidable rebuilds, empty-queue worker exits, and stale merge scheduling. All changes are deterministic (no AI).
