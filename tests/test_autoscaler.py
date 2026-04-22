@@ -950,3 +950,100 @@ class TestInfraExcludedFromDepth:
         assert count_ready_unblocked(tasks) == 0
         config = AutoscalerConfig(max_builders=5, builder_depth_factor=0.5)
         assert compute_depth_aware_target(count_ready_unblocked(tasks), config) == 0
+
+
+# ---------------------------------------------------------------------------
+# Active builder protection (#340)
+# ---------------------------------------------------------------------------
+
+
+class TestActiveBuilderNotRetired:
+    def test_active_builder_idle_since_stays_none(self):
+        """A builder whose colony-side status=='active' must NEVER be marked
+        confirmed-idle. ``idle_since`` must remain None even with an aged
+        heartbeat — otherwise _retire_one_idle_builder() would kill a worker
+        that is currently mid-task (root cause of issue #340).
+        """
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm, builder_scale_down_idle_seconds=30.0)
+        a.managed["auto-builder-1"] = ManagedWorker(
+            name="auto-builder-1",
+            role="builder",
+            worker_id="local/auto-builder-1",
+        )
+        # Worker is active with an aged heartbeat (which would otherwise
+        # qualify it as confirmed-idle if status were "idle").
+        colony_workers = [
+            _worker(
+                "local/auto-builder-1",
+                status="active",
+                last_heartbeat=_aged_hb(120),
+            )
+        ]
+
+        a._update_builder_idle_tracking(colony_workers)
+
+        assert a.managed["auto-builder-1"].idle_since is None
+
+    def test_active_builder_resets_existing_idle_since(self):
+        """If a builder was previously confirmed-idle and then transitioned
+        to active, _update_builder_idle_tracking must reset idle_since to None.
+        """
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm, builder_scale_down_idle_seconds=30.0)
+        mw = ManagedWorker(
+            name="auto-builder-1",
+            role="builder",
+            worker_id="local/auto-builder-1",
+        )
+        # Pre-existing idle_since (worker was idle in a prior tick)
+        mw.idle_since = datetime.now(UTC) - timedelta(seconds=10)
+        a.managed["auto-builder-1"] = mw
+
+        # Now the worker is active
+        colony_workers = [
+            _worker(
+                "local/auto-builder-1",
+                status="active",
+                last_heartbeat=_aged_hb(120),
+            )
+        ]
+        a._update_builder_idle_tracking(colony_workers)
+
+        assert a.managed["auto-builder-1"].idle_since is None
+
+    def test_active_builder_not_retired_even_when_desired_zero(self):
+        """End-to-end: a builder with status=active is not retired by
+        _retire_one_idle_builder, even when the scale-down loop would
+        otherwise want to drop the count to zero.
+        """
+        pm = _mock_pm()
+        pm.is_alive.return_value = True
+
+        a = _make_autoscaler(
+            _pm=pm,
+            builder_scale_down_idle_seconds=30.0,
+            poll_interval=30.0,
+        )
+        a.managed["auto-builder-1"] = ManagedWorker(
+            name="auto-builder-1",
+            role="builder",
+            worker_id="local/auto-builder-1",
+        )
+
+        # Active worker with an aged heartbeat
+        colony_workers = [
+            _worker(
+                "local/auto-builder-1",
+                status="active",
+                last_heartbeat=_aged_hb(120),
+            )
+        ]
+        a._update_builder_idle_tracking(colony_workers)
+
+        # Even if the scale-down path runs, no builder should be retired:
+        # idle_since is None (active → not confirmed-idle).
+        retired = a._retire_one_idle_builder()
+        assert retired is False
+        pm.stop.assert_not_called()
+        assert "auto-builder-1" in a.managed

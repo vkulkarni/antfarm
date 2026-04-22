@@ -2247,3 +2247,43 @@ def test_heartbeat_running_during_full_run_lifetime(tc, runtime, monkeypatch):
     assert alive_at_agent == [True], "heartbeat thread must be alive during agent run"
     # After run() exits, the thread is stopped.
     assert runtime._heartbeat_thread is None
+
+
+# ---------------------------------------------------------------------------
+# Worker status active_and_idle transitions (#340)
+# ---------------------------------------------------------------------------
+
+
+def test_process_one_task_sets_active_and_idle_status(tc, runtime):
+    """_process_one_task must heartbeat status='active' immediately after
+    forage and reset to status='idle' when processing finishes.
+
+    Without this, the autoscaler sees status='idle' for a worker that's
+    currently mid-task and (when count_ready_unblocked drops to 0) retires
+    it via tmux kill-session — the root cause of issue #340.
+    """
+    _carry(tc, task_id="task-status-001")
+
+    captured: list[dict] = []
+    original_heartbeat = runtime.colony.heartbeat
+
+    def tracking_heartbeat(worker_id, status=None, **kwargs):
+        captured.append(dict(status) if status else {})
+        return original_heartbeat(worker_id, status=status, **kwargs)
+
+    runtime.colony.heartbeat = tracking_heartbeat
+    runtime._launch_agent = _good_agent
+    runtime._build_artifact = lambda task, attempt_id, workspace, branch: {}
+    runtime._create_pr = lambda task, branch, workspace: ""
+
+    had_task = runtime._process_one_task()
+    assert had_task is True
+
+    statuses = [s.get("status") for s in captured if "status" in s]
+    # The first status update during the task must be "active".
+    assert "active" in statuses, (
+        f"expected an 'active' status heartbeat during _process_one_task, got: {statuses}"
+    )
+    assert statuses[0] == "active"
+    # The last status update must be "idle" (set in the finally block).
+    assert statuses[-1] == "idle"

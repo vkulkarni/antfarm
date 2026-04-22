@@ -11,6 +11,7 @@ Mutation-critical paths (pull, guard, trail, signal) are protected by _lock.
 from __future__ import annotations
 
 import collections
+import contextlib
 import json
 import logging
 import os
@@ -683,6 +684,11 @@ def get_app(
         """Pull the next eligible task for a worker. Returns 204 if queue is empty."""
         with _lock:
             task = _backend.pull(req.worker_id)
+            if task is not None:
+                # Atomically mark the worker active so the autoscaler does not
+                # retire it between task claim and the worker's next heartbeat.
+                with contextlib.suppress(Exception):
+                    _backend.heartbeat(req.worker_id, {"status": "active"})
         if task is None:
             response.status_code = 204
             return None
