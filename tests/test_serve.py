@@ -100,6 +100,21 @@ def test_forage_creates_attempt(client):
     assert data["attempts"][0]["status"] == "active"
 
 
+def test_forage_sets_worker_active(client):
+    """Forage transitions the claiming worker's status to 'active'."""
+    _register_worker(client, worker_id="worker-1")
+    _carry(client, task_id="task-001")
+
+    r = _forage(client, worker_id="worker-1")
+    assert r.status_code == 200
+
+    r = client.get("/workers")
+    assert r.status_code == 200
+    workers = r.json()
+    worker = next(w for w in workers if w["worker_id"] == "worker-1")
+    assert worker["status"] == "active"
+
+
 def test_trail_appends(client):
     _carry(client)
     task = _forage(client).json()

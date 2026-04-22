@@ -395,252 +395,271 @@ class WorkerRuntime:
         if task is None:
             return False
 
+        # Defense-in-depth: mark self active immediately so the autoscaler sees
+        # the transition even if the forage endpoint's status update raced or
+        # failed. The forage endpoint also flips status under _lock, but a
+        # second heartbeat here closes any window where the colony hasn't yet
+        # reflected the change.
+        with contextlib.suppress(Exception):
+            self.colony.heartbeat(self.worker_id, status={"status": "active"})
+
         task_id = task["id"]
         attempt_id = task["current_attempt"]
         self._last_task_id = task_id
         logger.info("task claimed task_id=%s attempt_id=%s", task_id, attempt_id)
         _emit("task_claimed", task_id, task.get("title", ""))
 
-        with contextlib.suppress(Exception):
-            self.colony.trail(task_id, self.worker_id, "task claimed, creating workspace")
+        try:
+            with contextlib.suppress(Exception):
+                self.colony.trail(task_id, self.worker_id, "task claimed, creating workspace")
 
-        dep_branches = self._resolve_dep_branches(task)
-        workspace = self.workspace_mgr.create(task_id, attempt_id, dep_branches=dep_branches)
-        logger.info("workspace created path=%s", workspace)
-        _emit("workspace_created", task_id, workspace)
+            dep_branches = self._resolve_dep_branches(task)
+            workspace = self.workspace_mgr.create(task_id, attempt_id, dep_branches=dep_branches)
+            logger.info("workspace created path=%s", workspace)
+            _emit("workspace_created", task_id, workspace)
 
-        with contextlib.suppress(Exception):
-            self.colony.trail(task_id, self.worker_id, "workspace ready, launching agent")
+            with contextlib.suppress(Exception):
+                self.colony.trail(task_id, self.worker_id, "workspace ready, launching agent")
 
-        # Heartbeat thread is managed by run() (issue #333) — coverage now
-        # spans the whole worker lifetime, not just the agent subprocess.
-        _emit("agent_launched", task_id, self.agent_type)
-        result = self._launch_agent(task, workspace)
+            # Heartbeat thread is managed by run() (issue #333) — coverage now
+            # spans the whole worker lifetime, not just the agent subprocess.
+            _emit("agent_launched", task_id, self.agent_type)
+            result = self._launch_agent(task, workspace)
 
-        is_silent = (
-            result.returncode == 0 and not result.stdout.strip() and not result.stderr.strip()
-        )
-
-        if result.returncode != 0 or is_silent:
-            if is_silent:
-                logger.warning(
-                    "silent agent failure detected task_id=%s attempt_id=%s "
-                    "worker_id=%s — returncode=0 with empty stdout+stderr",
-                    task_id,
-                    attempt_id,
-                    self.worker_id,
-                )
-                with contextlib.suppress(Exception):
-                    self.colony.trail(
-                        task_id,
-                        self.worker_id,
-                        "silent_failure: agent exited 0 with empty stdout+stderr "
-                        "— likely missing agent definition or adapter misconfiguration",
-                    )
-            else:
-                with contextlib.suppress(Exception):
-                    self.colony.trail(
-                        task_id,
-                        self.worker_id,
-                        f"agent failed (exit {result.returncode})",
-                    )
-            # Agent failed — classify, record, and trail the failure.
-            failure = build_failure_record(
-                task_id=task_id,
-                attempt_id=attempt_id,
-                worker_id=self.worker_id,
-                returncode=result.returncode,
-                stderr=result.stderr,
-                stdout=result.stdout,
+            is_silent = (
+                result.returncode == 0 and not result.stdout.strip() and not result.stderr.strip()
             )
-            logger.warning(
-                "agent failed task_id=%s type=%s retryable=%s returncode=%d",
-                task_id,
-                failure.failure_type.value,
-                failure.retryable,
-                result.returncode,
-            )
-            self.colony.trail(
-                task_id,
-                self.worker_id,
-                f"[{failure.failure_type.value}] {failure.message}: {result.stderr[:200]}",
-            )
-            # Persist structured failure record in trail for downstream consumers
-            self.colony.trail(
-                task_id,
-                self.worker_id,
-                f"[FAILURE_RECORD] {_json.dumps(failure.to_dict())}",
-            )
-            return True
 
-        with contextlib.suppress(Exception):
-            self.colony.trail(task_id, self.worker_id, "agent completed, building artifact")
-
-        # Plan task: parse output, validate, carry children, harvest with plan artifact
-        caps_req = set(task.get("capabilities_required", []))
-        is_plan = "plan" in caps_req
-        if is_plan:
-            plan_result = self._process_plan_output(task, attempt_id, result.stdout + result.stderr)
-            if plan_result:
-                is_mission_mode = plan_result.get("mission_mode", False)
-                if is_mission_mode:
-                    artifact = {
-                        "plan_task_id": task_id,
-                        "plan_artifact": plan_result["plan_artifact"],
-                        "task_count": plan_result["plan_artifact"]["task_count"],
-                        "warnings": plan_result["warnings"],
-                        "dependency_summary": plan_result["dep_summary"],
-                    }
-                    trail_msg = (
-                        f"plan complete (mission mode): "
-                        f"{plan_result['plan_artifact']['task_count']} tasks proposed"
-                    )
-                else:
-                    artifact = {
-                        "plan_task_id": task_id,
-                        "created_task_ids": plan_result["created_ids"],
-                        "task_count": len(plan_result["created_ids"]),
-                        "warnings": plan_result["warnings"],
-                        "dependency_summary": plan_result["dep_summary"],
-                    }
-                    trail_msg = f"plan complete: created {len(plan_result['created_ids'])} tasks"
-                try:
-                    self.colony.mark_harvest_pending(task_id, attempt_id)
-                except Exception as exc:
+            if result.returncode != 0 or is_silent:
+                if is_silent:
                     logger.warning(
-                        "mark_harvest_pending failed task_id=%s attempt_id=%s: %s",
+                        "silent agent failure detected task_id=%s attempt_id=%s "
+                        "worker_id=%s — returncode=0 with empty stdout+stderr",
                         task_id,
                         attempt_id,
-                        exc,
-                    )
-                try:
-                    self.colony.harvest(
-                        task_id,
-                        attempt_id,
-                        pr="",
-                        branch="",
-                        artifact=artifact,
-                    )
-                    logger.info("plan harvested task_id=%s", task_id)
-                except Exception as exc:
-                    logger.error(
-                        "plan harvest FAILED task_id=%s attempt_id=%s: %s",
-                        task_id,
-                        attempt_id,
-                        exc,
+                        self.worker_id,
                     )
                     with contextlib.suppress(Exception):
                         self.colony.trail(
                             task_id,
                             self.worker_id,
-                            f"plan harvest failed: {exc}",
+                            "silent_failure: agent exited 0 with empty stdout+stderr "
+                            "— likely missing agent definition or adapter misconfiguration",
                         )
-                with contextlib.suppress(Exception):
-                    self.colony.trail(task_id, self.worker_id, trail_msg)
-                return True
-
-            # Plan parsing failed — trail the error
-            with contextlib.suppress(Exception):
+                else:
+                    with contextlib.suppress(Exception):
+                        self.colony.trail(
+                            task_id,
+                            self.worker_id,
+                            f"agent failed (exit {result.returncode})",
+                        )
+                # Agent failed — classify, record, and trail the failure.
+                failure = build_failure_record(
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    worker_id=self.worker_id,
+                    returncode=result.returncode,
+                    stderr=result.stderr,
+                    stdout=result.stdout,
+                )
+                logger.warning(
+                    "agent failed task_id=%s type=%s retryable=%s returncode=%d",
+                    task_id,
+                    failure.failure_type.value,
+                    failure.retryable,
+                    result.returncode,
+                )
                 self.colony.trail(
                     task_id,
                     self.worker_id,
-                    "plan failed: could not parse agent output into tasks",
+                    f"[{failure.failure_type.value}] {failure.message}: {result.stderr[:200]}",
                 )
-            return True
+                # Persist structured failure record in trail for downstream consumers
+                self.colony.trail(
+                    task_id,
+                    self.worker_id,
+                    f"[FAILURE_RECORD] {_json.dumps(failure.to_dict())}",
+                )
+                return True
 
-        # Set harvest_pending before writing result (best-effort)
-        with contextlib.suppress(Exception):
-            self.colony.mark_harvest_pending(task_id, attempt_id)
-
-        # Build artifact and create PR
-        artifact = self._build_artifact(task, attempt_id, workspace, result.branch)
-        pr_url = self._create_pr(task, result.branch, workspace)
-        if pr_url:
-            artifact["pr_url"] = pr_url
-
-        # Successful agent — harvest the task.
-        try:
-            self.colony.harvest(
-                task_id, attempt_id, pr=pr_url, branch=result.branch, artifact=artifact
-            )
-            logger.info("task harvested task_id=%s branch=%s", task_id, result.branch)
             with contextlib.suppress(Exception):
-                self.colony.trail(task_id, self.worker_id, "harvested successfully")
-        except Exception as exc:
-            # 409 = ownership loss (another worker claimed this attempt).
-            # Log a warning and continue to next task — not fatal.
-            logger.warning(
-                "harvest failed task_id=%s attempt_id=%s error=%s",
-                task_id,
-                attempt_id,
-                exc,
-            )
+                self.colony.trail(task_id, self.worker_id, "agent completed, building artifact")
 
-        # For review tasks: parse verdict from output and store on original task
-        is_review_task = "review" in set(
-            task.get("capabilities_required", [])
-        ) or task_id.startswith("review-")
-        if is_review_task and result.returncode == 0:
-            original_task_id = task_id.removeprefix("review-")
-            verdict = _parse_review_verdict(result.stdout + result.stderr)
-            if verdict:
-                try:
-                    original = self.colony.get_task(original_task_id)
-                    if original and original.get("current_attempt"):
-                        self.colony.store_review_verdict(
-                            original_task_id,
-                            original["current_attempt"],
-                            verdict,
+            # Plan task: parse output, validate, carry children, harvest with plan artifact
+            caps_req = set(task.get("capabilities_required", []))
+            is_plan = "plan" in caps_req
+            if is_plan:
+                plan_result = self._process_plan_output(
+                    task, attempt_id, result.stdout + result.stderr
+                )
+                if plan_result:
+                    is_mission_mode = plan_result.get("mission_mode", False)
+                    if is_mission_mode:
+                        artifact = {
+                            "plan_task_id": task_id,
+                            "plan_artifact": plan_result["plan_artifact"],
+                            "task_count": plan_result["plan_artifact"]["task_count"],
+                            "warnings": plan_result["warnings"],
+                            "dependency_summary": plan_result["dep_summary"],
+                        }
+                        trail_msg = (
+                            f"plan complete (mission mode): "
+                            f"{plan_result['plan_artifact']['task_count']} tasks proposed"
                         )
-                        logger.info(
-                            "stored review verdict on %s verdict=%s",
-                            original_task_id,
-                            verdict.get("verdict"),
+                    else:
+                        artifact = {
+                            "plan_task_id": task_id,
+                            "created_task_ids": plan_result["created_ids"],
+                            "task_count": len(plan_result["created_ids"]),
+                            "warnings": plan_result["warnings"],
+                            "dependency_summary": plan_result["dep_summary"],
+                        }
+                        trail_msg = (
+                            f"plan complete: created {len(plan_result['created_ids'])} tasks"
                         )
-                except Exception as exc:
-                    logger.warning(
-                        "failed to store review verdict for %s: %s",
-                        original_task_id,
-                        exc,
-                    )
-            else:
-                # Agent didn't produce parseable [REVIEW_VERDICT] tags.
-                # Trail a warning, then kickback the review task itself so
-                # another reviewer attempt runs. The kickback budget (2 total
-                # attempts) is enforced by FileBackend.kickback via
-                # max_attempts — once exhausted, the review task moves to
-                # blocked and Soldier.run_once_with_review kicks back the
-                # *original* task with a clear reason.
-                logger.warning("reviewer produced no verdict for %s", original_task_id)
+                    try:
+                        self.colony.mark_harvest_pending(task_id, attempt_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "mark_harvest_pending failed task_id=%s attempt_id=%s: %s",
+                            task_id,
+                            attempt_id,
+                            exc,
+                        )
+                    try:
+                        self.colony.harvest(
+                            task_id,
+                            attempt_id,
+                            pr="",
+                            branch="",
+                            artifact=artifact,
+                        )
+                        logger.info("plan harvested task_id=%s", task_id)
+                    except Exception as exc:
+                        logger.error(
+                            "plan harvest FAILED task_id=%s attempt_id=%s: %s",
+                            task_id,
+                            attempt_id,
+                            exc,
+                        )
+                        with contextlib.suppress(Exception):
+                            self.colony.trail(
+                                task_id,
+                                self.worker_id,
+                                f"plan harvest failed: {exc}",
+                            )
+                    with contextlib.suppress(Exception):
+                        self.colony.trail(task_id, self.worker_id, trail_msg)
+                    return True
+
+                # Plan parsing failed — trail the error
                 with contextlib.suppress(Exception):
                     self.colony.trail(
                         task_id,
                         self.worker_id,
-                        f"WARNING: no [REVIEW_VERDICT] tags in output for {original_task_id}",
+                        "plan failed: could not parse agent output into tasks",
                     )
-                review_attempt_count = len(task.get("attempts", []))
-                retry_budget = 2
-                if review_attempt_count < retry_budget:
-                    logger.info(
-                        "retrying review task %s (attempt %d/%d)",
-                        task_id,
-                        review_attempt_count,
-                        retry_budget,
-                    )
-                else:
-                    logger.warning(
-                        "review task %s exhausted retry budget (%d attempts)",
-                        task_id,
-                        review_attempt_count,
-                    )
-                with contextlib.suppress(Exception):
-                    self.colony.kickback(
-                        task_id,
-                        reason="reviewer produced no [REVIEW_VERDICT] tags",
-                        max_attempts=retry_budget,
-                    )
+                return True
 
-        return True
+            # Set harvest_pending before writing result (best-effort)
+            with contextlib.suppress(Exception):
+                self.colony.mark_harvest_pending(task_id, attempt_id)
+
+            # Build artifact and create PR
+            artifact = self._build_artifact(task, attempt_id, workspace, result.branch)
+            pr_url = self._create_pr(task, result.branch, workspace)
+            if pr_url:
+                artifact["pr_url"] = pr_url
+
+            # Successful agent — harvest the task.
+            try:
+                self.colony.harvest(
+                    task_id, attempt_id, pr=pr_url, branch=result.branch, artifact=artifact
+                )
+                logger.info("task harvested task_id=%s branch=%s", task_id, result.branch)
+                with contextlib.suppress(Exception):
+                    self.colony.trail(task_id, self.worker_id, "harvested successfully")
+            except Exception as exc:
+                # 409 = ownership loss (another worker claimed this attempt).
+                # Log a warning and continue to next task — not fatal.
+                logger.warning(
+                    "harvest failed task_id=%s attempt_id=%s error=%s",
+                    task_id,
+                    attempt_id,
+                    exc,
+                )
+
+            # For review tasks: parse verdict from output and store on original task
+            is_review_task = "review" in set(
+                task.get("capabilities_required", [])
+            ) or task_id.startswith("review-")
+            if is_review_task and result.returncode == 0:
+                original_task_id = task_id.removeprefix("review-")
+                verdict = _parse_review_verdict(result.stdout + result.stderr)
+                if verdict:
+                    try:
+                        original = self.colony.get_task(original_task_id)
+                        if original and original.get("current_attempt"):
+                            self.colony.store_review_verdict(
+                                original_task_id,
+                                original["current_attempt"],
+                                verdict,
+                            )
+                            logger.info(
+                                "stored review verdict on %s verdict=%s",
+                                original_task_id,
+                                verdict.get("verdict"),
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "failed to store review verdict for %s: %s",
+                            original_task_id,
+                            exc,
+                        )
+                else:
+                    # Agent didn't produce parseable [REVIEW_VERDICT] tags.
+                    # Trail a warning, then kickback the review task itself so
+                    # another reviewer attempt runs. The kickback budget (2 total
+                    # attempts) is enforced by FileBackend.kickback via
+                    # max_attempts — once exhausted, the review task moves to
+                    # blocked and Soldier.run_once_with_review kicks back the
+                    # *original* task with a clear reason.
+                    logger.warning("reviewer produced no verdict for %s", original_task_id)
+                    with contextlib.suppress(Exception):
+                        self.colony.trail(
+                            task_id,
+                            self.worker_id,
+                            f"WARNING: no [REVIEW_VERDICT] tags in output for {original_task_id}",
+                        )
+                    review_attempt_count = len(task.get("attempts", []))
+                    retry_budget = 2
+                    if review_attempt_count < retry_budget:
+                        logger.info(
+                            "retrying review task %s (attempt %d/%d)",
+                            task_id,
+                            review_attempt_count,
+                            retry_budget,
+                        )
+                    else:
+                        logger.warning(
+                            "review task %s exhausted retry budget (%d attempts)",
+                            task_id,
+                            review_attempt_count,
+                        )
+                    with contextlib.suppress(Exception):
+                        self.colony.kickback(
+                            task_id,
+                            reason="reviewer produced no [REVIEW_VERDICT] tags",
+                            max_attempts=retry_budget,
+                        )
+
+            return True
+        finally:
+            # Reset to idle so the autoscaler can reap this worker when the
+            # queue empties. Without this, status stays "active" forever and
+            # the worker is never retired even when no tasks remain.
+            with contextlib.suppress(Exception):
+                self.colony.heartbeat(self.worker_id, status={"status": "idle"})
 
     # ------------------------------------------------------------------
     # Dependency branch resolution
