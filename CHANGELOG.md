@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.13] - 2026-04-21
+
+### Fixed
+- **#340: Workers killed mid-task by autoscaler** — worker's colony-side `status` was never updated from `"idle"` to `"active"` when claiming a task. The autoscaler saw all running workers as idle; when `count_ready_unblocked()` dropped to 0 (all tasks claimed), `desired_builders` dropped to 0 and `_retire_one_idle_builder()` killed workers mid-task via `tmux kill-session`. Fix: forage endpoint atomically sets `status=active` inside `_lock` when returning a task; `_process_one_task()` also sets active immediately after forage (defense-in-depth) and resets to idle in a `try/finally` on task completion. (#346)
+
 ## [0.6.12] - 2026-04-19
 
 ### Fixed
