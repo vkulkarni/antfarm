@@ -3941,3 +3941,198 @@ def test_trail_includes_full_stderr_on_test_failure(tmp_path, monkeypatch):
     # First four lines must not appear in the tail block.
     for dropped in ("err-line-1", "err-line-2", "err-line-3", "err-line-4"):
         assert dropped not in tail_lines, f"{dropped} should have been trimmed"
+
+
+# ---------------------------------------------------------------------------
+# #349: rebase-retry reclaims an antfarm-managed worktree blocking checkout
+# ---------------------------------------------------------------------------
+
+
+def test_remove_blocking_worktree_happy_path(tmp_path, monkeypatch):
+    """Stderr matches and the parsed path sits under .antfarm/workspaces/ —
+    helper invokes ``git worktree remove --force`` and returns True."""
+    import os as _os
+    import subprocess as _sp
+
+    soldier = _build_bare_soldier(tmp_path)
+
+    blocked_path = _os.path.join(str(tmp_path), ".antfarm", "workspaces", "task-rb-att-001")
+    _os.makedirs(blocked_path, exist_ok=True)
+    expected_abs = _os.path.realpath(blocked_path)
+
+    stderr = f"fatal: 'feat/task-rb' is already used by worktree at '{blocked_path}'\n"
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
+
+    assert soldier._remove_blocking_worktree(stderr) is True
+    assert calls == [["git", "worktree", "remove", "--force", expected_abs]]
+
+
+def test_remove_blocking_worktree_refuses_path_outside_antfarm(tmp_path, monkeypatch):
+    """Path outside .antfarm/workspaces/ is refused; git worktree remove is
+    never invoked."""
+    import subprocess as _sp
+
+    soldier = _build_bare_soldier(tmp_path)
+
+    stderr = (
+        "fatal: 'feat/task-rb' is already used by worktree at '/tmp/somebodyelse/feature-branch/'\n"
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
+
+    assert soldier._remove_blocking_worktree(stderr) is False
+    assert calls == []
+
+
+def test_remove_blocking_worktree_refuses_path_traversal(tmp_path, monkeypatch):
+    """A path that lexically starts with the antfarm prefix but traverses
+    out via '..' segments must be rejected after realpath resolution."""
+    import subprocess as _sp
+
+    soldier = _build_bare_soldier(tmp_path)
+
+    traversal = "/tmp/foo/.antfarm/workspaces/../../etc/"
+    stderr = f"fatal: 'feat/task-rb' is already used by worktree at '{traversal}'\n"
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
+
+    assert soldier._remove_blocking_worktree(stderr) is False
+    assert calls == []
+
+
+def test_remove_blocking_worktree_malformed_stderr(tmp_path, monkeypatch):
+    """Stderr lacking the 'already used by worktree at <path>' sentinel
+    produces False without any git invocation and without raising."""
+    import subprocess as _sp
+
+    soldier = _build_bare_soldier(tmp_path)
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
+
+    assert soldier._remove_blocking_worktree("some unrelated git error") is False
+    assert calls == []
+
+
+def test_rebase_checkout_retries_after_removing_worktree(tmp_path, monkeypatch):
+    """Integration: first checkout -B fails with the worktree-collision
+    sentinel, the helper reclaims the worktree, and the retry succeeds
+    straight through to a MERGED result."""
+    import os as _os
+    import subprocess as _sp
+
+    soldier = _build_bare_soldier(tmp_path)
+    task = _make_mock_task()
+
+    blocked_rel = ".antfarm/workspaces/task-rb-att-001/"
+    blocked_abs = _os.path.join(str(tmp_path), blocked_rel)
+    _os.makedirs(blocked_abs, exist_ok=True)
+
+    merge_call_count = {"n": 0}
+    checkout_calls = {"n": 0}
+    worktree_remove_calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        joined = " ".join(args)
+        if "merge" in args and "--no-ff" in args and "feat/task-rb" in args:
+            merge_call_count["n"] += 1
+            if merge_call_count["n"] == 1:
+                return _sp.CompletedProcess(args, 1, stdout=b"", stderr=b"CONFLICT (content)")
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if args[:3] == ["git", "checkout", "-B"] and "feat/task-rb" in args:
+            checkout_calls["n"] += 1
+            if checkout_calls["n"] == 1:
+                return _sp.CompletedProcess(
+                    args,
+                    1,
+                    stdout=b"",
+                    stderr=(
+                        b"fatal: 'feat/task-rb' is already used by worktree at '"
+                        + blocked_rel.encode()
+                        + b"'\n"
+                    ),
+                )
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if args[:3] == ["git", "worktree", "remove"]:
+            worktree_remove_calls.append(list(args))
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if "rebase" in args and "origin/main" in joined and "--abort" not in args:
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        if "push" in args:
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
+
+    result = soldier.attempt_merge(task)
+    assert result == MergeResult.MERGED
+    assert checkout_calls["n"] == 2
+    assert len(worktree_remove_calls) == 1
+    assert "--force" in worktree_remove_calls[0]
+    expected_abs = _os.path.realpath(blocked_abs)
+    assert worktree_remove_calls[0][-1] == expected_abs
+
+
+def test_rebase_checkout_does_not_retry_when_worktree_outside_antfarm(tmp_path, monkeypatch):
+    """If the blocking worktree lives outside the antfarm workspaces tree,
+    the helper must refuse and the rebase path must fail verbatim on the
+    ``rebase_failed: cannot checkout`` branch — no retry, no git worktree
+    remove."""
+    import subprocess as _sp
+
+    soldier = _build_bare_soldier(tmp_path)
+    task = _make_mock_task()
+
+    checkout_calls = {"n": 0}
+    worktree_remove_calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        if "merge" in args and "--no-ff" in args and "feat/task-rb" in args:
+            return _sp.CompletedProcess(args, 1, stdout=b"", stderr=b"CONFLICT (content)")
+        if args[:3] == ["git", "checkout", "-B"] and "feat/task-rb" in args:
+            checkout_calls["n"] += 1
+            return _sp.CompletedProcess(
+                args,
+                1,
+                stdout=b"",
+                stderr=(
+                    b"fatal: 'feat/task-rb' is already used by worktree at "
+                    b"'/tmp/elsewhere/task-rb-att-001/'\n"
+                ),
+            )
+        if args[:3] == ["git", "worktree", "remove"]:
+            worktree_remove_calls.append(list(args))
+            return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
+
+    result = soldier.attempt_merge(task)
+    assert result == MergeResult.FAILED
+    assert soldier.last_failure_reason.startswith("rebase_failed: cannot checkout")
+    assert checkout_calls["n"] == 1
+    assert worktree_remove_calls == []
