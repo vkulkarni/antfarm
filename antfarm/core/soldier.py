@@ -20,6 +20,8 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
+import re
 import subprocess
 import time
 from enum import StrEnum
@@ -73,6 +75,12 @@ WAKE_EVENT_TYPES: frozenset[str] = frozenset({"harvested", "kickback", "merged"}
 #   assertion after the five cleanup commands still finds the repo dirty.
 #   Never raises (``_cleanup`` runs in a ``finally`` block) — only emits
 #   the event and logs at ERROR so the condition is not silent.
+#
+# - worktree_reclaimed: Fires from ``_remove_blocking_worktree`` when the
+#   rebase-retry checkout would otherwise fail with "branch already used by
+#   worktree at <path>" and the path is an antfarm-managed worktree that
+#   was safely removed via ``git worktree remove --force``. Detail format:
+#   ``path=<absolute path>``. See #349.
 #
 # Emit failures are best-effort: a broken event bus MUST NEVER break merge
 # logic. Failures below the ``_emit`` surface are swallowed and logged at
@@ -968,12 +976,25 @@ class Soldier:
 
         # 3) Check out the PR branch locally. Use -B so we reset any existing
         # local branch to origin/<branch>, avoiding stale local state.
+        # If the branch is currently checked out by an antfarm-managed
+        # worktree (e.g. a stale workspace left behind after a crash — see
+        # #349), git refuses the checkout with
+        # ``is already used by worktree at '<path>'``. Reclaim that single
+        # worktree and retry the checkout exactly once.
+        checkout_cmd = ["git", "checkout", "-B", branch, f"origin/{branch}"]
         r = subprocess.run(
-            ["git", "checkout", "-B", branch, f"origin/{branch}"],
+            checkout_cmd,
             cwd=self.repo_path,
             capture_output=True,
             check=False,
         )
+        if r.returncode != 0 and self._remove_blocking_worktree(r.stderr.decode()):
+            r = subprocess.run(
+                checkout_cmd,
+                cwd=self.repo_path,
+                capture_output=True,
+                check=False,
+            )
         if r.returncode != 0:
             self.last_failure_reason = (
                 f"rebase_failed: cannot checkout {branch}: {r.stderr.decode().strip()}"
@@ -1237,6 +1258,56 @@ class Soldier:
             "",
             f"cmd={' '.join(self.test_command)} stderr=\n{tail}",
         )
+
+    def _remove_blocking_worktree(self, stderr: str) -> bool:
+        """Parse a 'branch already used by worktree at <path>' stderr message
+        and, if the path is an antfarm-managed worktree, remove it with
+        ``git worktree remove --force``. Returns True iff a worktree was
+        successfully removed (caller should retry).
+
+        Safety: the parsed path is resolved with ``os.path.realpath`` and
+        must lie strictly under ``{repo_path}/.antfarm/workspaces/``. Any
+        path outside that tree (including symlinks that resolve outside,
+        and the workspaces root itself) is refused without invoking
+        ``git worktree remove``. See #349.
+        """
+        match = re.search(r"is already used by worktree at '([^']+)'", stderr)
+        if not match:
+            return False
+
+        parsed = match.group(1)
+        antfarm_prefix = os.path.realpath(os.path.join(self.repo_path, ".antfarm", "workspaces"))
+        if os.path.isabs(parsed):
+            candidate = os.path.realpath(parsed)
+        else:
+            candidate = os.path.realpath(os.path.join(self.repo_path, parsed))
+
+        if not candidate.startswith(antfarm_prefix + os.sep):
+            logger.warning(
+                "soldier _remove_blocking_worktree: refusing to remove worktree "
+                "outside antfarm workspaces: parsed=%r resolved=%r prefix=%r",
+                parsed,
+                candidate,
+                antfarm_prefix,
+            )
+            return False
+
+        r = subprocess.run(
+            ["git", "worktree", "remove", "--force", candidate],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                "soldier _remove_blocking_worktree: git worktree remove failed for %r: %s",
+                candidate,
+                r.stderr.decode(errors="replace").strip(),
+            )
+            return False
+
+        _emit("worktree_reclaimed", "", f"path={candidate}")
+        return True
 
     def _force_clean_repo(self) -> bool:
         """Destructive recovery routine to restore a pristine clone.

@@ -6,6 +6,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Fixed
+- fix(soldier): reclaim blocking antfarm worktree when rebase checkout collides (#349)
+
 ## [0.6.13] - 2026-04-21
 
 ### Fixed
