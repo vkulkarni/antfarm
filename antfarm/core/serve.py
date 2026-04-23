@@ -189,6 +189,8 @@ def _start_doctor_thread(backend: TaskBackend, data_dir: str, interval: float = 
             colony_cfg = json.load(f)
         doctor_config["worker_ttl"] = colony_cfg.get("worker_ttl", 300)
         doctor_config["guard_ttl"] = colony_cfg.get("guard_ttl", 300)
+        doctor_config["max_reviewers"] = colony_cfg.get("max_reviewers", 2)
+        doctor_config["max_builders"] = colony_cfg.get("max_builders", 4)
         interval = colony_cfg.get("doctor_interval", interval)
 
     def _doctor_loop():

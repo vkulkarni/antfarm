@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -77,6 +78,7 @@ def run_doctor(
     findings.extend(check_stuck_workers(backend, config, fix))
     findings.extend(check_stale_tasks(backend, config, fix))
     findings.extend(check_retry_patterns(backend, config))
+    findings.extend(check_review_queue_saturated(backend, config))
     findings.extend(check_no_reviewer_capacity(backend, config))
     findings.extend(check_stale_guards(backend, config, fix))
     findings.extend(check_workspace_conflicts(backend))
@@ -642,6 +644,92 @@ def check_retry_patterns(backend, config: dict) -> list[Finding]:
 # ---------------------------------------------------------------------------
 # Check 5b: No reviewer capacity
 # ---------------------------------------------------------------------------
+
+
+def check_review_queue_saturated(backend, config: dict) -> list[Finding]:
+    """Warn when awaiting-review tasks exceed ``max_reviewers * 2`` for ≥2 minutes.
+
+    Detects the saturation pattern from issue #347: builders keep producing
+    work faster than reviewers can clear it, so the "awaiting review" queue
+    grows unbounded. The dwell window prevents false positives during bursts.
+
+    Sidecar state at ``{data_dir}/doctor_state/review_saturation.json`` tracks
+    when the queue first became saturated so we only fire once the condition
+    has held continuously for ``dwell_seconds``. Healthy state clears the
+    sidecar.
+
+    No auto-fix — operator must re-tune autoscaler sizing.
+
+    Args:
+        backend: TaskBackend instance.
+        config: Doctor config dict; reads ``max_reviewers`` (default 2) and
+            ``data_dir``.
+
+    Returns:
+        List of findings (at most one).
+    """
+    from antfarm.core.warnings import detect_review_queue_saturated
+
+    try:
+        tasks = backend.list_tasks()
+    except Exception:
+        return []
+
+    max_reviewers = int(config.get("max_reviewers", 2))
+    data_dir = config.get("data_dir", ".antfarm")
+    sidecar_dir = os.path.join(data_dir, "doctor_state")
+    sidecar_path = os.path.join(sidecar_dir, "review_saturation.json")
+
+    # Compute awaiting count using the same logic as the warning helper so we
+    # don't double-count. We rely on the helper returning None below-threshold
+    # and use a probe-with-far-past-timestamp to distinguish "below threshold"
+    # from "above but within dwell".
+    from antfarm.core.warnings import _count_awaiting_review
+
+    now = datetime.now(UTC)
+    awaiting_count = _count_awaiting_review(tasks)
+    threshold = max_reviewers * 2
+
+    if awaiting_count <= threshold:
+        # Healthy — clear any prior sidecar.
+        if os.path.exists(sidecar_path):
+            with contextlib.suppress(OSError):
+                os.unlink(sidecar_path)
+        return []
+
+    # Saturated — ensure sidecar records first_seen.
+    first_seen_at: str | None = None
+    if os.path.exists(sidecar_path):
+        try:
+            with open(sidecar_path) as f:
+                first_seen_at = json.load(f).get("first_seen_at")
+        except (json.JSONDecodeError, OSError):
+            first_seen_at = None
+
+    if first_seen_at is None:
+        with contextlib.suppress(OSError):
+            os.makedirs(sidecar_dir, exist_ok=True)
+            with open(sidecar_path, "w") as f:
+                json.dump({"first_seen_at": now.isoformat()}, f)
+        return []
+
+    warning = detect_review_queue_saturated(
+        tasks=tasks,
+        max_reviewers=max_reviewers,
+        awaiting_first_seen_at=first_seen_at,
+        now=now,
+    )
+    if warning is None:
+        return []
+
+    return [
+        Finding(
+            severity="warning",
+            check="review_queue_saturated",
+            message=warning["message"],
+            auto_fixable=False,
+        )
+    ]
 
 
 def check_no_reviewer_capacity(backend, config: dict) -> list[Finding]:  # noqa: ARG001

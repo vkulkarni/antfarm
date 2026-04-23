@@ -6,8 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- feat(doctor): warn when review queue saturates (awaiting > max_reviewers*2 for 2min+) (#347)
+
 ### Fixed
 - fix(soldier): reclaim blocking antfarm worktree when rebase checkout collides (#349)
+- fix(autoscaler): default max_reviewers now derives from max_builders (ceil(0.75x), floor 2) (#347)
 
 ## [0.6.13] - 2026-04-21
 

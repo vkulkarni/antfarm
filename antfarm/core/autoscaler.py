@@ -219,7 +219,11 @@ class AutoscalerConfig:
     integration_branch: str = "main"
     workspace_root: str = "./.antfarm/workspaces"
     max_builders: int = 4
-    max_reviewers: int = 2
+    # When None, derived from max_builders in __post_init__:
+    #   max_reviewers = max(2, ceil(max_builders * 0.75))
+    # See issue #347 — a fixed default of 2 starved review capacity on busy
+    # colonies.
+    max_reviewers: int | None = None
     token: str | None = None
     poll_interval: float = 30.0
     colony_url: str = "http://127.0.0.1:7433"
@@ -234,6 +238,10 @@ class AutoscalerConfig:
     # Seconds a builder must be idle before it is eligible for retirement.
     # Lazy scale-down: retire at most one idle builder per reconcile tick.
     builder_scale_down_idle_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        if self.max_reviewers is None:
+            self.max_reviewers = max(2, math.ceil(self.max_builders * 0.75))
 
 
 @dataclass
