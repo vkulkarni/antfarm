@@ -239,24 +239,32 @@ def colony(
             _existing = {}
     _existing["repo_path"] = repo_path
     _existing["integration_branch"] = integration_branch
-    with open(_config_path, "w") as _f:
-        json.dump(_existing, _f, indent=2)
 
     autoscaler_cfg = None
     if autoscaler:
         from antfarm.core.autoscaler import AutoscalerConfig
 
-        autoscaler_cfg = AutoscalerConfig(
-            enabled=True,
-            data_dir=data_dir,
-            colony_url=f"http://127.0.0.1:{port}",
-        )
+        # Pass tuning values at construction time so ``__post_init__`` derives
+        # ``max_reviewers`` from the final ``max_builders`` (issue #347).
+        autoscaler_kwargs: dict = {
+            "enabled": True,
+            "data_dir": data_dir,
+            "colony_url": f"http://127.0.0.1:{port}",
+        }
         if max_builders is not None:
-            autoscaler_cfg.max_builders = max_builders
+            autoscaler_kwargs["max_builders"] = max_builders
         if max_reviewers is not None:
-            autoscaler_cfg.max_reviewers = max_reviewers
+            autoscaler_kwargs["max_reviewers"] = max_reviewers
+        autoscaler_cfg = AutoscalerConfig(**autoscaler_kwargs)
         if auth_token:
             autoscaler_cfg.token = auth_token
+        # Persist autoscaler sizing so daemons reading config.json (doctor,
+        # etc.) see the same effective defaults.
+        _existing["max_builders"] = autoscaler_cfg.max_builders
+        _existing["max_reviewers"] = autoscaler_cfg.max_reviewers
+
+    with open(_config_path, "w") as _f:
+        json.dump(_existing, _f, indent=2)
 
     if multi_node and autoscaler:
         click.echo("Multi-node autoscaler mode enabled (requires remote Runners on each node).")
@@ -852,6 +860,10 @@ def doctor(fix: bool, data_dir: str, sweep_legacy_tmux: bool, yes: bool):
         except (json.JSONDecodeError, OSError):
             config = {}
     config["data_dir"] = data_dir
+    # Default autoscaler sizing used by review_queue_saturated (#347). The
+    # colony command persists these; older colonies won't have them yet.
+    config.setdefault("max_reviewers", 2)
+    config.setdefault("max_builders", 4)
     findings = run_doctor(backend, config, fix=fix)
 
     if not findings:

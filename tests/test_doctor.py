@@ -1979,3 +1979,96 @@ def test_retry_patterns_extracts_last_failure_reason(setup):
     retry = [f for f in findings if f.check == "retry_ceiling"]
     assert len(retry) == 1
     assert "tests failed: ImportError while loading conftest" in retry[0].message
+
+
+# ---------------------------------------------------------------------------
+# check_review_queue_saturated (#347)
+# ---------------------------------------------------------------------------
+
+
+def _seed_done_unreviewed(data_dir: Path, count: int) -> None:
+    """Seed ``count`` done-unreviewed tasks (no merge, no verdict, not infra)."""
+    for i in range(count):
+        _write_task_file(
+            data_dir,
+            "done",
+            f"awaiting-{i}",
+            status="done",
+            attempts=[_att(f"att-{i}", "done")],
+        )
+
+
+def test_check_review_queue_saturated_fires_after_dwell(setup):
+    """5 done-unreviewed, max_reviewers=2 (threshold=4), sidecar 130s old → fires."""
+    from datetime import timedelta
+
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+    config["max_reviewers"] = 2
+
+    _seed_done_unreviewed(data_dir, 5)
+
+    # Pre-populate sidecar with a first_seen_at 130s in the past.
+    sidecar_dir = data_dir / "doctor_state"
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    past = (datetime.now(UTC) - timedelta(seconds=130)).isoformat()
+    (sidecar_dir / "review_saturation.json").write_text(json.dumps({"first_seen_at": past}))
+
+    findings = run_doctor(backend, config, fix=False)
+    saturated = [f for f in findings if f.check == "review_queue_saturated"]
+    assert len(saturated) == 1
+    assert saturated[0].severity == "warning"
+    assert "awaiting review" in saturated[0].message
+
+
+def test_check_review_queue_saturated_silent_below_threshold(setup):
+    """4 done-unreviewed with max_reviewers=2 (threshold=4); 4 !> 4 → no finding."""
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+    config["max_reviewers"] = 2
+
+    _seed_done_unreviewed(data_dir, 4)
+
+    findings = run_doctor(backend, config, fix=False)
+    saturated = [f for f in findings if f.check == "review_queue_saturated"]
+    assert saturated == []
+
+
+def test_check_review_queue_saturated_silent_within_dwell(setup):
+    """Above threshold but first_seen_at only 30s ago → no finding yet."""
+    from datetime import timedelta
+
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+    config["max_reviewers"] = 2
+
+    _seed_done_unreviewed(data_dir, 5)
+
+    sidecar_dir = data_dir / "doctor_state"
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    recent = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+    (sidecar_dir / "review_saturation.json").write_text(json.dumps({"first_seen_at": recent}))
+
+    findings = run_doctor(backend, config, fix=False)
+    saturated = [f for f in findings if f.check == "review_queue_saturated"]
+    assert saturated == []
+
+
+def test_check_review_queue_saturated_clears_sidecar_when_healthy(setup):
+    """Sidecar exists but current state is below threshold → sidecar is removed."""
+    from datetime import timedelta
+
+    backend, config = setup
+    data_dir = Path(config["data_dir"])
+    config["max_reviewers"] = 2
+
+    # No tasks — below threshold.
+    sidecar_dir = data_dir / "doctor_state"
+    sidecar_dir.mkdir(parents=True, exist_ok=True)
+    past = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
+    sidecar_path = sidecar_dir / "review_saturation.json"
+    sidecar_path.write_text(json.dumps({"first_seen_at": past}))
+    assert sidecar_path.exists()
+
+    run_doctor(backend, config, fix=False)
+    assert not sidecar_path.exists()

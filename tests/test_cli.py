@@ -1117,6 +1117,80 @@ def test_cli_colony_multi_node_flag():
 
 
 # ---------------------------------------------------------------------------
+# colony persists autoscaler sizing to config.json (#347)
+# ---------------------------------------------------------------------------
+
+
+def test_colony_persists_autoscaler_config(tmp_path: Path):
+    """colony --autoscaler --max-builders 6 → config.json has max_builders=6, max_reviewers=5."""
+    runner = CliRunner()
+    data_dir = tmp_path / ".antfarm"
+
+    with (
+        patch("uvicorn.run"),
+        patch("antfarm.core.backends.file.FileBackend"),
+        patch("antfarm.core.serve.get_app") as mock_get_app,
+    ):
+        mock_get_app.return_value = MagicMock()
+
+        result = runner.invoke(
+            main,
+            [
+                "colony",
+                "--autoscaler",
+                "--max-builders",
+                "6",
+                "--port",
+                "9002",
+                "--data-dir",
+                str(data_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    config_path = data_dir / "config.json"
+    assert config_path.exists(), "colony should write config.json"
+    config = json.loads(config_path.read_text())
+    assert config["max_builders"] == 6
+    # ceil(6 * 0.75) = 5, floor 2 → 5
+    assert config["max_reviewers"] == 5
+
+
+def test_colony_persists_explicit_max_reviewers(tmp_path: Path):
+    """Explicit --max-reviewers overrides derivation."""
+    runner = CliRunner()
+    data_dir = tmp_path / ".antfarm"
+
+    with (
+        patch("uvicorn.run"),
+        patch("antfarm.core.backends.file.FileBackend"),
+        patch("antfarm.core.serve.get_app") as mock_get_app,
+    ):
+        mock_get_app.return_value = MagicMock()
+
+        result = runner.invoke(
+            main,
+            [
+                "colony",
+                "--autoscaler",
+                "--max-builders",
+                "6",
+                "--max-reviewers",
+                "2",
+                "--port",
+                "9003",
+                "--data-dir",
+                str(data_dir),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+    config = json.loads((data_dir / "config.json").read_text())
+    assert config["max_builders"] == 6
+    assert config["max_reviewers"] == 2
+
+
+# ---------------------------------------------------------------------------
 # plan --carry dependency resolution (#93)
 # ---------------------------------------------------------------------------
 

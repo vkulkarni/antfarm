@@ -1047,3 +1047,30 @@ class TestActiveBuilderNotRetired:
         assert retired is False
         pm.stop.assert_not_called()
         assert "auto-builder-1" in a.managed
+
+
+# ---------------------------------------------------------------------------
+# Derived max_reviewers default (#347)
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedMaxReviewers:
+    def test_config_derives_max_reviewers_from_max_builders(self):
+        """max_builders=4 -> max_reviewers = max(2, ceil(4*0.75)) = 3."""
+        config = AutoscalerConfig(max_builders=4)
+        assert config.max_reviewers == 3
+
+    def test_config_explicit_max_reviewers_respected(self):
+        """Explicit max_reviewers overrides derivation."""
+        config = AutoscalerConfig(max_builders=4, max_reviewers=1)
+        assert config.max_reviewers == 1
+
+    def test_config_derive_floor_is_two(self):
+        """max_builders=1 -> max_reviewers = max(2, ceil(1*0.75)) = 2 (floor)."""
+        config = AutoscalerConfig(max_builders=1)
+        assert config.max_reviewers == 2
+
+    def test_config_derive_max_builders_eight(self):
+        """max_builders=8 -> max_reviewers = max(2, ceil(8*0.75)) = 6."""
+        config = AutoscalerConfig(max_builders=8)
+        assert config.max_reviewers == 6
