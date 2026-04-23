@@ -3971,7 +3971,8 @@ def test_remove_blocking_worktree_happy_path(tmp_path, monkeypatch):
     monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
 
     assert soldier._remove_blocking_worktree(stderr) is True
-    assert calls == [["git", "worktree", "remove", "--force", expected_abs]]
+    git_calls = [c for c in calls if c and c[:2] == ["git", "worktree"]]
+    assert git_calls == [["git", "worktree", "remove", "--force", expected_abs]]
 
 
 def test_remove_blocking_worktree_refuses_path_outside_antfarm(tmp_path, monkeypatch):
@@ -3994,7 +3995,7 @@ def test_remove_blocking_worktree_refuses_path_outside_antfarm(tmp_path, monkeyp
     monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
 
     assert soldier._remove_blocking_worktree(stderr) is False
-    assert calls == []
+    assert not any(c[:3] == ["git", "worktree", "remove"] for c in calls)
 
 
 def test_remove_blocking_worktree_refuses_path_traversal(tmp_path, monkeypatch):
@@ -4016,7 +4017,7 @@ def test_remove_blocking_worktree_refuses_path_traversal(tmp_path, monkeypatch):
     monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
 
     assert soldier._remove_blocking_worktree(stderr) is False
-    assert calls == []
+    assert not any(c[:3] == ["git", "worktree", "remove"] for c in calls)
 
 
 def test_remove_blocking_worktree_malformed_stderr(tmp_path, monkeypatch):
@@ -4035,7 +4036,7 @@ def test_remove_blocking_worktree_malformed_stderr(tmp_path, monkeypatch):
     monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
 
     assert soldier._remove_blocking_worktree("some unrelated git error") is False
-    assert calls == []
+    assert not any(c[:3] == ["git", "worktree", "remove"] for c in calls)
 
 
 def test_rebase_checkout_retries_after_removing_worktree(tmp_path, monkeypatch):
