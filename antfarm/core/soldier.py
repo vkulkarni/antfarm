@@ -1328,6 +1328,39 @@ class Soldier:
             check=False,
         )
 
+    def _delete_local_branch_with_reclaim(self, branch: str) -> bool:
+        """Delete a local branch, reclaiming any blocking antfarm worktree.
+
+        Runs ``git branch -D <branch>`` in the soldier clone. If the delete
+        fails because the branch is checked out in an antfarm-managed
+        worktree (``used by worktree at '<path>'``), invokes
+        ``_remove_blocking_worktree`` and retries exactly once.
+
+        Best-effort: returns True iff the branch is gone after this call.
+        Callers use the return value for logging only — a False result must
+        never abort the surrounding merge-success flow (#360).
+        """
+        r = subprocess.run(
+            ["git", "branch", "-D", branch],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode == 0:
+            return True
+        stderr = r.stderr.decode(errors="replace") if r.stderr else ""
+        if "used by worktree at" not in stderr:
+            return False
+        if not self._remove_blocking_worktree(stderr):
+            return False
+        retry = subprocess.run(
+            ["git", "branch", "-D", branch],
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        return retry.returncode == 0
+
     def _remove_blocking_worktree(self, stderr: str) -> bool:
         """Parse a 'branch already used by worktree at <path>' stderr message
         and, if the path is an antfarm-managed worktree, remove it with
@@ -1340,7 +1373,7 @@ class Soldier:
         and the workspaces root itself) is refused without invoking
         ``git worktree remove``. See #349.
         """
-        match = re.search(r"is already used by worktree at '([^']+)'", stderr)
+        match = re.search(r"used by worktree at '([^']+)'", stderr)
         if not match:
             return False
 
@@ -2111,14 +2144,29 @@ class Soldier:
             return None
         return parse_pr_state(r.stdout or "")
 
-    def _gh_pr_merge_squash(self, pr: str) -> tuple[bool, str]:
-        """Run ``gh pr merge <pr> --squash --delete-branch``.
+    def _gh_pr_merge_squash(self, pr: str, branch: str | None = None) -> tuple[bool, str]:
+        """Run ``gh pr merge <pr> --squash`` and clean up the branch separately.
+
+        Auto-merge flow (#360): the squash-merge and the branch-delete are
+        decoupled so a branch cleanup hiccup (local branch checked out in a
+        stale antfarm worktree, or remote already gone) never poisons an
+        already-successful remote merge. Cleanup is best-effort.
 
         Returns (ok, stderr_tail). Never raises.
+
+        Behavior:
+        - ``gh pr merge --squash`` returncode 0 → success; attempt branch
+          cleanup, then return ``(True, "")`` regardless of cleanup outcome.
+        - Non-zero gh exit → consult ``_check_pr_merged_on_origin`` because
+          gh sometimes exits non-zero after the remote merge already
+          landed (flaky follow-up calls, auth races). When the origin
+          confirms MERGED, emit ``auto_merge_gh_nonzero_but_merged``,
+          attempt branch cleanup, and return ``(True, "")``. Otherwise
+          surface the failure normally.
         """
         try:
             r = subprocess.run(
-                ["gh", "pr", "merge", pr, "--squash", "--delete-branch"],
+                ["gh", "pr", "merge", pr, "--squash"],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
@@ -2127,10 +2175,62 @@ class Soldier:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return False, f"gh pr merge exec error: {exc}"
-        if r.returncode == 0:
-            return True, ""
-        tail = (r.stderr or r.stdout or "").strip().splitlines()
-        return False, "\n".join(tail[-20:])
+
+        if r.returncode != 0:
+            # gh non-zero exits can race with successful remote merges.
+            # Re-check origin state before kicking the task back.
+            tail = (r.stderr or r.stdout or "").strip().splitlines()
+            stderr_tail = "\n".join(tail[-20:])
+            merged = self._check_pr_merged_on_origin(pr)
+            if merged is True:
+                _emit(
+                    "auto_merge_gh_nonzero_but_merged",
+                    "",
+                    f"pr={pr} stderr_tail={stderr_tail!r}",
+                )
+                self._cleanup_merged_branch(branch)
+                return True, ""
+            return False, stderr_tail
+
+        self._cleanup_merged_branch(branch)
+        return True, ""
+
+    def _cleanup_merged_branch(self, branch: str | None) -> None:
+        """Best-effort local + remote branch deletion after a squash-merge.
+
+        Never raises. All subprocess errors (including ``TimeoutExpired``)
+        are swallowed — by the time we get here the remote merge already
+        landed and we must not let janitorial noise surface as a failure
+        (#360).
+        """
+        if not branch:
+            return
+        try:
+            self._delete_local_branch_with_reclaim(branch)
+        except Exception:
+            logger.debug(
+                "auto-merge: local branch delete raised for %r",
+                branch,
+                exc_info=True,
+            )
+        try:
+            subprocess.run(
+                ["git", "push", "origin", "--delete", branch],
+                cwd=self.repo_path,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug(
+                "auto-merge: remote branch delete timed out for %r", branch
+            )
+        except Exception:
+            logger.debug(
+                "auto-merge: remote branch delete raised for %r",
+                branch,
+                exc_info=True,
+            )
 
     def _resolve_repo_slug(self) -> str | None:
         """Return ``owner/name`` for the repo we're operating on, or None."""
@@ -2378,7 +2478,8 @@ class Soldier:
         attempt_id = task.get("current_attempt") or ""
 
         if outcome.action == "merge":
-            ok, stderr_tail = self._gh_pr_merge_squash(outcome.pr)
+            branch = self._get_attempt_branch(task)
+            ok, stderr_tail = self._gh_pr_merge_squash(outcome.pr, branch=branch)
             if not ok:
                 self.last_failure_reason = f"auto_merge: gh pr merge failed: {stderr_tail}"
                 _emit(

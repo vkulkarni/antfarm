@@ -4086,6 +4086,39 @@ def test_remove_blocking_worktree_malformed_stderr(tmp_path, monkeypatch):
     assert not any(c[:3] == ["git", "worktree", "remove"] for c in calls)
 
 
+def test_remove_blocking_worktree_matches_git_branch_d_phrasing(tmp_path, monkeypatch):
+    """``git branch -D`` emits ``used by worktree at '<path>'`` without the
+    ``is already`` prefix that ``git checkout`` uses. The widened regex (#360)
+    must match both phrasings so the reclaim path fires for branch-delete
+    failures too."""
+    import os as _os
+    import subprocess as _sp
+
+    soldier = _build_bare_soldier(tmp_path)
+
+    blocked_path = _os.path.join(str(tmp_path), ".antfarm", "workspaces", "task-bd-att-001")
+    _os.makedirs(blocked_path, exist_ok=True)
+    expected_abs = _os.path.realpath(blocked_path)
+
+    # ``git branch -D`` phrasing — note: no "is already" prefix.
+    stderr = (
+        f"error: cannot delete branch 'feat/task-bd' checked out at '{blocked_path}'\n"
+        f"error: cannot delete branch 'feat/task-bd' used by worktree at '{blocked_path}'\n"
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(soldier_module.subprocess, "run", fake_run)
+
+    assert soldier._remove_blocking_worktree(stderr) is True
+    git_calls = [c for c in calls if c and c[:2] == ["git", "worktree"]]
+    assert git_calls == [["git", "worktree", "remove", "--force", expected_abs]]
+
+
 def test_rebase_checkout_retries_after_removing_worktree(tmp_path, monkeypatch):
     """Integration: first checkout -B fails with the worktree-collision
     sentinel, the helper reclaims the worktree, and the retry succeeds
