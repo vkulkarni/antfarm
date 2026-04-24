@@ -8,10 +8,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 - feat(doctor): warn when review queue saturates (awaiting > max_reviewers*2 for 2min+) (#347)
+- feat(doctor): `check_stale_worktrees` auto-prunes antfarm worktrees by task lifecycle + TTL; `--keep-worktree` flag exempts paths; config keys `worktree_prune_ttl_days` (7d) and `worktree_prune_merged_min_age_hours` (24h) (#352)
+- feat(mission,soldier): `--auto-merge {never,on-review-pass,on-review-pass-and-ci-green}` invokes `gh pr merge --squash --delete-branch` when review passes (and CI green in strict mode); security guard requires ADMIN on main/master or `--allow-auto-merge-on-external`; new `mission update` subcommand for runtime toggle (#353)
+- feat(mission,queen): `--max-cost-usd` / `--max-tokens` / `--budget-action {pause,cancel}` tripwires; Queen pauses or cancels missions on breach; `mission extend` resumes paused missions; Claude Code `Stop` hook reports usage via `POST /workers/{id}/usage` (#354)
 
 ### Fixed
 - fix(soldier): reclaim blocking antfarm worktree when rebase checkout collides (#349)
 - fix(autoscaler): default max_reviewers now derives from max_builders (ceil(0.75x), floor 2) (#347)
+- fix(soldier): seven remaining `git checkout` call sites in `attempt_merge` and `_rebase_and_retry_merge` now use the same reclaim-and-retry wrapper; `_cleanup` intentionally left unwrapped (finally-block contract) (#352)
 
 ## [0.6.13] - 2026-04-21
 
