@@ -219,3 +219,58 @@ def test_is_infra_task_review_prefix():
 def test_is_infra_task_builder():
     assert is_infra_task({"id": "task-001", "capabilities_required": ["build"]}) is False
     assert is_infra_task({"id": "task-001"}) is False
+
+
+# ---------------------------------------------------------------------------
+# Auto-merge config (#353)
+# ---------------------------------------------------------------------------
+
+
+def test_mission_config_default_auto_merge_never():
+    config = MissionConfig()
+    assert config.auto_merge == "never"
+    assert config.allow_auto_merge_on_external is False
+
+
+def test_mission_config_accepts_valid_auto_merge_modes():
+    for mode in ("never", "on-review-pass", "on-review-pass-and-ci-green"):
+        config = MissionConfig(auto_merge=mode)
+        assert config.auto_merge == mode
+
+
+def test_mission_config_rejects_invalid_auto_merge():
+    with pytest.raises(ValueError, match="auto_merge must be one of"):
+        MissionConfig(auto_merge="on-friday")
+
+
+def test_mission_config_roundtrip_includes_auto_merge_fields():
+    config = MissionConfig(
+        auto_merge="on-review-pass-and-ci-green",
+        allow_auto_merge_on_external=True,
+    )
+    d = config.to_dict()
+    assert d["auto_merge"] == "on-review-pass-and-ci-green"
+    assert d["allow_auto_merge_on_external"] is True
+    restored = MissionConfig.from_dict(d)
+    assert restored.auto_merge == "on-review-pass-and-ci-green"
+    assert restored.allow_auto_merge_on_external is True
+    assert restored == config
+
+
+def test_mission_report_roundtrip_includes_auto_merge_counts():
+    report = _make_mission_report()
+    report.auto_merged_tasks = 2
+    report.manual_merged_tasks = 1
+    d = report.to_dict()
+    assert d["auto_merged_tasks"] == 2
+    assert d["manual_merged_tasks"] == 1
+    restored = MissionReport.from_dict(d)
+    assert restored.auto_merged_tasks == 2
+    assert restored.manual_merged_tasks == 1
+    assert restored == report
+
+
+def test_mission_report_defaults_auto_merge_counts_zero():
+    report = _make_mission_report()
+    assert report.auto_merged_tasks == 0
+    assert report.manual_merged_tasks == 0

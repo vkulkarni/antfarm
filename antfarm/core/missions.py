@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 VALID_COMPLETION_MODES = ("best_effort", "all_or_nothing")
 VALID_BLOCKED_TIMEOUT_ACTIONS = ("wait", "fail")
+VALID_AUTO_MERGE_MODES = ("never", "on-review-pass", "on-review-pass-and-ci-green")
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,8 @@ class MissionConfig:
     integration_branch: str = "main"
     blocked_timeout_action: str = "wait"
     blocked_timeout_minutes: int = 120
+    auto_merge: str = "never"
+    allow_auto_merge_on_external: bool = False
 
     def __post_init__(self) -> None:
         if self.completion_mode not in VALID_COMPLETION_MODES:
@@ -60,6 +63,8 @@ class MissionConfig:
             raise ValueError(
                 f"blocked_timeout_action must be one of {VALID_BLOCKED_TIMEOUT_ACTIONS}"
             )
+        if self.auto_merge not in VALID_AUTO_MERGE_MODES:
+            raise ValueError(f"auto_merge must be one of {VALID_AUTO_MERGE_MODES}")
 
     def to_dict(self) -> dict:
         return {
@@ -72,6 +77,8 @@ class MissionConfig:
             "integration_branch": self.integration_branch,
             "blocked_timeout_action": self.blocked_timeout_action,
             "blocked_timeout_minutes": self.blocked_timeout_minutes,
+            "auto_merge": self.auto_merge,
+            "allow_auto_merge_on_external": self.allow_auto_merge_on_external,
         }
 
     @classmethod
@@ -88,6 +95,8 @@ class MissionConfig:
             integration_branch=data.get("integration_branch", "main"),
             blocked_timeout_action=data.get("blocked_timeout_action", "wait"),
             blocked_timeout_minutes=data.get("blocked_timeout_minutes", 120),
+            auto_merge=data.get("auto_merge", "never"),
+            allow_auto_merge_on_external=data.get("allow_auto_merge_on_external", False),
         )
 
 
@@ -221,6 +230,8 @@ class MissionReport:
     total_lines_removed: int = 0
     files_changed: list[str] = field(default_factory=list)
     generated_at: str = ""
+    auto_merged_tasks: int = 0
+    manual_merged_tasks: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -242,6 +253,8 @@ class MissionReport:
             "total_lines_removed": self.total_lines_removed,
             "files_changed": list(self.files_changed),
             "generated_at": self.generated_at,
+            "auto_merged_tasks": self.auto_merged_tasks,
+            "manual_merged_tasks": self.manual_merged_tasks,
         }
 
     @classmethod
@@ -265,6 +278,8 @@ class MissionReport:
             total_lines_removed=data.get("total_lines_removed", 0),
             files_changed=list(data.get("files_changed", [])),
             generated_at=data.get("generated_at", ""),
+            auto_merged_tasks=data.get("auto_merged_tasks", 0),
+            manual_merged_tasks=data.get("manual_merged_tasks", 0),
         )
 
 

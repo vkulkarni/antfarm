@@ -137,15 +137,17 @@ def test_build_report_all_merged():
         _make_task(
             "task-002",
             title="Widget B",
-            attempts=[_make_attempt(
-                attempt_id="att-002",
-                artifact=_make_artifact(
-                    pr_url="https://github.com/org/repo/pull/2",
-                    lines_added=30,
-                    lines_removed=5,
-                    files_changed=["src/other.py"],
-                ),
-            )],
+            attempts=[
+                _make_attempt(
+                    attempt_id="att-002",
+                    artifact=_make_artifact(
+                        pr_url="https://github.com/org/repo/pull/2",
+                        lines_added=30,
+                        lines_removed=5,
+                        files_changed=["src/other.py"],
+                    ),
+                )
+            ],
         ),
     ]
     mission = _make_mission(task_ids=["task-001", "task-002"])
@@ -219,10 +221,12 @@ def test_build_report_aggregates_lines_added_removed():
         ),
         _make_task(
             "task-002",
-            attempts=[_make_attempt(
-                attempt_id="att-002",
-                artifact=_make_artifact(lines_added=200, lines_removed=50),
-            )],
+            attempts=[
+                _make_attempt(
+                    attempt_id="att-002",
+                    artifact=_make_artifact(lines_added=200, lines_removed=50),
+                )
+            ],
         ),
     ]
     mission = _make_mission(task_ids=["task-001", "task-002"])
@@ -240,16 +244,22 @@ def test_build_report_collects_pr_urls_from_artifacts():
     tasks = [
         _make_task(
             "task-001",
-            attempts=[_make_attempt(artifact=_make_artifact(
-                pr_url="https://github.com/org/repo/pull/1",
-            ))],
+            attempts=[
+                _make_attempt(
+                    artifact=_make_artifact(
+                        pr_url="https://github.com/org/repo/pull/1",
+                    )
+                )
+            ],
         ),
         _make_task(
             "task-002",
-            attempts=[_make_attempt(
-                attempt_id="att-002",
-                artifact=_make_artifact(pr_url="https://github.com/org/repo/pull/2"),
-            )],
+            attempts=[
+                _make_attempt(
+                    attempt_id="att-002",
+                    artifact=_make_artifact(pr_url="https://github.com/org/repo/pull/2"),
+                )
+            ],
         ),
     ]
     mission = _make_mission(task_ids=["task-001", "task-002"])
@@ -375,8 +385,7 @@ def test_render_terminal_no_rich_import():
         [
             sys.executable,
             "-c",
-            "import antfarm.core.report; import sys; "
-            "sys.exit(1 if 'rich' in sys.modules else 0)",
+            "import antfarm.core.report; import sys; sys.exit(1 if 'rich' in sys.modules else 0)",
         ],
         capture_output=True,
         text=True,
@@ -478,10 +487,12 @@ def test_cancelled_mission_report_includes_completed_tasks():
         _make_task(
             f"task-{i:03d}",
             title=f"Task {i}",
-            attempts=[_make_attempt(
-                attempt_id=f"att-{i:03d}",
-                artifact=_make_artifact(pr_url=f"https://github.com/pr/{i}"),
-            )],
+            attempts=[
+                _make_attempt(
+                    attempt_id=f"att-{i:03d}",
+                    artifact=_make_artifact(pr_url=f"https://github.com/pr/{i}"),
+                )
+            ],
         )
         for i in range(1, 4)  # 3 merged
     ] + [
@@ -563,3 +574,62 @@ def test_report_distinguishes_system_vs_review_prefix():
     reasons = [b.reason for b in report.blocked]
     assert any(r.startswith("system: ") for r in reasons)
     assert any(r.startswith("review: ") for r in reasons)
+
+
+# ---------------------------------------------------------------------------
+# Auto-merged vs manual-merged counts (#353)
+# ---------------------------------------------------------------------------
+
+
+def test_build_report_counts_auto_and_manual_merges_separately():
+    tasks = [
+        _make_task(
+            "task-001",
+            title="Auto-merged work",
+            attempts=[
+                {
+                    "attempt_id": "att-001",
+                    "worker_id": "w1",
+                    "status": "merged",
+                    "branch": "feat/task-001",
+                    "pr": None,
+                    "started_at": "2026-04-01T00:00:00Z",
+                    "completed_at": "2026-04-01T00:30:00Z",
+                    "artifact": _make_artifact(lines_added=20, lines_removed=5),
+                    "auto_merged": True,
+                }
+            ],
+        ),
+        _make_task(
+            "task-002",
+            title="Manual-merged work",
+            attempts=[
+                _make_attempt(
+                    attempt_id="att-002",
+                    artifact=_make_artifact(
+                        pr_url="https://github.com/org/repo/pull/2",
+                        lines_added=10,
+                        lines_removed=3,
+                    ),
+                )
+            ],
+        ),
+    ]
+    mission = _make_mission(task_ids=["task-001", "task-002"])
+    report = build_report(mission, tasks)
+    assert report.merged_tasks == 2
+    assert report.auto_merged_tasks == 1
+    assert report.manual_merged_tasks == 1
+
+
+def test_build_report_all_manual_when_no_auto_merged_flag():
+    tasks = [
+        _make_task(
+            "task-001",
+            attempts=[_make_attempt(artifact=_make_artifact())],
+        ),
+    ]
+    mission = _make_mission(task_ids=["task-001"])
+    report = build_report(mission, tasks)
+    assert report.auto_merged_tasks == 0
+    assert report.manual_merged_tasks == 1
