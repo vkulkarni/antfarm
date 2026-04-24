@@ -121,10 +121,10 @@ def test_on_review_pass_clean_triggers_gh_merge(monkeypatch):
     # Auto-merge security gate: simulate ADMIN on main.
     monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
     monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
-    merge_calls: list[str] = []
+    merge_calls: list[tuple[str, str | None]] = []
 
-    def fake_merge(pr: str):
-        merge_calls.append(pr)
+    def fake_merge(pr: str, branch: str | None = None):
+        merge_calls.append((pr, branch))
         return True, ""
 
     monkeypatch.setattr(s, "_gh_pr_merge_squash", fake_merge)
@@ -137,7 +137,7 @@ def test_on_review_pass_clean_triggers_gh_merge(monkeypatch):
 
     result = s._handle_auto_merge_outcome(outcome, task)
     assert result == MergeResult.MERGED
-    assert merge_calls == ["https://github.com/org/repo/pull/1"]
+    assert merge_calls == [("https://github.com/org/repo/pull/1", "feat/task-1")]
     # mark_merged should receive auto_merged=True
     s.colony.mark_merged.assert_called_once_with("task-1", "att-1", auto_merged=True)
 
@@ -157,7 +157,7 @@ def test_on_review_pass_unstable_merges_ci_agnostic(monkeypatch):
     )
     monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
     monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
-    monkeypatch.setattr(s, "_gh_pr_merge_squash", lambda pr: (True, ""))
+    monkeypatch.setattr(s, "_gh_pr_merge_squash", lambda pr, branch=None: (True, ""))
     monkeypatch.setattr(s, "_sync_integration_branch_after_auto_merge", lambda: None)
 
     outcome = s._attempt_auto_merge(_task())
@@ -377,7 +377,7 @@ def test_emits_auto_merged_event_on_success(monkeypatch):
     )
     monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
     monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
-    monkeypatch.setattr(s, "_gh_pr_merge_squash", lambda pr: (True, ""))
+    monkeypatch.setattr(s, "_gh_pr_merge_squash", lambda pr, branch=None: (True, ""))
     monkeypatch.setattr(s, "_sync_integration_branch_after_auto_merge", lambda: None)
 
     emitted = []
@@ -434,7 +434,9 @@ def test_gh_pr_merge_failure_returns_failed(monkeypatch):
     )
     monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
     monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
-    monkeypatch.setattr(s, "_gh_pr_merge_squash", lambda pr: (False, "remote rejected"))
+    monkeypatch.setattr(
+        s, "_gh_pr_merge_squash", lambda pr, branch=None: (False, "remote rejected")
+    )
 
     task = _task()
     outcome = s._attempt_auto_merge(task)
@@ -531,6 +533,254 @@ def test_mission_without_auto_merge_key_is_never():
     s.colony.get_mission.return_value = {"mission_id": "m", "status": "building", "config": {}}
     outcome = s._attempt_auto_merge(_task())
     assert outcome is None
+
+
+# ---------------------------------------------------------------------------
+# #360: _gh_pr_merge_squash decouples remote merge from branch cleanup.
+#
+# The helper now runs ``gh pr merge --squash`` without ``--delete-branch`` and
+# drives local + remote branch deletes itself, so a janky cleanup (worktree
+# collision, remote already gone) never turns a successful merge into a
+# kickback. Regression tests for each branch of the new contract.
+# ---------------------------------------------------------------------------
+
+
+def _make_soldier_for_gh() -> Soldier:
+    """Bare soldier suitable for exercising ``_gh_pr_merge_squash`` directly."""
+    s = Soldier.__new__(Soldier)
+    s.colony = MagicMock()
+    s.colony_url = ""
+    s.repo_path = "/fake/repo"
+    s.integration_branch = "main"
+    s.test_command = ["true"]
+    s.poll_interval = 0.0
+    s.require_review = True
+    s.poll_external_merges = False
+    s.data_dir_name = ".antfarm"
+    s.last_failure_reason = ""
+    s._event_cursor = 0
+    s._preflight_done = True
+    s._auto_merge_last_checked = {}
+    s._repo_permission_cache = {}
+    s.auto_merge_poll_backoff_seconds = 30.0
+    return s
+
+
+def test_gh_pr_merge_squash_success_with_branch(monkeypatch):
+    """gh returns 0 → branch-delete attempts are issued (both local + remote)
+    but their failures are swallowed; helper returns (True, "")."""
+    s = _make_soldier_for_gh()
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        # Both local and remote deletes simulate failures — must be tolerated.
+        if cmd[:3] == ["git", "branch", "-D"]:
+            return SimpleNamespace(
+                returncode=1,
+                stdout=b"",
+                stderr=b"error: branch 'feat/x' not found.\n",
+            )
+        if cmd[:4] == ["git", "push", "origin", "--delete"]:
+            return SimpleNamespace(
+                returncode=1,
+                stdout=b"",
+                stderr=b"error: unable to delete 'feat/x': remote ref does not exist\n",
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ok, tail = s._gh_pr_merge_squash("PR-1", branch="feat/x")
+    assert ok is True
+    assert tail == ""
+    # gh invocation must NOT include --delete-branch.
+    gh_cmds = [c for c in calls if c[:3] == ["gh", "pr", "merge"]]
+    assert gh_cmds and "--delete-branch" not in gh_cmds[0]
+    # Cleanup attempts were made despite failures.
+    assert any(c[:3] == ["git", "branch", "-D"] for c in calls)
+    assert any(c[:4] == ["git", "push", "origin", "--delete"] for c in calls)
+
+
+def test_gh_pr_merge_squash_local_branch_delete_reclaim(monkeypatch):
+    """gh 0 → local ``git branch -D`` first fails with 'used by worktree at',
+    reclaim path runs, retry succeeds; helper still returns (True, "")."""
+    s = _make_soldier_for_gh()
+
+    branch_delete_calls = {"n": 0}
+    reclaim_calls: list[str] = []
+
+    def fake_reclaim(stderr: str) -> bool:
+        reclaim_calls.append(stderr)
+        return True
+
+    monkeypatch.setattr(s, "_remove_blocking_worktree", fake_reclaim)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["git", "branch", "-D"]:
+            branch_delete_calls["n"] += 1
+            if branch_delete_calls["n"] == 1:
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout=b"",
+                    stderr=(
+                        b"error: cannot delete branch 'feat/x' used by worktree "
+                        b"at '/fake/repo/.antfarm/workspaces/task-x-att-001'\n"
+                    ),
+                )
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if cmd[:4] == ["git", "push", "origin", "--delete"]:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ok, tail = s._gh_pr_merge_squash("PR-1", branch="feat/x")
+    assert ok is True
+    assert tail == ""
+    assert reclaim_calls, "reclaim helper should have been invoked"
+    assert branch_delete_calls["n"] == 2  # initial fail + retry success
+
+
+def test_gh_pr_merge_squash_local_branch_delete_unrelated_error(monkeypatch):
+    """gh 0 → local ``git branch -D`` fails with a non-worktree stderr.
+    No reclaim attempted. Helper still returns (True, "")."""
+    s = _make_soldier_for_gh()
+
+    reclaim_calls: list[str] = []
+    monkeypatch.setattr(
+        s,
+        "_remove_blocking_worktree",
+        lambda stderr: reclaim_calls.append(stderr) or True,
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["git", "branch", "-D"]:
+            return SimpleNamespace(
+                returncode=1,
+                stdout=b"",
+                stderr=b"error: branch 'feat/x' not found.\n",
+            )
+        if cmd[:4] == ["git", "push", "origin", "--delete"]:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ok, tail = s._gh_pr_merge_squash("PR-1", branch="feat/x")
+    assert ok is True
+    assert tail == ""
+    # Non-worktree stderr must NOT route through the reclaim helper.
+    assert reclaim_calls == []
+
+
+def test_gh_pr_merge_squash_nonzero_but_merged(monkeypatch):
+    """gh returns 1 but origin reports MERGED → treat as success.
+
+    Emits ``auto_merge_gh_nonzero_but_merged`` and still attempts branch
+    cleanup. Returns (True, "")."""
+    s = _make_soldier_for_gh()
+
+    monkeypatch.setattr(s, "_check_pr_merged_on_origin", lambda pr: True)
+
+    cleanup_calls: list[tuple] = []
+
+    def fake_cleanup(branch):
+        cleanup_calls.append(("cleanup", branch))
+
+    monkeypatch.setattr(s, "_cleanup_merged_branch", fake_cleanup)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="already merged or transient"
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    emitted: list[tuple[str, str, str]] = []
+
+    def fake_emit(event_type, task_id, detail="", actor="soldier"):
+        emitted.append((event_type, task_id, detail))
+
+    with patch("antfarm.core.serve._emit_event", side_effect=fake_emit):
+        ok, tail = s._gh_pr_merge_squash("PR-1", branch="feat/x")
+
+    assert ok is True
+    assert tail == ""
+    assert any(e[0] == "auto_merge_gh_nonzero_but_merged" for e in emitted)
+    assert cleanup_calls == [("cleanup", "feat/x")]
+
+
+def test_gh_pr_merge_squash_nonzero_not_merged(monkeypatch):
+    """gh returns 1 and origin reports OPEN → surface failure with tail."""
+    s = _make_soldier_for_gh()
+    monkeypatch.setattr(s, "_check_pr_merged_on_origin", lambda pr: False)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="remote rejected\nbecause reasons\n"
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ok, tail = s._gh_pr_merge_squash("PR-1", branch="feat/x")
+    assert ok is False
+    assert "remote rejected" in tail
+
+
+def test_gh_pr_merge_squash_nonzero_state_unknown(monkeypatch):
+    """gh returns 1 and origin state is unknown (None) → conservative FAIL."""
+    s = _make_soldier_for_gh()
+    monkeypatch.setattr(s, "_check_pr_merged_on_origin", lambda pr: None)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="network blip"
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ok, tail = s._gh_pr_merge_squash("PR-1", branch="feat/x")
+    assert ok is False
+    assert "network blip" in tail
+
+
+def test_gh_pr_merge_squash_remote_branch_delete_fails(monkeypatch):
+    """gh 0 → local delete OK, ``git push origin --delete`` fails; still
+    returns (True, "") — cleanup must never poison a successful merge."""
+    s = _make_soldier_for_gh()
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["git", "branch", "-D"]:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if cmd[:4] == ["git", "push", "origin", "--delete"]:
+            return SimpleNamespace(
+                returncode=1,
+                stdout=b"",
+                stderr=b"error: unable to delete 'feat/x': remote ref does not exist\n",
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    ok, tail = s._gh_pr_merge_squash("PR-1", branch="feat/x")
+    assert ok is True
+    assert tail == ""
 
 
 if __name__ == "__main__":
