@@ -707,17 +707,13 @@ class Soldier:
                 return MergeResult.FAILED
 
             # Create temp branch from integration branch
-            r = subprocess.run(
+            r = self._checkout_with_reclaim(
                 [
-                    "git",
                     "checkout",
                     "-b",
                     temp_branch,
                     f"origin/{self.integration_branch}",
-                ],
-                cwd=self.repo_path,
-                capture_output=True,
-                check=False,
+                ]
             )
             if r.returncode != 0:
                 self.last_failure_reason = (
@@ -776,12 +772,7 @@ class Soldier:
                 return MergeResult.FAILED
 
             # Fast-forward integration branch
-            r = subprocess.run(
-                ["git", "checkout", self.integration_branch],
-                cwd=self.repo_path,
-                capture_output=True,
-                check=False,
-            )
+            r = self._checkout_with_reclaim(["checkout", self.integration_branch])
             if r.returncode != 0:
                 self.last_failure_reason = (
                     f"could not checkout {self.integration_branch}: {r.stderr.decode().strip()}"
@@ -981,20 +972,7 @@ class Soldier:
         # #349), git refuses the checkout with
         # ``is already used by worktree at '<path>'``. Reclaim that single
         # worktree and retry the checkout exactly once.
-        checkout_cmd = ["git", "checkout", "-B", branch, f"origin/{branch}"]
-        r = subprocess.run(
-            checkout_cmd,
-            cwd=self.repo_path,
-            capture_output=True,
-            check=False,
-        )
-        if r.returncode != 0 and self._remove_blocking_worktree(r.stderr.decode()):
-            r = subprocess.run(
-                checkout_cmd,
-                cwd=self.repo_path,
-                capture_output=True,
-                check=False,
-            )
+        r = self._checkout_with_reclaim(["checkout", "-B", branch, f"origin/{branch}"])
         if r.returncode != 0:
             self.last_failure_reason = (
                 f"rebase_failed: cannot checkout {branch}: {r.stderr.decode().strip()}"
@@ -1040,23 +1018,15 @@ class Soldier:
 
         # 6) Recreate the temp branch from latest origin/<integration_branch>.
         # Delete any local temp branch first so checkout -b won't fail.
-        subprocess.run(
-            ["git", "checkout", self.integration_branch],
-            cwd=self.repo_path,
-            capture_output=True,
-            check=False,
-        )
+        self._checkout_with_reclaim(["checkout", self.integration_branch])
         subprocess.run(
             ["git", "branch", "-D", temp_branch],
             cwd=self.repo_path,
             capture_output=True,
             check=False,
         )
-        r = subprocess.run(
-            ["git", "checkout", "-b", temp_branch, f"origin/{self.integration_branch}"],
-            cwd=self.repo_path,
-            capture_output=True,
-            check=False,
+        r = self._checkout_with_reclaim(
+            ["checkout", "-b", temp_branch, f"origin/{self.integration_branch}"]
         )
         if r.returncode != 0:
             self.last_failure_reason = (
@@ -1101,12 +1071,7 @@ class Soldier:
             return MergeResult.FAILED
 
         # 9) Fast-forward integration branch.
-        r = subprocess.run(
-            ["git", "checkout", self.integration_branch],
-            cwd=self.repo_path,
-            capture_output=True,
-            check=False,
-        )
+        r = self._checkout_with_reclaim(["checkout", self.integration_branch])
         if r.returncode != 0:
             self.last_failure_reason = (
                 f"could not checkout {self.integration_branch}: {r.stderr.decode().strip()}"
@@ -1259,6 +1224,37 @@ class Soldier:
             f"cmd={' '.join(self.test_command)} stderr=\n{tail}",
         )
 
+    def _checkout_with_reclaim(self, args: list[str]) -> subprocess.CompletedProcess:
+        """Run ``git <args>`` once; on a worktree-collision failure, reclaim
+        the blocking worktree via ``_remove_blocking_worktree`` and retry the
+        same command exactly once. Returns the final CompletedProcess.
+
+        This is the single chokepoint for every checkout Soldier performs in
+        the shared clone — a stale antfarm-managed worktree holding the
+        target branch would otherwise fail the checkout with ``is already
+        used by worktree at '<path>'`` (#352). Callers emit their own
+        diagnostic events; this helper only runs git and swallows nothing.
+        """
+        r = subprocess.run(
+            ["git"] + args,
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+        if r.returncode == 0:
+            return r
+        stderr = r.stderr.decode(errors="replace") if r.stderr else ""
+        if "is already used by worktree" not in stderr:
+            return r
+        if not self._remove_blocking_worktree(stderr):
+            return r
+        return subprocess.run(
+            ["git"] + args,
+            cwd=self.repo_path,
+            capture_output=True,
+            check=False,
+        )
+
     def _remove_blocking_worktree(self, stderr: str) -> bool:
         """Parse a 'branch already used by worktree at <path>' stderr message
         and, if the path is an antfarm-managed worktree, remove it with
@@ -1345,12 +1341,12 @@ class Soldier:
                 capture_output=True,
                 check=True,
             )
-            subprocess.run(
-                ["git", "checkout", self.integration_branch],
-                cwd=self.repo_path,
-                capture_output=True,
-                check=True,
-            )
+            # Checkout wrapped with reclaim so a stale antfarm-managed
+            # worktree holding the integration branch cannot perma-break
+            # recovery (#352). If reclaim+retry still fails, return False.
+            r = self._checkout_with_reclaim(["checkout", self.integration_branch])
+            if r.returncode != 0:
+                return False
             try:
                 subprocess.run(
                     ["git", "reset", "--hard", f"origin/{self.integration_branch}"],
@@ -1429,6 +1425,13 @@ class Soldier:
             check=False,
         )
         # 3) Return to integration branch.
+        # NOTE: intentionally NOT wrapped with _checkout_with_reclaim (#352).
+        # _cleanup runs inside a finally block and must never raise or propagate
+        # failures; reclaim emits SSE events and calls git worktree remove,
+        # either of which could fail and mask the original exception. Leaving
+        # this as a best-effort direct subprocess.run keeps the finally contract
+        # intact. If a stale worktree blocks the checkout here, the next
+        # attempt_merge tick's wrapped checkout will reclaim it.
         subprocess.run(
             ["git", "checkout", self.integration_branch],
             cwd=self.repo_path,

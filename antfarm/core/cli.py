@@ -805,7 +805,23 @@ def scent(task_id: str, poll_interval: float, colony_url: str, token: str | None
     default=False,
     help="Skip confirmation prompt for --sweep-legacy-tmux.",
 )
-def doctor(fix: bool, data_dir: str, sweep_legacy_tmux: bool, yes: bool):
+@click.option(
+    "--keep-worktree",
+    "keep_worktrees",
+    multiple=True,
+    type=str,
+    help=(
+        "Paths to exempt from stale-worktree pruning (repeatable). "
+        "Each path is realpath-normalized before comparison."
+    ),
+)
+def doctor(
+    fix: bool,
+    data_dir: str,
+    sweep_legacy_tmux: bool,
+    yes: bool,
+    keep_worktrees: tuple[str, ...],
+):
     """Run pre-flight diagnostics on the colony data directory."""
     import os
 
@@ -864,7 +880,7 @@ def doctor(fix: bool, data_dir: str, sweep_legacy_tmux: bool, yes: bool):
     # colony command persists these; older colonies won't have them yet.
     config.setdefault("max_reviewers", 2)
     config.setdefault("max_builders", 4)
-    findings = run_doctor(backend, config, fix=fix)
+    findings = run_doctor(backend, config, fix=fix, keep_worktrees=list(keep_worktrees))
 
     if not findings:
         click.echo("All checks passed.")

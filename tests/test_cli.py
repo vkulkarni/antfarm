@@ -422,7 +422,7 @@ def test_doctor_cli_reads_config_json_max_attempts(tmp_path: Path):
 
     captured: dict = {}
 
-    def _spy(backend, config, fix=False):
+    def _spy(backend, config, fix=False, **kwargs):
         captured["config"] = config
         return []
 
@@ -447,7 +447,7 @@ def test_doctor_cli_falls_back_when_no_config_json(tmp_path: Path):
 
     captured: dict = {}
 
-    def _spy(backend, config, fix=False):
+    def _spy(backend, config, fix=False, **kwargs):
         captured["config"] = config
         return []
 
