@@ -24,6 +24,7 @@ from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from antfarm.core import activity
 from antfarm.core.backends.base import TaskBackend
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,15 @@ _autoscaler_thread: threading.Thread | None = None
 _autoscaler_status: str = "not started"
 _autoscaler_instance = None
 
+# Activity state for the soldier and doctor (synthetic TUI rows — #348).
+# These live on the server (not in the backend) because the soldier/doctor run
+# in-process as threads alongside the FastAPI app. The TUI surfaces them via
+# /status/full. Appends are guarded by _colony_activity_lock so readers never
+# observe a partially-mutated dict.
+_colony_activity_lock = threading.Lock()
+_soldier_activity: dict = {"action": None, "target": None, "text": None, "since": None}
+_doctor_activity: dict = {"action": None, "target": None, "text": None, "since": None}
+
 # SSE event bus
 _event_queue: collections.deque = collections.deque(maxlen=1000)
 _event_counter: int = 0
@@ -55,6 +65,39 @@ _server_epoch: str = str(uuid.uuid4())
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _set_colony_activity(kind: str, action: str, target: str = "") -> None:
+    """Update the soldier/doctor synthetic activity rows (#348).
+
+    Intended to be called from ``antfarm.core.soldier`` and
+    ``antfarm.core.doctor`` via a lazy import to avoid circular imports at
+    module-load time (serve.py imports soldier/doctor indirectly).
+
+    Best-effort: any failure is swallowed so merge/check logic never breaks
+    because the TUI sidecar is unhappy.
+
+    Args:
+        kind: "soldier" or "doctor". Unknown kinds are ignored.
+        action: Canonical verb (see ``activity.VERB_TEMPLATES``).
+        target: Optional target; truncated by the synthesizer.
+    """
+    try:
+        text = activity.synthesize_text(action, target)
+        since = _now_iso()
+        with _colony_activity_lock:
+            if kind == "soldier":
+                _soldier_activity["action"] = action
+                _soldier_activity["target"] = target
+                _soldier_activity["text"] = text
+                _soldier_activity["since"] = since
+            elif kind == "doctor":
+                _doctor_activity["action"] = action
+                _doctor_activity["target"] = target
+                _doctor_activity["text"] = text
+                _doctor_activity["since"] = since
+    except Exception:
+        logger.debug("_set_colony_activity(%s) failed", kind, exc_info=True)
 
 
 def _emit_event(event_type: str, task_id: str, detail: str = "", actor: str = "colony") -> None:
@@ -328,6 +371,9 @@ class HeartbeatRequest(BaseModel):
 
 class ActivityRequest(BaseModel):
     action: str | None = None
+    target: str | None = None
+    source: str | None = None  # "hook" | "soldier" | "doctor"
+    text: str | None = None  # caller-provided; server synthesizes if absent
 
 
 class PullRequest(BaseModel):
@@ -629,10 +675,27 @@ def get_app(
     def worker_activity(worker_id: str, req: ActivityRequest):
         """Set or clear the worker's current action.
 
+        Accepts either a freeform ``action`` string (legacy) or a structured
+        ``{action, target}`` pair that the server synthesizes into a
+        human-readable line (#348). Callers may also pre-compute ``text`` and
+        pass it verbatim. Clearing is still done via ``action=null``.
+
         Does not update last_heartbeat — activity is a separate signal. Unknown
         workers are a silent no-op at the backend layer.
         """
-        _backend.update_worker_activity(worker_id, req.action)
+        # Resolution order: explicit text → synthesize(action, target) →
+        # legacy action-as-text → None (clear).
+        if req.text is not None:
+            resolved: str | None = req.text
+        elif req.action is None and req.target is None:
+            resolved = None
+        else:
+            synthesized = activity.synthesize_text(req.action, req.target)
+            # Back-compat: if neither verb is canonical nor a target is set,
+            # ``synthesize_text`` returns the raw action string — preserves
+            # prior behavior for freeform callers like legacy hooks.
+            resolved = synthesized if synthesized is not None else req.action
+        _backend.update_worker_activity(worker_id, resolved)
         return {"ok": True}
 
     @app.get("/workers", status_code=200)
@@ -1435,6 +1498,12 @@ def get_app(
             missions = _backend.list_missions()
         except NotImplementedError:
             missions = []
+        # Copy soldier/doctor activity dicts under the lock so the TUI can
+        # render them as synthetic rows (#348). Copies are shallow but all
+        # values are primitives, so this is safe.
+        with _colony_activity_lock:
+            soldier_activity = dict(_soldier_activity)
+            doctor_activity = dict(_doctor_activity)
         return {
             "status": _backend.status(),
             "tasks": _backend.list_tasks(),
@@ -1444,6 +1513,8 @@ def get_app(
             "doctor": _doctor_status,
             "queen": _queen_status,
             "autoscaler": _autoscaler_status,
+            "soldier_activity": soldier_activity,
+            "doctor_activity": doctor_activity,
             "warnings": _compute_status_warnings(_backend),
         }
 

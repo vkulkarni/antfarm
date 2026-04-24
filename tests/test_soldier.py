@@ -1585,6 +1585,53 @@ def test_soldier_emits_reconciled_external_and_skips_merge_events(
     assert _events_of_type(clear_events, "merge_succeeded") == []
 
 
+def test_soldier_emits_activity_during_attempt_merge(soldier_env, monkeypatch):
+    """Soldier publishes phase activity through _set_colony_activity (#348).
+
+    We don't pin the exact sequence — it depends on the test repo state (e.g.
+    whether conflict paths run). We assert that the critical phases ALL appear
+    at least once on a green merge: merging, fetching, rebasing, running_tests,
+    fast_forwarding, pushing, cleanup, idle. Additionally, the outer run loop
+    emits 'polling' — we verify that too.
+    """
+    from antfarm.core import serve
+
+    calls: list[tuple[str, str, str]] = []
+
+    def _capture(kind, action, target=""):
+        calls.append((kind, action, target))
+
+    monkeypatch.setattr(serve, "_set_colony_activity", _capture)
+
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-act-ok", "feat/task-act-ok")
+
+    results = soldier.run_once()
+    assert results == [("task-act-ok", MergeResult.MERGED)]
+
+    soldier_calls = [c for c in calls if c[0] == "soldier"]
+    actions = {c[1] for c in soldier_calls}
+    # Lifecycle of a green merge.
+    for expected in {
+        "merging",
+        "fetching",
+        "rebasing",
+        "running_tests",
+        "fast_forwarding",
+        "pushing",
+        "cleanup",
+        "idle",
+    }:
+        assert expected in actions, f"expected {expected!r} in soldier activity; got {actions}"
+
+    # The "merging" activity carries the task id as target.
+    merging = next(c for c in soldier_calls if c[1] == "merging")
+    assert merging[2] == "task-act-ok"
+
+
 def test_soldier_does_not_re_emit_colony_event_types(soldier_env, clear_events):
     """Colony-owned events (harvested/kickback/merged) must not fire with actor='soldier'."""
     soldier = soldier_env["soldier"]

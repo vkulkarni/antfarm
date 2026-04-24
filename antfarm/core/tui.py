@@ -197,6 +197,8 @@ class AntfarmTUI:
             tasks = full.get("tasks", [])
             workers = full.get("workers", [])
             soldier_status = full.get("soldier", "unknown")
+            soldier_activity = full.get("soldier_activity") or None
+            doctor_activity = full.get("doctor_activity") or None
         except httpx.ConnectError:
             layout = Layout()
             msg = (
@@ -224,10 +226,13 @@ class AntfarmTUI:
         layout = Layout()
         missions_size = max(5, min(len(missions) + 4, 10)) if missions else 5
         warnings_size = len(snap.warnings) + 2 if snap.warnings else 0
+        # Workers panel grows by 1 when the doctor synthetic row is present
+        # (the soldier row is already budgeted into the +5 headroom).
+        doctor_row_extra = 1 if doctor_activity else 0
         column_slices = [
             Layout(name="header", size=10),
             Layout(name="missions", size=missions_size),
-            Layout(name="workers", size=max(5, len(workers) + 5)),
+            Layout(name="workers", size=max(5, len(workers) + 5 + doctor_row_extra)),
             Layout(name="waiting", size=7),
             Layout(name="planning", size=5),
             Layout(name="building", size=6),
@@ -287,10 +292,19 @@ class AntfarmTUI:
             )
         )
 
-        worker_count = len(workers) + (1 if soldier_status != "disabled" else 0)
+        worker_count = (
+            len(workers)
+            + (1 if soldier_status != "disabled" else 0)
+            + (1 if doctor_activity else 0)
+        )
         layout["workers"].update(
             Panel(
-                self._render_workers(workers, soldier_status),
+                self._render_workers(
+                    workers,
+                    soldier_status,
+                    soldier_activity=soldier_activity,
+                    doctor_activity=doctor_activity,
+                ),
                 title=f"[bold cyan]Workers ({worker_count})[/bold cyan]",
             )
         )
@@ -1042,33 +1056,76 @@ class AntfarmTUI:
             return "reviewer"
         return "builder"
 
-    def _format_activity_cell(self, worker: dict, stuck_ttl: int = 300) -> Text:
-        """Format the Activity column cell for a worker row.
+    def _format_activity_cell(
+        self,
+        current_action: str | dict | None,
+        current_action_at: str | None = None,
+        now: datetime | None = None,
+        fresh_ttl: int = 30,
+        warn_ttl: int = 90,
+        stuck_ttl: int = 300,
+    ) -> Text:
+        """Format the Activity column cell.
 
-        Returns a Rich Text object rendering '<action[:40]> (<N>s)' when the
-        worker has a current_action, dim em-dash when it does not, and red
-        when the elapsed time exceeds stuck_ttl.
+        Renders ``<action[:40]> (<N>s)`` when an action is present, or a dim
+        em-dash when it is absent. Color bands follow elapsed seconds:
+
+        - ``< fresh_ttl`` (default 30s): green — actively working
+        - ``< warn_ttl`` (default 90s): default (no style) — normal
+        - ``< stuck_ttl`` (default 300s): yellow — slow/stalling
+        - ``>= stuck_ttl``: red — likely stuck; matches
+          ``doctor.check_stuck_workers`` TTL
+
+        Back-compat: the first arg still accepts a worker dict for existing
+        callers. When a dict is passed, ``current_action`` and
+        ``current_action_at`` are read from its keys.
         """
-        action = worker.get("current_action")
-        action_at = worker.get("current_action_at")
-        if not action or not action_at:
+        # Back-compat shim: dict form resolves both fields from keys.
+        if isinstance(current_action, dict):
+            worker = current_action
+            current_action = worker.get("current_action")
+            current_action_at = worker.get("current_action_at")
+
+        if not current_action or not current_action_at:
             return Text("—", style="dim")
 
+        now = now or datetime.now(UTC)
         try:
-            start = datetime.fromisoformat(action_at)
+            start = datetime.fromisoformat(current_action_at)
             if start.tzinfo is None:
                 start = start.replace(tzinfo=UTC)
-            elapsed = int((datetime.now(UTC) - start).total_seconds())
+            elapsed = int((now - start).total_seconds())
         except (ValueError, TypeError):
-            return Text(str(action)[:40], style="dim")
+            return Text(str(current_action)[:40], style="dim")
 
-        truncated = action[:40]
+        truncated = str(current_action)[:40]
         label = f"{truncated} ({elapsed}s)"
-        style = "red" if elapsed > stuck_ttl else ""
+        if elapsed < fresh_ttl:
+            style = "green"
+        elif elapsed < warn_ttl:
+            style = ""
+        elif elapsed < stuck_ttl:
+            style = "yellow"
+        else:
+            style = "red"
         return Text(label, style=style)
 
-    def _render_workers(self, workers: list, soldier_status: str = "unknown") -> Table:
-        """Render worker list with type column, including Soldier."""
+    def _render_workers(
+        self,
+        workers: list,
+        soldier_status: str = "unknown",
+        soldier_activity: dict | None = None,
+        doctor_activity: dict | None = None,
+    ) -> Table:
+        """Render worker list with type column, including Soldier and Doctor.
+
+        ``soldier_activity`` and ``doctor_activity`` are the per-subsystem
+        activity dicts returned by ``/status/full`` (see
+        ``serve._set_colony_activity``). When present, their ``text`` and
+        ``since`` fields drive the Activity cell for the synthetic row. The
+        doctor row is only rendered when ``doctor_activity`` is provided —
+        absent activity implies the doctor thread is disabled.
+        """
         table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
         table.add_column("Worker", max_width=22, no_wrap=True)
         table.add_column("Node", max_width=15, no_wrap=True)
@@ -1080,16 +1137,34 @@ class AntfarmTUI:
         # Soldier row (virtual — it's a thread, not a registered worker)
         if soldier_status != "disabled":
             s_style = "green" if soldier_status == "running" else "yellow"
+            sa = soldier_activity or {}
+            s_activity_cell = self._format_activity_cell(sa.get("text"), sa.get("since"))
             table.add_row(
                 Text("soldier", style="bold"),
                 Text("colony", style="dim"),
                 Text(soldier_status, style=s_style),
                 Text("soldier", style="bold"),
-                Text("—", style="dim"),
+                s_activity_cell,
                 Text("—", style="dim"),
             )
 
-        if not workers and soldier_status == "disabled":
+        # Doctor row (virtual — same pattern as soldier). Only shown when
+        # activity is available; callers that don't run a doctor thread
+        # simply pass None.
+        if doctor_activity:
+            d_activity_cell = self._format_activity_cell(
+                doctor_activity.get("text"), doctor_activity.get("since")
+            )
+            table.add_row(
+                Text("doctor", style="bold"),
+                Text("colony", style="dim"),
+                Text("running", style="green"),
+                Text("doctor", style="bold"),
+                d_activity_cell,
+                Text("—", style="dim"),
+            )
+
+        if not workers and soldier_status == "disabled" and not doctor_activity:
             table.add_row("[dim]\u2014[/dim]", "[dim]no workers[/dim]", "", "", "", "")
             return table
 

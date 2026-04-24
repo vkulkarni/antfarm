@@ -53,6 +53,23 @@ class Finding:
     fixed: bool = False
 
 
+def _set_doctor_activity(action: str, target: str = "") -> None:
+    """Publish doctor phase activity to the colony for the TUI (#348).
+
+    Lazy-imports ``_set_colony_activity``. Best-effort: ANY failure is
+    swallowed — a broken TUI sidecar must never break doctor checks.
+    """
+    try:
+        from antfarm.core.serve import _set_colony_activity
+    except Exception:
+        logger.debug("doctor _set_doctor_activity: could not import helper", exc_info=True)
+        return
+    try:
+        _set_colony_activity("doctor", action, target)
+    except Exception:
+        logger.debug("doctor _set_doctor_activity(%s) raised", action, exc_info=True)
+
+
 def run_doctor(
     backend,
     config: dict,
@@ -87,28 +104,41 @@ def run_doctor(
     """
     findings: list[Finding] = []
 
+    _set_doctor_activity("scanning", "filesystem")
     findings.extend(check_filesystem(config, fix))
+    _set_doctor_activity("scanning", "colony")
     findings.extend(check_colony_reachable(config))
+    _set_doctor_activity("scanning", "git")
     findings.extend(check_git_config())
+    _set_doctor_activity("scanning", "workers")
     findings.extend(check_stale_workers(backend, config, fix))
     findings.extend(check_stuck_workers(backend, config, fix))
+    _set_doctor_activity("scanning", "tasks")
     findings.extend(check_stale_tasks(backend, config, fix))
     findings.extend(check_retry_patterns(backend, config))
+    _set_doctor_activity("scanning", "review_queue")
     findings.extend(check_review_queue_saturated(backend, config))
     findings.extend(check_no_reviewer_capacity(backend, config))
+    _set_doctor_activity("scanning", "guards")
     findings.extend(check_stale_guards(backend, config, fix))
+    _set_doctor_activity("scanning", "workspaces")
     findings.extend(check_workspace_conflicts(backend))
     findings.extend(check_orphan_workspaces(config, fix))
+    _set_doctor_activity("scanning", "worktrees")
     findings.extend(check_stale_worktrees(backend, config, fix=fix, keep_worktrees=keep_worktrees))
+    _set_doctor_activity("scanning", "state")
     findings.extend(check_state_consistency(backend))
     findings.extend(check_dependency_cycles(backend))
+    _set_doctor_activity("scanning", "runners")
     findings.extend(check_runner_health(backend, config))
+    _set_doctor_activity("scanning", "tmux")
     findings.extend(check_tmux_available(config))
     findings.extend(check_orphan_tmux_sessions(config, fix))
 
     if sweep_legacy_tmux:
         findings.extend(sweep_legacy_tmux_sessions(config, confirmed=True))
 
+    _set_doctor_activity("idle", "")
     return findings
 
 
