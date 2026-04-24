@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -22,6 +23,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from antfarm.core.serve import _emit_event
+
+logger = logging.getLogger(__name__)
+
+# UUID4 regex used to parse worktree directory names of the form
+# ``{task_id}-{attempt_id}``. See ``check_stale_worktrees`` (#352).
+_UUID4_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
 
 # Matches legacy (pre-#231/#235) tmux session names. A hash slot is exactly
 # 8 lowercase hex chars followed by a dash; the negative lookahead ensures
@@ -51,6 +58,7 @@ def run_doctor(
     config: dict,
     fix: bool = False,
     sweep_legacy_tmux: bool = False,
+    keep_worktrees: list[str] | None = None,
 ) -> list[Finding]:
     """Run all diagnostic checks. If fix=True, apply safe repairs.
 
@@ -61,10 +69,18 @@ def run_doctor(
             - colony_url (str, optional): for reachability check
             - worker_ttl (int, default 300): seconds before worker is stale
             - guard_ttl (int, default 300): seconds before guard is stale
+            - worktree_prune_ttl_days (int, default 7): TTL catchall for
+              stale worktrees. See ``check_stale_worktrees``.
+            - worktree_prune_merged_min_age_hours (int, default 24):
+              cool-down age after attempt merge before a worktree is eligible
+              for pruning.
         fix: If True, apply safe auto-fixes.
         sweep_legacy_tmux: If True, also kill pre-hash tmux sessions host-wide
             (``auto-``/``runner-``/``antfarm-`` without a colony hash). Intended
             to be driven from the CLI after explicit operator confirmation.
+        keep_worktrees: Optional list of absolute paths that must NOT be
+            pruned by ``check_stale_worktrees`` even when they qualify. Each
+            path is realpath-normalized for comparison.
 
     Returns:
         List of Finding objects describing issues found.
@@ -83,6 +99,7 @@ def run_doctor(
     findings.extend(check_stale_guards(backend, config, fix))
     findings.extend(check_workspace_conflicts(backend))
     findings.extend(check_orphan_workspaces(config, fix))
+    findings.extend(check_stale_worktrees(backend, config, fix=fix, keep_worktrees=keep_worktrees))
     findings.extend(check_state_consistency(backend))
     findings.extend(check_dependency_cycles(backend))
     findings.extend(check_runner_health(backend, config))
@@ -608,9 +625,7 @@ def check_retry_patterns(backend, config: dict) -> list[Finding]:
         reason = _extract_last_failure_reason(task)
 
         if finished >= effective_max and status == "blocked":
-            message = (
-                f"Task '{task_id}' has failed {finished}/{effective_max} attempts."
-            )
+            message = f"Task '{task_id}' has failed {finished}/{effective_max} attempts."
             if reason:
                 message += f" Last failure: {reason}"
             findings.append(
@@ -624,9 +639,7 @@ def check_retry_patterns(backend, config: dict) -> list[Finding]:
             continue
 
         if finished >= effective_max - 1 and status != "blocked":
-            message = (
-                f"Task '{task_id}' has failed {finished} of max {effective_max} attempts."
-            )
+            message = f"Task '{task_id}' has failed {finished} of max {effective_max} attempts."
             if reason:
                 message += f" Last failure: {reason}"
             findings.append(
@@ -1024,6 +1037,289 @@ def check_orphan_workspaces(config: dict, fix: bool = False) -> list[Finding]:
                         auto_fixable=True,
                     )
                 )
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Check 8b: Stale worktree pruning (#352)
+# ---------------------------------------------------------------------------
+
+
+def _parse_worktree_dir_name(name: str) -> tuple[str | None, str | None]:
+    """Parse a worktree directory name shaped as ``{task_id}-{attempt_id}``
+    where the attempt_id is a UUID4. Returns (task_id, attempt_id) or
+    (None, None) when the name does not match."""
+    m = _UUID4_RE.search(name)
+    if not m:
+        return None, None
+    attempt_id = m.group(1)
+    # task_id is everything before the attempt_id minus the joining dash.
+    head = name[: -len(attempt_id)]
+    if not head.endswith("-"):
+        return None, None
+    task_id = head[:-1]
+    if not task_id:
+        return None, None
+    return task_id, attempt_id
+
+
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    """Best-effort ISO-8601 parse. Returns None when value is missing,
+    malformed, or otherwise unparseable. Never raises."""
+    if not value:
+        return None
+    try:
+        # fromisoformat accepts offset-aware timestamps on 3.11+. Normalize
+        # to UTC-aware for arithmetic.
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _enumerate_antfarm_worktrees(repo_path: str) -> list[str]:
+    """Return absolute paths of worktrees under ``.antfarm/workspaces/`` as
+    reported by ``git worktree list --porcelain`` run in ``repo_path``.
+
+    Silently returns an empty list on any git failure — doctor is diagnostic
+    and must not raise.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=repo_path,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+
+    antfarm_prefix = os.path.realpath(os.path.join(repo_path, ".antfarm", "workspaces"))
+    results: list[str] = []
+    for line in r.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = line[len("worktree ") :].strip()
+        if not path:
+            continue
+        real = os.path.realpath(path)
+        if real.startswith(antfarm_prefix + os.sep):
+            results.append(real)
+    return results
+
+
+def check_stale_worktrees(
+    backend,
+    config: dict,
+    fix: bool = False,
+    keep_worktrees: list[str] | None = None,
+) -> list[Finding]:
+    """Prune stale worktrees under ``.antfarm/workspaces/`` (#352).
+
+    A worktree is a pruning candidate when ANY of these rules match:
+      1. merged cool-down — task.status=done AND attempt.status=merged AND
+         age >= ``worktree_prune_merged_min_age_hours`` (default 24). Age is
+         sourced from ``attempt.completed_at``, falling back to dir mtime.
+      2. superseded — attempt.status=superseded (no age gate).
+      3. orphan — backend.get_task(task_id) returns None (no age gate).
+      4. TTL catchall — dir mtime age > ``worktree_prune_ttl_days``
+         (default 7). Applies regardless of task/attempt state and covers
+         directories whose names do not parse as ``{task}-{uuid4}``.
+
+    ``fix=True`` runs ``git worktree remove --force`` on each candidate after
+    a safety re-check that the realpath lies strictly under
+    ``.antfarm/workspaces/``. Paths in ``keep_worktrees`` (realpath-compared)
+    are skipped. A ``worktree_pruned`` SSE event is emitted per success with
+    actor="doctor".
+
+    Args:
+        backend: TaskBackend instance.
+        config: Doctor config dict. Reads ``data_dir``, ``repo_path``,
+            ``worktree_prune_ttl_days``, ``worktree_prune_merged_min_age_hours``.
+        fix: If True, actually remove candidate worktrees.
+        keep_worktrees: Optional list of absolute paths never to prune.
+
+    Returns:
+        List of findings — one per candidate, whether or not it was fixed.
+    """
+    findings: list[Finding] = []
+    repo_path = config.get("repo_path", ".")
+    ws_root = os.path.realpath(os.path.join(repo_path, ".antfarm", "workspaces"))
+    if not os.path.isdir(ws_root):
+        return findings
+
+    ttl_days = int(config.get("worktree_prune_ttl_days", 7))
+    merged_min_age_hours = int(config.get("worktree_prune_merged_min_age_hours", 24))
+    ttl_seconds = ttl_days * 86400
+    merged_min_age_seconds = merged_min_age_hours * 3600
+
+    keep_set: set[str] = set()
+    for k in keep_worktrees or []:
+        try:
+            keep_set.add(os.path.realpath(k))
+        except (OSError, ValueError):
+            # Unresolvable path — ignore; doctor is best-effort.
+            continue
+
+    now = datetime.now(UTC)
+    paths = _enumerate_antfarm_worktrees(repo_path)
+
+    for path in paths:
+        dir_name = os.path.basename(path.rstrip(os.sep))
+        task_id, attempt_id = _parse_worktree_dir_name(dir_name)
+
+        try:
+            dir_mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        dir_age_seconds = now.timestamp() - dir_mtime
+
+        rule: str | None = None
+        task: dict | None = None
+        attempt: dict | None = None
+
+        if task_id and attempt_id:
+            try:
+                task = backend.get_task(task_id)
+            except Exception:
+                task = None
+
+            if task is None:
+                # Rule 3: orphan (no task matches this worktree).
+                rule = "orphan"
+            else:
+                attempts = task.get("attempts", []) or []
+                for a in attempts:
+                    if a.get("attempt_id") == attempt_id:
+                        attempt = a
+                        break
+
+                if attempt is not None:
+                    a_status = attempt.get("status")
+                    if a_status == "superseded":
+                        rule = "superseded"
+                    elif task.get("status") == "done" and a_status == "merged":
+                        completed = _parse_iso_timestamp(attempt.get("completed_at"))
+                        if completed is not None:
+                            age_seconds = (now - completed).total_seconds()
+                        else:
+                            age_seconds = dir_age_seconds
+                        if age_seconds >= merged_min_age_seconds:
+                            rule = "merged"
+
+        # Rule 4: TTL catchall — applies regardless of task/attempt state
+        # (including unparseable names that never set a rule above).
+        if rule is None and dir_age_seconds > ttl_seconds:
+            rule = "ttl"
+
+        if rule is None:
+            continue
+
+        message = f"stale worktree eligible for pruning: {path} (reason={rule})"
+        hint = (
+            "Run `antfarm doctor --fix` to remove it, or "
+            f"`antfarm doctor --fix --keep-worktree {path}` to exempt it."
+        )
+
+        if not fix:
+            findings.append(
+                Finding(
+                    severity="info",
+                    check="stale_worktree",
+                    message=f"{message}\n  hint: {hint}",
+                    auto_fixable=True,
+                    fixed=False,
+                )
+            )
+            continue
+
+        # Safety re-check BEFORE any git invocation.
+        real_path = os.path.realpath(path)
+        if not real_path.startswith(ws_root + os.sep):
+            logger.warning(
+                "doctor check_stale_worktrees: refusing to prune path outside "
+                ".antfarm/workspaces/: %r (resolved %r, prefix %r)",
+                path,
+                real_path,
+                ws_root,
+            )
+            findings.append(
+                Finding(
+                    severity="warning",
+                    check="stale_worktree",
+                    message=(
+                        f"refused to prune worktree outside .antfarm/workspaces/: "
+                        f"{path} (resolved {real_path})"
+                    ),
+                    auto_fixable=False,
+                    fixed=False,
+                )
+            )
+            continue
+
+        if real_path in keep_set:
+            findings.append(
+                Finding(
+                    severity="info",
+                    check="stale_worktree",
+                    message=f"kept by --keep-worktree: {path} (reason={rule})",
+                    auto_fixable=True,
+                    fixed=False,
+                )
+            )
+            continue
+
+        # Detach HEAD before removing so git doesn't balk on a checked-out
+        # branch. Best-effort; we care about the subsequent worktree remove.
+        subprocess.run(
+            ["git", "-C", real_path, "checkout", "--detach"],
+            check=False,
+            capture_output=True,
+        )
+        rm = subprocess.run(
+            ["git", "worktree", "remove", "--force", real_path],
+            cwd=repo_path,
+            check=False,
+            capture_output=True,
+        )
+        if rm.returncode == 0:
+            detail = f"path={real_path} reason={rule}"
+            logger.info("doctor pruned stale worktree: %s", detail)
+            with contextlib.suppress(Exception):
+                _emit_event(
+                    "worktree_pruned",
+                    task_id="",
+                    detail=detail,
+                    actor="doctor",
+                )
+            findings.append(
+                Finding(
+                    severity="info",
+                    check="stale_worktree",
+                    message=f"{message}\n  hint: {hint}",
+                    auto_fixable=True,
+                    fixed=True,
+                )
+            )
+        else:
+            err = rm.stderr.decode(errors="replace").strip() if rm.stderr else ""
+            findings.append(
+                Finding(
+                    severity="warning",
+                    check="stale_worktree",
+                    message=(
+                        f"failed to prune stale worktree: {path} (reason={rule}) stderr={err}"
+                    ),
+                    auto_fixable=True,
+                    fixed=False,
+                )
+            )
 
     return findings
 

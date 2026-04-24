@@ -191,6 +191,10 @@ def _start_doctor_thread(backend: TaskBackend, data_dir: str, interval: float = 
         doctor_config["guard_ttl"] = colony_cfg.get("guard_ttl", 300)
         doctor_config["max_reviewers"] = colony_cfg.get("max_reviewers", 2)
         doctor_config["max_builders"] = colony_cfg.get("max_builders", 4)
+        doctor_config["worktree_prune_ttl_days"] = colony_cfg.get("worktree_prune_ttl_days", 7)
+        doctor_config["worktree_prune_merged_min_age_hours"] = colony_cfg.get(
+            "worktree_prune_merged_min_age_hours", 24
+        )
         interval = colony_cfg.get("doctor_interval", interval)
 
     def _doctor_loop():

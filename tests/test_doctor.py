@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -2072,3 +2072,366 @@ def test_check_review_queue_saturated_clears_sidecar_when_healthy(setup):
 
     run_doctor(backend, config, fix=False)
     assert not sidecar_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# #352: check_stale_worktrees — prune stale antfarm worktrees
+# ---------------------------------------------------------------------------
+
+
+def _init_repo_with_worktree(
+    tmp_path: Path, dir_name: str, branch: str = "feat/stale"
+) -> tuple[Path, Path]:
+    """Create a tiny git repo at tmp_path/'repo' with a worktree at
+    tmp_path/'repo'/.antfarm/workspaces/<dir_name>. Returns (repo, wt)."""
+    import subprocess as _sp
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _sp.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+    _sp.run(
+        ["git", "config", "user.email", "test@antfarm.test"],
+        cwd=str(repo),
+        capture_output=True,
+    )
+    _sp.run(
+        ["git", "config", "user.name", "Antfarm Test"],
+        cwd=str(repo),
+        capture_output=True,
+    )
+    (repo / "file.txt").write_text("init")
+    _sp.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
+    _sp.run(
+        ["git", "commit", "-m", "init"],
+        cwd=str(repo),
+        capture_output=True,
+        check=True,
+    )
+
+    ws_root = repo / ".antfarm" / "workspaces"
+    ws_root.mkdir(parents=True)
+    wt = ws_root / dir_name
+    _sp.run(
+        ["git", "worktree", "add", "-b", branch, str(wt)],
+        cwd=str(repo),
+        capture_output=True,
+        check=True,
+    )
+    return repo, wt
+
+
+def _make_done_merged_task(task_id: str, attempt_id: str, completed_at: str) -> dict:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "id": task_id,
+        "title": task_id,
+        "spec": "",
+        "complexity": "M",
+        "priority": 10,
+        "depends_on": [],
+        "touches": [],
+        "status": "done",
+        "current_attempt": attempt_id,
+        "attempts": [
+            {
+                "attempt_id": attempt_id,
+                "worker_id": "w-1",
+                "status": "merged",
+                "branch": "feat/stale",
+                "pr": "PR-1",
+                "started_at": now,
+                "completed_at": completed_at,
+            }
+        ],
+        "trail": [],
+        "signals": [],
+        "created_at": now,
+        "updated_at": now,
+        "created_by": "test",
+    }
+
+
+def test_stale_worktree_merged_past_cool_down_pruned_dry_run(tmp_path):
+    """Rule 1 (merged cool-down): task done, attempt merged, age past
+    cool-down → dry-run finding with reason=merged, fixed=False."""
+    from antfarm.core.doctor import check_stale_worktrees
+
+    attempt_id = "12345678-1234-4123-8123-123456789abc"
+    task_id = "task-stale"
+    dir_name = f"{task_id}-{attempt_id}"
+    repo, _wt = _init_repo_with_worktree(tmp_path, dir_name)
+
+    backend = FileBackend(root=str(repo / ".antfarm"))
+    # completed 48h ago — past the 24h cool-down default.
+    completed = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+
+    # Write the task JSON directly into done/ — carry() has its own state
+    # machine we don't need to replay here.
+    done_dir = repo / ".antfarm" / "tasks" / "done"
+    done_dir.mkdir(parents=True, exist_ok=True)
+    task = _make_done_merged_task(task_id, attempt_id, completed)
+    (done_dir / f"{task_id}.json").write_text(json.dumps(task))
+
+    config = {"data_dir": str(repo / ".antfarm"), "repo_path": str(repo)}
+    findings = check_stale_worktrees(backend, config, fix=False)
+
+    matches = [f for f in findings if task_id in f.message]
+    assert matches, f"expected a stale_worktree finding for {task_id}, got {findings}"
+    f = matches[0]
+    assert f.check == "stale_worktree"
+    assert "reason=merged" in f.message
+    assert f.fixed is False
+    assert f.auto_fixable is True
+
+
+def test_stale_worktree_merged_past_cool_down_fix_removes(tmp_path, monkeypatch):
+    """Rule 1 with fix=True: git worktree remove is called, SSE event
+    emitted, finding.fixed=True, worktree dir gone."""
+    from antfarm.core import doctor as doctor_mod
+    from antfarm.core.doctor import check_stale_worktrees
+
+    attempt_id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    task_id = "task-fx"
+    dir_name = f"{task_id}-{attempt_id}"
+    repo, wt = _init_repo_with_worktree(tmp_path, dir_name)
+
+    backend = FileBackend(root=str(repo / ".antfarm"))
+    completed = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
+    done_dir = repo / ".antfarm" / "tasks" / "done"
+    done_dir.mkdir(parents=True, exist_ok=True)
+    (done_dir / f"{task_id}.json").write_text(
+        json.dumps(_make_done_merged_task(task_id, attempt_id, completed))
+    )
+
+    emitted: list[tuple] = []
+
+    def fake_emit(event_type, task_id="", detail="", actor="doctor"):  # noqa: ARG001
+        emitted.append((event_type, detail, actor))
+
+    monkeypatch.setattr(doctor_mod, "_emit_event", fake_emit)
+
+    config = {"data_dir": str(repo / ".antfarm"), "repo_path": str(repo)}
+    assert wt.exists()
+    findings = check_stale_worktrees(backend, config, fix=True)
+
+    matches = [f for f in findings if task_id in f.message]
+    assert matches, f"expected a stale_worktree finding, got {findings}"
+    assert matches[0].fixed is True
+    assert not wt.exists(), "worktree directory should be gone after fix"
+
+    pruned_events = [e for e in emitted if e[0] == "worktree_pruned"]
+    assert pruned_events, f"expected worktree_pruned SSE event, got {emitted}"
+    assert "reason=merged" in pruned_events[0][1]
+
+
+def test_stale_worktree_superseded_attempt_pruned(tmp_path):
+    """Rule 2: superseded attempt → candidate regardless of age."""
+    from antfarm.core.doctor import check_stale_worktrees
+
+    attempt_id = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+    task_id = "task-sup"
+    dir_name = f"{task_id}-{attempt_id}"
+    repo, _wt = _init_repo_with_worktree(tmp_path, dir_name)
+
+    backend = FileBackend(root=str(repo / ".antfarm"))
+    now = datetime.now(UTC).isoformat()
+    task = {
+        "id": task_id,
+        "title": task_id,
+        "spec": "",
+        "complexity": "M",
+        "priority": 10,
+        "depends_on": [],
+        "touches": [],
+        "status": "ready",
+        "current_attempt": None,
+        "attempts": [
+            {
+                "attempt_id": attempt_id,
+                "worker_id": "w-1",
+                "status": "superseded",
+                "branch": "feat/stale",
+                "pr": None,
+                "started_at": now,
+                "completed_at": None,
+            }
+        ],
+        "trail": [],
+        "signals": [],
+        "created_at": now,
+        "updated_at": now,
+        "created_by": "test",
+    }
+    ready_dir = repo / ".antfarm" / "tasks" / "ready"
+    ready_dir.mkdir(parents=True, exist_ok=True)
+    (ready_dir / f"{task_id}.json").write_text(json.dumps(task))
+
+    config = {"data_dir": str(repo / ".antfarm"), "repo_path": str(repo)}
+    findings = check_stale_worktrees(backend, config, fix=False)
+
+    matches = [f for f in findings if task_id in f.message]
+    assert matches, f"expected a stale_worktree finding for superseded, got {findings}"
+    assert "reason=superseded" in matches[0].message
+
+
+def test_stale_worktree_orphan_no_task_pruned(tmp_path):
+    """Rule 3: backend.get_task returns None → candidate regardless of age."""
+    from antfarm.core.doctor import check_stale_worktrees
+
+    attempt_id = "cccccccc-3333-4333-8333-cccccccccccc"
+    task_id = "task-orph"
+    dir_name = f"{task_id}-{attempt_id}"
+    repo, _wt = _init_repo_with_worktree(tmp_path, dir_name)
+
+    backend = FileBackend(root=str(repo / ".antfarm"))
+    # No task JSON written — backend.get_task returns None.
+
+    config = {"data_dir": str(repo / ".antfarm"), "repo_path": str(repo)}
+    findings = check_stale_worktrees(backend, config, fix=False)
+
+    matches = [f for f in findings if task_id in f.message]
+    assert matches, f"expected a stale_worktree finding for orphan, got {findings}"
+    assert "reason=orphan" in matches[0].message
+
+
+def test_stale_worktree_ttl_catchall(tmp_path):
+    """Rule 4: dir mtime > TTL triggers pruning regardless of task state
+    (use a small TTL and backdate the worktree)."""
+    from antfarm.core.doctor import check_stale_worktrees
+
+    attempt_id = "dddddddd-4444-4444-8444-dddddddddddd"
+    task_id = "task-ttl"
+    dir_name = f"{task_id}-{attempt_id}"
+    repo, wt = _init_repo_with_worktree(tmp_path, dir_name)
+
+    # Task is healthy but the worktree is ancient.
+    backend = FileBackend(root=str(repo / ".antfarm"))
+    now = datetime.now(UTC).isoformat()
+    task = _make_done_merged_task(task_id, attempt_id, now)
+    done_dir = repo / ".antfarm" / "tasks" / "done"
+    done_dir.mkdir(parents=True, exist_ok=True)
+    (done_dir / f"{task_id}.json").write_text(json.dumps(task))
+
+    # Backdate the worktree dir mtime by 10 days.
+    old = time.time() - 10 * 86400
+    os.utime(str(wt), (old, old))
+
+    config = {
+        "data_dir": str(repo / ".antfarm"),
+        "repo_path": str(repo),
+        "worktree_prune_ttl_days": 7,
+        # Keep merged cool-down large so rule 1 does NOT fire (we want to
+        # isolate the TTL catchall). Task's completed_at is "now" so merged
+        # cool-down of 24h is never met anyway.
+    }
+    findings = check_stale_worktrees(backend, config, fix=False)
+
+    matches = [f for f in findings if task_id in f.message]
+    assert matches, f"expected a stale_worktree finding, got {findings}"
+    # Either ttl or merged depending on whose age check wins; since completed
+    # is "now" rule 1 can't fire — must be ttl.
+    assert "reason=ttl" in matches[0].message
+
+
+def test_stale_worktree_refuses_symlink_outside_antfarm(tmp_path, monkeypatch):
+    """Safety guard: the fix path refuses to git-worktree-remove any path
+    whose realpath does not live under .antfarm/workspaces/. We simulate
+    this by making git worktree list report a path outside the antfarm
+    workspaces tree and confirming no git worktree remove is invoked."""
+    from antfarm.core import doctor as doctor_mod
+    from antfarm.core.doctor import check_stale_worktrees
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # Set up just enough of the .antfarm/workspaces tree so the check
+    # enumerates at all.
+    (repo / ".antfarm" / "workspaces").mkdir(parents=True)
+    # Pretend a rogue worktree entry outside antfarm is "seen" by git.
+    outside = tmp_path / "outside-wt"
+    outside.mkdir()
+
+    # Bypass real enumeration: return a path OUTSIDE .antfarm/workspaces/.
+    monkeypatch.setattr(
+        doctor_mod,
+        "_enumerate_antfarm_worktrees",
+        lambda repo_path: [str(outside)],
+    )
+
+    calls: list[list[str]] = []
+    import subprocess as _sp
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return _sp.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(doctor_mod.subprocess, "run", fake_run)
+
+    backend = FileBackend(root=str(repo / ".antfarm"))
+    config = {
+        "data_dir": str(repo / ".antfarm"),
+        "repo_path": str(repo),
+        # Force rule 4 to match so the fix path is exercised.
+        "worktree_prune_ttl_days": 0,
+    }
+    findings = check_stale_worktrees(backend, config, fix=True)
+
+    # No git worktree remove invocation against a path outside antfarm.
+    remove_calls = [c for c in calls if c[:3] == ["git", "worktree", "remove"]]
+    assert remove_calls == [], f"unexpected worktree remove: {remove_calls}"
+
+    # Must have emitted a refusal finding.
+    assert any(f.check == "stale_worktree" and f.fixed is False for f in findings)
+
+
+def test_stale_worktree_keep_worktree_flag_exempts_path(tmp_path):
+    """A path listed in keep_worktrees must not be pruned even when it
+    qualifies; instead a Finding with fixed=False is returned."""
+    from antfarm.core.doctor import check_stale_worktrees
+
+    attempt_id = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
+    task_id = "task-keep"
+    dir_name = f"{task_id}-{attempt_id}"
+    repo, wt = _init_repo_with_worktree(tmp_path, dir_name)
+
+    backend = FileBackend(root=str(repo / ".antfarm"))
+    # Make it qualify under rule 3 (orphan: no task JSON written).
+    config = {"data_dir": str(repo / ".antfarm"), "repo_path": str(repo)}
+    findings = check_stale_worktrees(backend, config, fix=True, keep_worktrees=[str(wt)])
+    matches = [f for f in findings if task_id in f.message]
+    assert matches, f"expected a stale_worktree finding, got {findings}"
+    # Skipped because of --keep-worktree — dir must still exist.
+    assert wt.exists(), "keep_worktrees path should not be pruned"
+    assert matches[0].fixed is False
+    assert "keep" in matches[0].message.lower()
+
+
+def test_stale_worktree_parsing_hazard_unparseable_name(tmp_path):
+    """A directory name that does not match ``{task}-{uuid4}`` must not
+    trigger rules 1-3 (they need a valid task/attempt pair) — only the
+    TTL catchall (rule 4) applies via dir mtime."""
+    from antfarm.core.doctor import check_stale_worktrees
+
+    # Unparseable — no UUID4 tail.
+    dir_name = "legacy-worktree-no-uuid"
+    repo, wt = _init_repo_with_worktree(tmp_path, dir_name)
+
+    backend = FileBackend(root=str(repo / ".antfarm"))
+    config = {
+        "data_dir": str(repo / ".antfarm"),
+        "repo_path": str(repo),
+        # TTL high enough that fresh dir doesn't qualify yet.
+        "worktree_prune_ttl_days": 30,
+    }
+    findings = check_stale_worktrees(backend, config, fix=False)
+    # No TTL hit because dir is fresh, no rule 1-3 because name is unparseable.
+    stale = [f for f in findings if f.check == "stale_worktree"]
+    assert stale == [], f"unparseable fresh dir must not qualify yet; got findings: {stale}"
+
+    # Now backdate and verify rule 4 fires.
+    old = time.time() - 60 * 86400
+    os.utime(str(wt), (old, old))
+    config["worktree_prune_ttl_days"] = 7
+    findings = check_stale_worktrees(backend, config, fix=False)
+    stale = [f for f in findings if f.check == "stale_worktree"]
+    assert stale, "rule 4 should fire once dir mtime is past TTL"
+    assert "reason=ttl" in stale[0].message
