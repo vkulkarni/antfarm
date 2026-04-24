@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 VALID_COMPLETION_MODES = ("best_effort", "all_or_nothing")
 VALID_BLOCKED_TIMEOUT_ACTIONS = ("wait", "fail")
 VALID_AUTO_MERGE_MODES = ("never", "on-review-pass", "on-review-pass-and-ci-green")
+VALID_BUDGET_ACTIONS = ("pause", "cancel")
+
+# Bounded FIFO of recent UsageEvent IDs kept per-mission for dedup.
+_SEEN_EVENT_ID_CAP = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +36,7 @@ class MissionStatus(StrEnum):
     REVIEWING_PLAN = "reviewing_plan"
     BUILDING = "building"
     BLOCKED = "blocked"
+    PAUSED = "paused"
     COMPLETE = "complete"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -55,6 +60,10 @@ class MissionConfig:
     blocked_timeout_minutes: int = 120
     auto_merge: str = "never"
     allow_auto_merge_on_external: bool = False
+    # Budget tripwire (v0.6.14 — issue #354). None means no limit.
+    max_cost_usd: float | None = None
+    max_tokens: int | None = None
+    budget_action: str = "pause"
 
     def __post_init__(self) -> None:
         if self.completion_mode not in VALID_COMPLETION_MODES:
@@ -65,6 +74,8 @@ class MissionConfig:
             )
         if self.auto_merge not in VALID_AUTO_MERGE_MODES:
             raise ValueError(f"auto_merge must be one of {VALID_AUTO_MERGE_MODES}")
+        if self.budget_action not in VALID_BUDGET_ACTIONS:
+            raise ValueError(f"budget_action must be one of {VALID_BUDGET_ACTIONS}")
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +90,9 @@ class MissionConfig:
             "blocked_timeout_minutes": self.blocked_timeout_minutes,
             "auto_merge": self.auto_merge,
             "allow_auto_merge_on_external": self.allow_auto_merge_on_external,
+            "max_cost_usd": self.max_cost_usd,
+            "max_tokens": self.max_tokens,
+            "budget_action": self.budget_action,
         }
 
     @classmethod
@@ -97,6 +111,9 @@ class MissionConfig:
             blocked_timeout_minutes=data.get("blocked_timeout_minutes", 120),
             auto_merge=data.get("auto_merge", "never"),
             allow_auto_merge_on_external=data.get("allow_auto_merge_on_external", False),
+            max_cost_usd=data.get("max_cost_usd"),
+            max_tokens=data.get("max_tokens"),
+            budget_action=data.get("budget_action", "pause"),
         )
 
 
@@ -371,6 +388,145 @@ def is_infra_task(task: dict) -> bool:
 # ---------------------------------------------------------------------------
 # link_task_to_mission
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# MissionUsage (v0.6 cost tripwire)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MissionUsage:
+    """Aggregated cost/token counters for a mission.
+
+    Persisted as a sidecar JSON file at
+    ``.antfarm/missions/<mission_id>_usage.json``. Mutations happen under
+    FileBackend._lock; idempotency against duplicate UsageEvents is enforced
+    by a bounded FIFO of seen event IDs.
+    """
+
+    mission_id: str
+    total_cost_usd: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cache_read_tokens: int = 0
+    total_cache_creation_tokens: int = 0
+    event_count: int = 0
+    first_event_at: str | None = None
+    last_event_at: str | None = None
+    # task_id → {cost_usd, input_tokens, output_tokens, cache_read_tokens,
+    #            cache_creation_tokens, event_count, top_attempt_id,
+    #            top_attempt_cost}
+    per_task: dict[str, dict] = field(default_factory=dict)
+    # FIFO of already-applied UsageEvent IDs, capped at _SEEN_EVENT_ID_CAP.
+    seen_event_ids: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "mission_id": self.mission_id,
+            "total_cost_usd": self.total_cost_usd,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_cache_read_tokens": self.total_cache_read_tokens,
+            "total_cache_creation_tokens": self.total_cache_creation_tokens,
+            "event_count": self.event_count,
+            "first_event_at": self.first_event_at,
+            "last_event_at": self.last_event_at,
+            "per_task": {k: dict(v) for k, v in self.per_task.items()},
+            "seen_event_ids": list(self.seen_event_ids),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> MissionUsage:
+        return cls(
+            mission_id=data["mission_id"],
+            total_cost_usd=float(data.get("total_cost_usd", 0.0)),
+            total_input_tokens=int(data.get("total_input_tokens", 0)),
+            total_output_tokens=int(data.get("total_output_tokens", 0)),
+            total_cache_read_tokens=int(data.get("total_cache_read_tokens", 0)),
+            total_cache_creation_tokens=int(data.get("total_cache_creation_tokens", 0)),
+            event_count=int(data.get("event_count", 0)),
+            first_event_at=data.get("first_event_at"),
+            last_event_at=data.get("last_event_at"),
+            per_task={k: dict(v) for k, v in data.get("per_task", {}).items()},
+            seen_event_ids=list(data.get("seen_event_ids", [])),
+        )
+
+    def apply(self, event) -> None:
+        """Apply a UsageEvent to the aggregates. Idempotent by event_id.
+
+        ``event`` is either a ``UsageEvent`` dataclass or its ``to_dict()``
+        form — both are accepted so callers don't need to round-trip.
+        """
+        # Accept dict or dataclass — keeps the call sites simple.
+        ed = event.to_dict() if hasattr(event, "to_dict") else dict(event)
+
+        event_id = ed.get("event_id")
+        if not event_id:
+            return
+        if event_id in self.seen_event_ids:
+            return
+
+        cost = float(ed.get("cost_usd", 0.0))
+        input_tok = int(ed.get("input_tokens", 0))
+        output_tok = int(ed.get("output_tokens", 0))
+        cache_r = int(ed.get("cache_read_tokens", 0))
+        cache_c = int(ed.get("cache_creation_tokens", 0))
+        ts = ed.get("ts")
+
+        self.total_cost_usd += cost
+        self.total_input_tokens += input_tok
+        self.total_output_tokens += output_tok
+        self.total_cache_read_tokens += cache_r
+        self.total_cache_creation_tokens += cache_c
+        self.event_count += 1
+
+        if ts is not None:
+            if self.first_event_at is None:
+                self.first_event_at = ts
+            self.last_event_at = ts
+
+        task_id = ed.get("task_id")
+        attempt_id = ed.get("attempt_id")
+        if task_id:
+            bucket = self.per_task.setdefault(
+                task_id,
+                {
+                    "cost_usd": 0.0,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "event_count": 0,
+                    "top_attempt_id": None,
+                    "top_attempt_cost": 0.0,
+                    "per_attempt": {},
+                },
+            )
+            bucket["cost_usd"] = float(bucket.get("cost_usd", 0.0)) + cost
+            bucket["input_tokens"] = int(bucket.get("input_tokens", 0)) + input_tok
+            bucket["output_tokens"] = int(bucket.get("output_tokens", 0)) + output_tok
+            bucket["cache_read_tokens"] = int(bucket.get("cache_read_tokens", 0)) + cache_r
+            bucket["cache_creation_tokens"] = int(bucket.get("cache_creation_tokens", 0)) + cache_c
+            bucket["event_count"] = int(bucket.get("event_count", 0)) + 1
+
+            # Track per-attempt cost so we can surface the most expensive
+            # attempt for this task — useful when a task churned and cost
+            # blew up across kickbacks.
+            per_attempt = bucket.setdefault("per_attempt", {})
+            if attempt_id:
+                prev = float(per_attempt.get(attempt_id, 0.0))
+                new_attempt_cost = prev + cost
+                per_attempt[attempt_id] = new_attempt_cost
+                if new_attempt_cost > float(bucket.get("top_attempt_cost", 0.0)):
+                    bucket["top_attempt_id"] = attempt_id
+                    bucket["top_attempt_cost"] = new_attempt_cost
+
+        # Record seen event_id; drop oldest when over the cap.
+        self.seen_event_ids.append(event_id)
+        overflow = len(self.seen_event_ids) - _SEEN_EVENT_ID_CAP
+        if overflow > 0:
+            del self.seen_event_ids[:overflow]
 
 
 def link_task_to_mission(

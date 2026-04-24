@@ -406,6 +406,29 @@ class MissionUpdateRequest(BaseModel):
     updates: dict
 
 
+class WorkerUsageRequest(BaseModel):
+    """Usage/cost ping from a worker hook — mirrors UsageEvent (minus cost)."""
+
+    event_id: str
+    ts: str
+    model: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    source: str = "claude_stop_hook"
+    # Optional overrides — if omitted, the server derives from the worker's
+    # active task. Supplied by tests and by future non-Claude adapters.
+    task_id: str | None = None
+    attempt_id: str | None = None
+    mission_id: str | None = None
+
+
+class MissionExtendRequest(BaseModel):
+    additional_usd: float | None = None
+    additional_tokens: int | None = None
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -623,6 +646,140 @@ def get_app(
         _backend.deregister_worker(worker_id)
         return {"ok": True}
 
+    @app.post("/workers/{worker_id:path}/usage", status_code=200)
+    def worker_usage(worker_id: str, req: WorkerUsageRequest):
+        """Record a usage/cost event from a worker hook.
+
+        Attribution flow:
+        1. Explicit task_id/attempt_id/mission_id on the request wins.
+        2. Otherwise look up the worker's current active task and attribute
+           to its current_attempt.
+        3. Otherwise fall back to the worker's most recent harvested/done
+           attempt that still carries a mission_id — this catches the
+           Stop-hook-after-harvest ordering.
+        4. If no mission can be resolved, record the trail entry on the
+           task (if any) but skip mission aggregation.
+
+        The endpoint is idempotent by ``event_id`` — the backend usage
+        updater dedupes.
+        """
+        from antfarm.core.missions import MissionUsage
+        from antfarm.core.models import UsageEvent
+        from antfarm.core.pricing import compute_cost
+
+        task_id = req.task_id
+        attempt_id = req.attempt_id
+        mission_id = req.mission_id
+
+        # Fall back to worker lookup only when attribution fields are absent.
+        if task_id is None or mission_id is None:
+            try:
+                active_tasks = _backend.list_tasks(status="active")
+            except Exception:
+                active_tasks = []
+            found: dict | None = None
+            for t in active_tasks:
+                current_id = t.get("current_attempt")
+                if not current_id:
+                    continue
+                for a in t.get("attempts", []):
+                    if a.get("attempt_id") == current_id and a.get("worker_id") == worker_id:
+                        found = t
+                        break
+                if found is not None:
+                    break
+
+            if found is None:
+                # Fall back to last-completed attempt with a mission_id. The
+                # Stop hook frequently fires immediately after harvest, by
+                # which time the task is no longer active.
+                try:
+                    done_tasks = _backend.list_tasks(status="done")
+                except Exception:
+                    done_tasks = []
+                best_ts = ""
+                for t in done_tasks:
+                    if not t.get("mission_id"):
+                        continue
+                    for a in t.get("attempts", []):
+                        if a.get("worker_id") != worker_id:
+                            continue
+                        completed = a.get("completed_at") or a.get("started_at") or ""
+                        if completed > best_ts:
+                            best_ts = completed
+                            found = t
+                            attempt_id = attempt_id or a.get("attempt_id")
+
+            if found is not None:
+                task_id = task_id or found.get("id")
+                mission_id = mission_id or found.get("mission_id")
+                if attempt_id is None:
+                    attempt_id = found.get("current_attempt")
+
+        cost = compute_cost(
+            model=req.model,
+            input_tokens=req.input_tokens,
+            output_tokens=req.output_tokens,
+            cache_read_tokens=req.cache_read_tokens,
+            cache_creation_tokens=req.cache_creation_tokens,
+        )
+
+        event = UsageEvent(
+            event_id=req.event_id,
+            worker_id=worker_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            mission_id=mission_id,
+            ts=req.ts,
+            model=req.model,
+            input_tokens=req.input_tokens,
+            output_tokens=req.output_tokens,
+            cache_read_tokens=req.cache_read_tokens,
+            cache_creation_tokens=req.cache_creation_tokens,
+            cost_usd=cost,
+            source=req.source,
+        )
+
+        total_cost: float = 0.0
+        total_tokens: int = 0
+        if mission_id:
+
+            def _updater(current: dict) -> dict:
+                usage = MissionUsage.from_dict(current)
+                usage.apply(event)
+                return usage.to_dict()
+
+            try:
+                new_state = _backend.update_mission_usage(mission_id, _updater)
+                total_cost = float(new_state.get("total_cost_usd", 0.0))
+                total_tokens = int(
+                    new_state.get("total_input_tokens", 0) + new_state.get("total_output_tokens", 0)
+                )
+            except NotImplementedError:
+                logger.warning("worker_usage: backend does not support mission usage; skipping")
+
+        # Append a trail entry on the task so operators see cost per task.
+        if task_id:
+            trail_msg = f"cost +${cost:.4f} model={req.model}"
+            entry = {
+                "ts": _now_iso(),
+                "worker_id": worker_id,
+                "message": trail_msg,
+                "action_type": "usage",
+            }
+            with contextlib.suppress(Exception), _lock:
+                _backend.append_trail(task_id, entry)
+
+        return {
+            "ok": True,
+            "event_id": req.event_id,
+            "cost_usd": cost,
+            "mission_id": mission_id,
+            "task_id": task_id,
+            "total_cost_usd": total_cost,
+            "total_tokens": total_tokens,
+        }
+
     # ------------------------------------------------------------------
     # Tasks
     # ------------------------------------------------------------------
@@ -688,14 +845,42 @@ def get_app(
 
     @app.post("/tasks/pull")
     def forage(req: PullRequest, response: Response):
-        """Pull the next eligible task for a worker. Returns 204 if queue is empty."""
-        with _lock:
-            task = _backend.pull(req.worker_id)
-            if task is not None:
-                # Atomically mark the worker active so the autoscaler does not
-                # retire it between task claim and the worker's next heartbeat.
-                with contextlib.suppress(Exception):
-                    _backend.heartbeat(req.worker_id, {"status": "active"})
+        """Pull the next eligible task for a worker. Returns 204 if queue is empty.
+
+        Tasks whose parent mission is paused or cancelled are returned to
+        ready/ (via reassign_task) so the claim doesn't wedge them on a
+        paused mission. We do this post-pull rather than pre-filtering inside
+        the scheduler to keep the scheduler path simple — bounded O(pauses)
+        retries per pull in the common case where no missions are paused.
+        """
+        # Try up to a handful of times in case we repeatedly pull tasks from
+        # paused missions. In practice a paused mission will have few tasks
+        # compared to the queue and the loop exits after one iteration.
+        for _ in range(8):
+            with _lock:
+                task = _backend.pull(req.worker_id)
+                if task is not None:
+                    with contextlib.suppress(Exception):
+                        _backend.heartbeat(req.worker_id, {"status": "active"})
+            if task is None:
+                break
+            mission_id = task.get("mission_id")
+            if not mission_id:
+                break
+            try:
+                mission = _backend.get_mission(mission_id)
+            except NotImplementedError:
+                mission = None
+            if mission is None:
+                break
+            if mission.get("status") not in ("paused", "cancelled"):
+                break
+            # Return the claimed task to ready/ so another pull (or a future
+            # extend) can pick it up. reassign_task supersedes the attempt
+            # and moves active/ → ready/.
+            with contextlib.suppress(Exception):
+                _backend.reassign_task(task["id"], req.worker_id)
+            task = None
         if task is None:
             response.status_code = 204
             return None
@@ -1024,6 +1209,72 @@ def get_app(
         ids = _backend.cancel_mission_tasks(mission_id, reason="mission cancelled")
         return {"ok": True, "cancelled_tasks": ids}
 
+    @app.get("/missions/{mission_id}/usage", status_code=200)
+    def get_mission_usage_endpoint(mission_id: str):
+        """Return aggregated usage for a mission. Empty object if none recorded."""
+        from antfarm.core.missions import MissionUsage
+
+        mission = _backend.get_mission(mission_id)
+        if mission is None:
+            raise HTTPException(status_code=404, detail=f"Mission '{mission_id}' not found")
+        usage = _backend.get_mission_usage(mission_id)
+        if usage is None:
+            return MissionUsage(mission_id=mission_id).to_dict()
+        return usage
+
+    @app.post("/missions/{mission_id}/extend", status_code=200)
+    def extend_mission(mission_id: str, req: MissionExtendRequest):
+        """Bump a mission's budget caps and resume if paused.
+
+        When ``additional_usd`` or ``additional_tokens`` is provided, the
+        corresponding config field is increased by that amount. If the mission
+        is currently PAUSED due to a budget tripwire, it is moved back to the
+        status recorded in ``paused_from_status`` (falling back to BUILDING).
+        """
+        from antfarm.core.missions import MissionStatus
+
+        mission = _backend.get_mission(mission_id)
+        if mission is None:
+            raise HTTPException(status_code=404, detail=f"Mission '{mission_id}' not found")
+
+        cfg = dict(mission.get("config") or {})
+        updates: dict = {}
+
+        if req.additional_usd is not None:
+            current = cfg.get("max_cost_usd")
+            new_val = (float(current) if current is not None else 0.0) + float(req.additional_usd)
+            cfg["max_cost_usd"] = new_val
+
+        if req.additional_tokens is not None:
+            current_tok = cfg.get("max_tokens")
+            new_tok = (int(current_tok) if current_tok is not None else 0) + int(
+                req.additional_tokens
+            )
+            cfg["max_tokens"] = new_tok
+
+        updates["config"] = cfg
+
+        if mission.get("status") == MissionStatus.PAUSED.value:
+            prior = mission.get("paused_from_status") or MissionStatus.BUILDING.value
+            updates["status"] = prior
+            updates["paused_from_status"] = None
+
+        try:
+            _backend.update_mission(mission_id, updates)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        _emit_event(
+            "mission_extended",
+            "",
+            detail=(
+                f"mission={mission_id} +usd={req.additional_usd} +tokens={req.additional_tokens}"
+            ),
+            actor="colony",
+        )
+
+        return _backend.get_mission(mission_id)
+
     @app.get("/missions/{mission_id}/context")
     def get_mission_context_endpoint(mission_id: str):
         """Return mission context blob for prompt cache sharing. 404 if not found."""
@@ -1180,10 +1431,15 @@ def get_app(
         Returns:
             Dict with 'status', 'tasks', and 'workers' keys.
         """
+        try:
+            missions = _backend.list_missions()
+        except NotImplementedError:
+            missions = []
         return {
             "status": _backend.status(),
             "tasks": _backend.list_tasks(),
             "workers": _backend.list_workers(),
+            "missions": missions,
             "soldier": _soldier_status,
             "doctor": _doctor_status,
             "queen": _queen_status,

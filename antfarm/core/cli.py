@@ -745,6 +745,7 @@ def inbox(colony_url: str, token: str | None):
     items = collect_inbox_items(
         tasks=data.get("tasks", []),
         workers=data.get("workers", []),
+        missions=data.get("missions", []),
     )
     if not items:
         click.echo("Inbox empty — everything healthy.")
@@ -1396,6 +1397,25 @@ def mission():
     default=False,
     help="Permit auto-merge even when the viewer is not an ADMIN of the target repo.",
 )
+@click.option(
+    "--max-cost-usd",
+    type=float,
+    default=None,
+    help="Cost budget in USD. Mission pauses or cancels at this ceiling.",
+)
+@click.option(
+    "--max-tokens",
+    type=int,
+    default=None,
+    help="Token budget (input+output). Mission pauses or cancels at this ceiling.",
+)
+@click.option(
+    "--budget-action",
+    type=click.Choice(["pause", "cancel"]),
+    default="pause",
+    show_default=True,
+    help="Action taken when the budget is exceeded.",
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def mission_create(
@@ -1407,6 +1427,9 @@ def mission_create(
     integration_branch: str | None,
     auto_merge: str | None,
     allow_auto_merge_on_external: bool,
+    max_cost_usd: float | None,
+    max_tokens: int | None,
+    budget_action: str,
     colony_url: str,
     token: str | None,
 ):
@@ -1428,6 +1451,13 @@ def mission_create(
         config["auto_merge"] = auto_merge
     if allow_auto_merge_on_external:
         config["allow_auto_merge_on_external"] = True
+    if max_cost_usd is not None:
+        config["max_cost_usd"] = max_cost_usd
+    if max_tokens is not None:
+        config["max_tokens"] = max_tokens
+    # Always thread budget_action — even when budgets are unset it's harmless
+    # and keeps round-trips deterministic.
+    config["budget_action"] = budget_action
     if config:
         payload["config"] = config
     if mission_id:
@@ -1466,6 +1496,76 @@ def mission_status(mission_id: str, colony_url: str, token: str | None):
         click.echo(f"Plan task:  {data['plan_task_id']}")
     if data.get("spec_file"):
         click.echo(f"Spec file:  {data['spec_file']}")
+
+    # Budget block — only rendered when a budget was set on the mission.
+    max_cost = config.get("max_cost_usd")
+    max_tokens = config.get("max_tokens")
+    if max_cost is not None or max_tokens is not None:
+        try:
+            usage = _get(colony_url, f"/missions/{mission_id}/usage", token=token)
+        except Exception:
+            usage = {}
+        cost = float(usage.get("total_cost_usd", 0.0) or 0.0)
+        tokens = int(usage.get("total_input_tokens", 0) or 0) + int(
+            usage.get("total_output_tokens", 0) or 0
+        )
+        if max_cost is not None:
+            pct = (cost / max_cost * 100.0) if max_cost else 0.0
+            click.echo(f"Budget:    ${cost:.4f} / ${float(max_cost):.4f} ({pct:.1f}%)")
+        else:
+            click.echo(f"Budget:    ${cost:.4f} / —")
+        if max_tokens is not None:
+            click.echo(f"Tokens:    {tokens} / {max_tokens}")
+        else:
+            click.echo(f"Tokens:    {tokens} / —")
+
+        per_task = usage.get("per_task") or {}
+        if per_task:
+            top = max(
+                per_task.items(),
+                key=lambda kv: float(kv[1].get("cost_usd", 0.0) or 0.0),
+            )
+            top_task_id, top_entry = top
+            click.echo(f"Top spend: {top_task_id} ${float(top_entry.get('cost_usd', 0.0)):.4f}")
+
+
+@mission.command("extend")
+@click.argument("mission_id")
+@click.option(
+    "--additional-usd",
+    type=float,
+    default=None,
+    help="Add this many USD to the mission's cost budget.",
+)
+@click.option(
+    "--additional-tokens",
+    type=int,
+    default=None,
+    help="Add this many tokens to the mission's token budget.",
+)
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def mission_extend(
+    mission_id: str,
+    additional_usd: float | None,
+    additional_tokens: int | None,
+    colony_url: str,
+    token: str | None,
+):
+    """Bump a mission's budget ceiling and resume it if paused."""
+    payload = {
+        "additional_usd": additional_usd,
+        "additional_tokens": additional_tokens,
+    }
+    result = _post(colony_url, f"/missions/{mission_id}/extend", payload, token=token)
+    if not result:
+        click.echo("Mission extend failed.", err=True)
+        return
+    cfg = result.get("config", {})
+    click.echo(f"Mission:    {result.get('mission_id', mission_id)}")
+    click.echo(f"Status:     {result.get('status', 'unknown')}")
+    click.echo(f"Budget:     ${cfg.get('max_cost_usd', '—')}")
+    click.echo(f"Tokens:     {cfg.get('max_tokens', '—')}")
 
 
 @mission.command("report")

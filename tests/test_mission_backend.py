@@ -254,3 +254,72 @@ def test_github_backend_stubs_raise() -> None:
         gb.list_missions()
     with pytest.raises(NotImplementedError, match="Mission mode requires FileBackend"):
         gb.update_mission("x", {})
+    with pytest.raises(NotImplementedError, match="Mission mode requires FileBackend"):
+        gb.get_mission_usage("x")
+    with pytest.raises(NotImplementedError, match="Mission mode requires FileBackend"):
+        gb.update_mission_usage("x", lambda d: d)
+
+
+# ---------------------------------------------------------------------------
+# get_mission_usage / update_mission_usage
+# ---------------------------------------------------------------------------
+
+
+def test_get_mission_usage_none_for_unknown(backend: FileBackend) -> None:
+    assert backend.get_mission_usage("mission-missing") is None
+
+
+def test_update_mission_usage_creates_sidecar(backend: FileBackend, tmp_path) -> None:
+    backend.create_mission(_make_mission())
+
+    def _updater(current: dict) -> dict:
+        current["total_cost_usd"] = current.get("total_cost_usd", 0.0) + 0.25
+        return current
+
+    new_state = backend.update_mission_usage("mission-login-123", _updater)
+    assert new_state["total_cost_usd"] == 0.25
+    sidecar = tmp_path / ".antfarm" / "missions" / "mission-login-123_usage.json"
+    assert sidecar.exists()
+
+
+def test_update_mission_usage_is_read_modify_write(backend: FileBackend) -> None:
+    backend.create_mission(_make_mission())
+
+    def _add(amount: float):
+        def _fn(current: dict) -> dict:
+            current["total_cost_usd"] = current.get("total_cost_usd", 0.0) + amount
+            return current
+
+        return _fn
+
+    backend.update_mission_usage("mission-login-123", _add(0.10))
+    backend.update_mission_usage("mission-login-123", _add(0.20))
+    backend.update_mission_usage("mission-login-123", _add(0.05))
+    final = backend.get_mission_usage("mission-login-123")
+    assert round(final["total_cost_usd"], 6) == 0.35
+
+
+def test_update_mission_usage_concurrent_serialized(backend: FileBackend) -> None:
+    """Concurrent updaters under the backend lock must not clobber each other."""
+    backend.create_mission(_make_mission())
+    N = 50
+
+    def _increment(current: dict) -> dict:
+        current["total_cost_usd"] = current.get("total_cost_usd", 0.0) + 1.0
+        current["event_count"] = current.get("event_count", 0) + 1
+        return current
+
+    threads = []
+    for _ in range(N):
+        t = threading.Thread(
+            target=backend.update_mission_usage,
+            args=("mission-login-123", _increment),
+        )
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join()
+
+    final = backend.get_mission_usage("mission-login-123")
+    assert final["event_count"] == N
+    assert final["total_cost_usd"] == float(N)

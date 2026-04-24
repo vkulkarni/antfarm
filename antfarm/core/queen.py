@@ -123,12 +123,19 @@ class Queen:
                     )
             time.sleep(self._adaptive_interval(missions))
 
+    # NOTE: _adaptive_interval treats paused missions as non-active so the
+    # loop idles appropriately; no change needed there.
+
     def stop(self) -> None:
         self._stopped = True
 
     # --- per-tick phase dispatch (all idempotent, all read fresh state) ---
 
     def _advance(self, mission: dict) -> None:
+        # Budget tripwire runs BEFORE status dispatch so a mid-phase breach
+        # pauses or cancels immediately rather than waiting for the next tick.
+        if self._check_budget(mission):
+            return
         status = mission["status"]
         if status == MissionStatus.PLANNING:
             self._advance_planning(mission)
@@ -138,6 +145,76 @@ class Queen:
             self._advance_building(mission)
         elif status == MissionStatus.BLOCKED:
             self._advance_blocked(mission)
+        elif status == MissionStatus.PAUSED:
+            # Paused missions are inert until `antfarm mission extend` is
+            # called (which flips status back via the HTTP handler).
+            return
+
+    # --- budget tripwire (v0.6.14 — issue #354) ------------------------
+
+    def _check_budget(self, mission: dict) -> bool:
+        """Return True if a budget breach was detected and acted upon.
+
+        When True, the caller should skip status dispatch — the mission has
+        been transitioned to PAUSED (budget_action='pause') or CANCELLED
+        (budget_action='cancel') in this tick.
+        """
+        cfg = mission.get("config") or {}
+        if cfg.get("max_cost_usd") is None and cfg.get("max_tokens") is None:
+            return False
+        # Already paused — the loop keeps us from re-triggering the event.
+        if mission.get("status") == MissionStatus.PAUSED.value:
+            return True
+
+        try:
+            usage = self.backend.get_mission_usage(mission["mission_id"]) or {}
+        except NotImplementedError:
+            return False
+        cost = float(usage.get("total_cost_usd", 0.0) or 0.0)
+        tokens = int(usage.get("total_input_tokens", 0) or 0) + int(
+            usage.get("total_output_tokens", 0) or 0
+        )
+
+        breach = False
+        if cfg.get("max_cost_usd") is not None and cost >= float(cfg["max_cost_usd"]):
+            breach = True
+        if cfg.get("max_tokens") is not None and tokens >= int(cfg["max_tokens"]):
+            breach = True
+        if not breach:
+            return False
+
+        action = cfg.get("budget_action", "pause")
+        mission_id = mission["mission_id"]
+        if action == "pause":
+            prior = mission.get("status")
+            self.backend.update_mission(
+                mission_id,
+                {
+                    "status": MissionStatus.PAUSED.value,
+                    "paused_from_status": prior,
+                },
+            )
+            _emit_event(
+                "mission_budget_exceeded",
+                "",
+                detail=(f"mission={mission_id} action=pause cost={cost:.4f} tokens={tokens}"),
+                actor="queen",
+            )
+        else:  # cancel
+            with contextlib.suppress(Exception):
+                self.backend.cancel_mission_tasks(mission_id, reason="mission budget exceeded")
+            with contextlib.suppress(Exception):
+                self.backend.update_mission(
+                    mission_id,
+                    {"status": MissionStatus.CANCELLED.value},
+                )
+            _emit_event(
+                "mission_budget_exceeded",
+                "",
+                detail=(f"mission={mission_id} action=cancel cost={cost:.4f} tokens={tokens}"),
+                actor="queen",
+            )
+        return True
 
     # --- phase handlers ---
 
