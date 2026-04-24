@@ -28,6 +28,7 @@ from enum import StrEnum
 
 import httpx
 
+from antfarm.core.auto_merge import AutoMergeOutcome, decide, parse_pr_state
 from antfarm.core.backends.base import TaskBackend
 from antfarm.core.colony_client import ColonyClient
 from antfarm.core.missions import is_infra_task
@@ -110,9 +111,37 @@ _MERGE_FAILED_REASONS = frozenset(
         "fetch_failed",  # git fetch origin failed
         "checkout_failed",  # could not checkout integration branch / temp
         "repo_dirty",  # soldier clone was dirty and recovery failed
+        "auto_merge_ci_failed",  # CI on PR reported FAILURE while mode gated on CI
+        "auto_merge_refused",  # security guard refused auto-merge on this repo
         "unknown",  # catch-all for unclassified failures
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# Auto-merge event vocabulary (#353)
+#
+# When a mission's ``config.auto_merge`` is not ``never``, Soldier runs the
+# auto-merge pipeline on every passing-verdict task. The pipeline emits
+# these event types (actor=soldier) so operators can trace why a PR did or
+# did not auto-merge:
+#
+# - auto_merged: PR was successfully squash-merged via ``gh pr merge``.
+# - auto_merge_rebasing: PR needs ``git merge --ff-only`` / rebase before
+#   auto-merge can proceed. Usually followed by another auto_merge_* event
+#   on the next tick.
+# - auto_merge_waiting_ci: ``on-review-pass-and-ci-green`` mode, PR
+#   mergeStateStatus is UNSTABLE or PENDING. Soldier skips this tick.
+# - auto_merge_kickback: mergeStateStatus=BLOCKED with failing CI. Soldier
+#   kicks back the task with reason=auto_merge_ci_failed so the worker
+#   re-attempts with fixed code.
+# - auto_merge_blocked: mergeStateStatus=BLOCKED with missing reviews or
+#   other unresolved reason. Soldier pauses the parent mission (sets
+#   status=BLOCKED + stores ``auto_merge_pause_reason``).
+# - auto_merge_refused: security guard refused auto-merge (viewer lacks
+#   permission or main/master without ADMIN). Surfaces once per PR until
+#   the backoff window expires.
+# ---------------------------------------------------------------------------
 
 
 def _emit(event_type: str, task_id: str, detail: str = "") -> None:
@@ -199,6 +228,12 @@ class Soldier:
         # One-shot preflight validation of ``test_command`` — see #326. Fires
         # at most once per Soldier lifetime from ``run`` or ``run_once``.
         self._preflight_done: bool = False
+        # Auto-merge (#353): per-PR backoff (tick timestamp when we last
+        # polled that PR's mergeability) and a per-repo cache of
+        # ``gh repo view`` viewer permission (value, expires_ts).
+        self._auto_merge_last_checked: dict[str, float] = {}
+        self._repo_permission_cache: dict[str, tuple[str, float]] = {}
+        self.auto_merge_poll_backoff_seconds: float = 30.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -379,20 +414,24 @@ class Soldier:
             if verdict_dict is not None:
                 passed, reason = self.check_review_verdict(task)
                 if passed:
-                    result = self.attempt_merge(task)
-                    if result == MergeResult.MERGED:
-                        self._safe_mark_merged(task_id, attempt_id)
+                    auto_outcome = self._attempt_auto_merge(task)
+                    if auto_outcome is None:
+                        result = self.attempt_merge(task)
+                        if result == MergeResult.MERGED:
+                            self._safe_mark_merged(task_id, attempt_id)
+                        else:
+                            try:
+                                self.kickback_with_cascade(task_id, self.last_failure_reason)
+                            except Exception as exc:
+                                logger.exception("kickback failed for %s", task_id)
+                                _emit(
+                                    "soldier_error",
+                                    task_id,
+                                    f"op=kickback_merge_failed type={type(exc).__name__} msg={exc}",
+                                )
+                                raise
                     else:
-                        try:
-                            self.kickback_with_cascade(task_id, self.last_failure_reason)
-                        except Exception as exc:
-                            logger.exception("kickback failed for %s", task_id)
-                            _emit(
-                                "soldier_error",
-                                task_id,
-                                f"op=kickback_merge_failed type={type(exc).__name__} msg={exc}",
-                            )
-                            raise
+                        result = self._handle_auto_merge_outcome(auto_outcome, task)
                     results.append((task_id, result))
                 else:
                     # Diagnostic skip before kickback: needs_changes verdict.
@@ -475,11 +514,15 @@ class Soldier:
                             continue
                         passed, reason = self.check_review_verdict(task_updated)
                         if passed:
-                            result = self.attempt_merge(task_updated)
-                            if result == MergeResult.MERGED:
-                                self._safe_mark_merged(task_id, attempt_id)
+                            auto_outcome = self._attempt_auto_merge(task_updated)
+                            if auto_outcome is None:
+                                result = self.attempt_merge(task_updated)
+                                if result == MergeResult.MERGED:
+                                    self._safe_mark_merged(task_id, attempt_id)
+                                else:
+                                    self.kickback_with_cascade(task_id, self.last_failure_reason)
                             else:
-                                self.kickback_with_cascade(task_id, self.last_failure_reason)
+                                result = self._handle_auto_merge_outcome(auto_outcome, task_updated)
                             results.append((task_id, result))
                         else:
                             _emit("merge_skipped", task_id, "reason=needs_changes")
@@ -540,11 +583,15 @@ class Soldier:
 
             passed, reason = self.check_review_verdict(task_updated)
             if passed:
-                result = self.attempt_merge(task_updated)
-                if result == MergeResult.MERGED:
-                    self._safe_mark_merged(task_id, attempt_id)
+                auto_outcome = self._attempt_auto_merge(task_updated)
+                if auto_outcome is None:
+                    result = self.attempt_merge(task_updated)
+                    if result == MergeResult.MERGED:
+                        self._safe_mark_merged(task_id, attempt_id)
+                    else:
+                        self.kickback_with_cascade(task_id, self.last_failure_reason)
                 else:
-                    self.kickback_with_cascade(task_id, self.last_failure_reason)
+                    result = self._handle_auto_merge_outcome(auto_outcome, task_updated)
                 results.append((task_id, result))
             else:
                 # Diagnostic skip before kickback: needs_changes verdict.
@@ -1984,6 +2031,385 @@ class Soldier:
             return None
 
     # ------------------------------------------------------------------
+    # Auto-merge (#353)
+    # ------------------------------------------------------------------
+
+    def _auto_merge_policy_for_task(self, task: dict) -> str:
+        """Resolve the auto-merge mode for ``task`` via its parent mission.
+
+        Returns the mode string — ``"never"`` when the task has no mission,
+        the mission cannot be fetched, or the mission's config does not set
+        the key.
+        """
+        mission_id = task.get("mission_id")
+        if not mission_id:
+            return "never"
+        try:
+            mission = self.colony.get_mission(mission_id)
+        except Exception:
+            logger.debug("auto-merge: get_mission(%s) raised", mission_id, exc_info=True)
+            return "never"
+        if not mission:
+            return "never"
+        config = mission.get("config") or {}
+        return str(config.get("auto_merge") or "never")
+
+    def _query_pr_state(self, pr: str):
+        """Run ``gh pr view <pr> --json ...`` and parse the output.
+
+        Returns a :class:`PRState` or None on any subprocess / parse error.
+        """
+        if not pr:
+            return None
+        try:
+            r = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    pr,
+                    "--json",
+                    "mergeStateStatus,mergeable,reviewDecision,statusCheckRollup",
+                ],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode != 0:
+            return None
+        return parse_pr_state(r.stdout or "")
+
+    def _gh_pr_merge_squash(self, pr: str) -> tuple[bool, str]:
+        """Run ``gh pr merge <pr> --squash --delete-branch``.
+
+        Returns (ok, stderr_tail). Never raises.
+        """
+        try:
+            r = subprocess.run(
+                ["gh", "pr", "merge", pr, "--squash", "--delete-branch"],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, f"gh pr merge exec error: {exc}"
+        if r.returncode == 0:
+            return True, ""
+        tail = (r.stderr or r.stdout or "").strip().splitlines()
+        return False, "\n".join(tail[-20:])
+
+    def _resolve_repo_slug(self) -> str | None:
+        """Return ``owner/name`` for the repo we're operating on, or None."""
+        try:
+            r = subprocess.run(
+                [
+                    "gh",
+                    "repo",
+                    "view",
+                    "--json",
+                    "owner,name",
+                    "-q",
+                    '.owner.login + "/" + .name',
+                ],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode != 0:
+            return None
+        slug = (r.stdout or "").strip()
+        return slug or None
+
+    def _query_viewer_permission(self) -> str | None:
+        """Query viewer permission via ``gh repo view --json viewerPermission``."""
+        try:
+            r = subprocess.run(
+                ["gh", "repo", "view", "--json", "viewerPermission", "-q", ".viewerPermission"],
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if r.returncode != 0:
+            return None
+        perm = (r.stdout or "").strip()
+        return perm or None
+
+    def _auto_merge_security_check(
+        self,
+        task: dict,
+        mission: dict,
+    ) -> tuple[bool, str]:
+        """Gate auto-merge on viewer permission + integration branch.
+
+        Returns (True, "") to allow; (False, reason) to refuse. Caches
+        viewer permission per-repo for 5 minutes.
+        """
+        del task  # kept in signature for symmetry with other hooks
+        slug = self._resolve_repo_slug() or self.repo_path
+        now = time.time()
+        cached = self._repo_permission_cache.get(slug)
+        if cached and cached[1] > now:
+            perm = cached[0]
+        else:
+            perm = self._query_viewer_permission() or ""
+            # Cache for 5 minutes regardless of success, so a transient gh
+            # outage doesn't hammer the API on every tick.
+            self._repo_permission_cache[slug] = (perm, now + 300.0)
+        perm_upper = perm.upper()
+        allow_external = bool(
+            (mission.get("config") or {}).get("allow_auto_merge_on_external", False)
+        )
+
+        if perm_upper not in {"ADMIN", "MAINTAIN", "WRITE"}:
+            if allow_external:
+                return True, ""
+            return False, f"insufficient repo permission: {perm or 'unknown'}"
+
+        # Extra guard: auto-merge to main/master requires ADMIN unless operator
+        # explicitly opted in via allow_auto_merge_on_external.
+        if self.integration_branch in ("main", "master") and perm_upper != "ADMIN":
+            if allow_external:
+                return True, ""
+            return (
+                False,
+                f"auto-merge to {self.integration_branch} requires ADMIN "
+                f"(viewer={perm or 'unknown'})",
+            )
+        return True, ""
+
+    def _sync_integration_branch_after_auto_merge(self) -> None:
+        """Re-align the local integration branch with origin after auto-merge.
+
+        GitHub squash-merged the PR on the remote; locally we still have the
+        pre-merge tip. Fetch + hard-reset brings us back in sync without
+        running any local tests (GitHub's branch protection already gated
+        the merge). Best-effort; subprocess errors are swallowed.
+        """
+        try:
+            subprocess.run(
+                ["git", "fetch", "origin"],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=False,
+            )
+            subprocess.run(
+                ["git", "checkout", self.integration_branch],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=False,
+            )
+            subprocess.run(
+                ["git", "reset", "--hard", f"origin/{self.integration_branch}"],
+                cwd=self.repo_path,
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            logger.debug(
+                "auto-merge: post-merge sync raised for %s",
+                self.integration_branch,
+                exc_info=True,
+            )
+
+    def _rebase_pr_branch_for_auto_merge(self, task: dict, pr: str) -> None:
+        """Rebase the PR's branch onto origin/<integration_branch>.
+
+        Wraps the existing deterministic rebase helper. Any failure is
+        logged and surfaces as an ``auto_merge_rebasing`` event with
+        ``status=failed`` so the next tick re-evaluates.
+        """
+        branch = self._get_attempt_branch(task) or ""
+        task_id = task.get("id", "")
+        if not branch:
+            _emit("auto_merge_rebasing", task_id, f"pr={pr} status=failed reason=no_branch")
+            return
+        # Reuse the deterministic helper's rebase core — it aborts on conflict
+        # and returns FAILED without merging further. We don't care about the
+        # eventual merge here; we just want the rebase/force-push side effect.
+        outcome = self._rebase_and_retry_merge(
+            task_id=task_id,
+            branch=branch,
+            temp_branch="antfarm/temp-merge",
+            initial_conflict_stderr="auto-merge triggered rebase",
+        )
+        detail = f"pr={pr} branch={branch} result={outcome.value}"
+        _emit("auto_merge_rebasing", task_id, detail)
+
+    def _pause_mission_for_blocked_reviews(
+        self,
+        task: dict,
+        pr: str,
+        reason: str,
+    ) -> None:
+        """Mark the parent mission as BLOCKED with a human-readable reason."""
+        task_id = task.get("id", "")
+        mission_id = task.get("mission_id")
+        if not mission_id:
+            _emit("auto_merge_blocked", task_id, f"pr={pr} reason={reason} mission=none")
+            return
+        try:
+            self.colony.update_mission(
+                mission_id,
+                {
+                    "status": "blocked",
+                    "auto_merge_pause_reason": reason,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "auto-merge: failed to pause mission %s for task %s", mission_id, task_id
+            )
+        _emit("auto_merge_blocked", task_id, f"pr={pr} reason={reason} mission={mission_id}")
+
+    def _attempt_auto_merge(self, task: dict) -> AutoMergeOutcome | None:
+        """Decide and perform auto-merge for ``task``.
+
+        Returns:
+            - None if auto-merge is disabled for this task (caller falls
+              through to the legacy ``attempt_merge`` path).
+            - AutoMergeOutcome (possibly with ``action='skip'``) otherwise.
+              The caller (``_handle_auto_merge_outcome``) translates the
+              outcome into the merge-pipeline result.
+        """
+        mode = self._auto_merge_policy_for_task(task)
+        if mode == "never":
+            return None
+
+        task_id = task.get("id", "")
+        pr = self._get_attempt_pr(task) or ""
+        if not pr:
+            return AutoMergeOutcome(action="skip", pr="", mode=mode, reason="no PR on attempt")
+
+        # Security check before we make any destructive call or poll gh.
+        mission = {}
+        mission_id = task.get("mission_id")
+        if mission_id:
+            try:
+                mission = self.colony.get_mission(mission_id) or {}
+            except Exception:
+                logger.debug(
+                    "auto-merge: get_mission(%s) raised during security check",
+                    mission_id,
+                    exc_info=True,
+                )
+                mission = {}
+
+        ok, refuse_reason = self._auto_merge_security_check(task, mission)
+        if not ok:
+            _emit("auto_merge_refused", task_id, f"pr={pr} reason={refuse_reason}")
+            return AutoMergeOutcome(
+                action="skip", pr=pr, mode=mode, reason=f"refused: {refuse_reason}"
+            )
+
+        # Backoff: don't re-poll the same PR within 30s.
+        now = time.time()
+        last = self._auto_merge_last_checked.get(pr, 0.0)
+        if now - last < self.auto_merge_poll_backoff_seconds:
+            return AutoMergeOutcome(
+                action="skip", pr=pr, mode=mode, reason="within poll backoff window"
+            )
+        self._auto_merge_last_checked[pr] = now
+
+        pr_state = self._query_pr_state(pr)
+        outcome = decide(mode, verdict_passed=True, pr_state=pr_state, pr=pr)
+        return outcome
+
+    def _handle_auto_merge_outcome(
+        self,
+        outcome: AutoMergeOutcome,
+        task: dict,
+    ) -> MergeResult:
+        """Translate an :class:`AutoMergeOutcome` into a :class:`MergeResult`.
+
+        - ``merge``: invoke ``gh pr merge --squash`` and mark the attempt
+          with ``auto_merged=True``. Returns MERGED on success, FAILED on
+          error (caller kicks back through the normal pipeline).
+        - ``rebase``: rebase the PR branch; signal NEEDS_REVIEW so the tick
+          exits without touching the attempt's review verdict.
+        - ``wait_ci`` / ``skip``: signal NEEDS_REVIEW — the PR stays done,
+          we'll re-evaluate next tick.
+        - ``kickback_ci``: kick back the task with an ``auto_merge_ci_failed``
+          reason code and emit ``auto_merge_kickback``.
+        - ``pause_mission``: pause the parent mission and signal NEEDS_REVIEW.
+        """
+        task_id = task.get("id", "")
+        attempt_id = task.get("current_attempt") or ""
+
+        if outcome.action == "merge":
+            ok, stderr_tail = self._gh_pr_merge_squash(outcome.pr)
+            if not ok:
+                self.last_failure_reason = f"auto_merge: gh pr merge failed: {stderr_tail}"
+                _emit(
+                    "merge_failed",
+                    task_id,
+                    f"reason=unknown: auto_merge gh pr merge failed: {stderr_tail}",
+                )
+                return MergeResult.FAILED
+            self._sync_integration_branch_after_auto_merge()
+            _emit(
+                "auto_merged",
+                task_id,
+                f"pr={outcome.pr} mode={outcome.mode} reason={outcome.reason}",
+            )
+            try:
+                self.colony.mark_merged(task_id, attempt_id, auto_merged=True)
+            except TypeError:
+                # Older colony/backends may not accept the kwarg — degrade gracefully.
+                self.colony.mark_merged(task_id, attempt_id)
+            return MergeResult.MERGED
+
+        if outcome.action == "rebase":
+            _emit(
+                "auto_merge_rebasing",
+                task_id,
+                f"pr={outcome.pr} mode={outcome.mode} reason={outcome.reason}",
+            )
+            self._rebase_pr_branch_for_auto_merge(task, outcome.pr)
+            return MergeResult.NEEDS_REVIEW
+
+        if outcome.action == "wait_ci":
+            _emit(
+                "auto_merge_waiting_ci",
+                task_id,
+                f"pr={outcome.pr} mode={outcome.mode} reason={outcome.reason}",
+            )
+            return MergeResult.NEEDS_REVIEW
+
+        if outcome.action == "kickback_ci":
+            _emit(
+                "auto_merge_kickback",
+                task_id,
+                f"pr={outcome.pr} mode={outcome.mode} reason={outcome.reason}",
+            )
+            self.last_failure_reason = f"auto_merge_ci_failed: {outcome.reason}"
+            try:
+                self.kickback_with_cascade(task_id, self.last_failure_reason)
+            except Exception:
+                logger.exception("auto-merge: kickback_with_cascade failed for %s", task_id)
+            return MergeResult.FAILED
+
+        if outcome.action == "pause_mission":
+            self._pause_mission_for_blocked_reviews(task, outcome.pr, outcome.reason)
+            return MergeResult.NEEDS_REVIEW
+
+        # skip — logged at caller scope; stay inert.
+        return MergeResult.NEEDS_REVIEW
+
+    # ------------------------------------------------------------------
     # from_backend: in-process Soldier (no HTTP round-trips)
     # ------------------------------------------------------------------
 
@@ -2019,6 +2445,9 @@ class Soldier:
         instance.last_failure_reason = ""
         instance._event_cursor = 0
         instance._preflight_done = False
+        instance._auto_merge_last_checked = {}
+        instance._repo_permission_cache = {}
+        instance.auto_merge_poll_backoff_seconds = 30.0
         return instance
 
 
@@ -2066,8 +2495,13 @@ class _BackendAdapter:
             task_id = self._backend.carry(task)
         return {"task_id": task_id}
 
-    def mark_merged(self, task_id: str, attempt_id: str) -> None:
-        self._backend.mark_merged(task_id, attempt_id)
+    def mark_merged(
+        self,
+        task_id: str,
+        attempt_id: str,
+        auto_merged: bool = False,
+    ) -> None:
+        self._backend.mark_merged(task_id, attempt_id, auto_merged=auto_merged)
 
     def kickback(self, task_id: str, reason: str, max_attempts: int = 3) -> None:
         self._backend.kickback(task_id, reason, max_attempts=max_attempts)

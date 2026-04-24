@@ -367,6 +367,7 @@ class ReviewVerdictRequest(BaseModel):
 
 class MergeRequest(BaseModel):
     attempt_id: str
+    auto_merged: bool = False
 
 
 class RereviewRequest(BaseModel):
@@ -786,12 +787,15 @@ def get_app(
     def merge_task(task_id: str, req: MergeRequest):
         """Mark a task attempt as merged. Soldier only."""
         try:
-            _backend.mark_merged(task_id, req.attempt_id)
+            _backend.mark_merged(task_id, req.attempt_id, auto_merged=req.auto_merged)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        _emit_event("merged", task_id, f"attempt={req.attempt_id}")
+        detail = f"attempt={req.attempt_id}"
+        if req.auto_merged:
+            detail += " auto_merged=1"
+        _emit_event("merged", task_id, detail)
         return {"ok": True}
 
     @app.post("/tasks/{task_id}/pause", status_code=200)

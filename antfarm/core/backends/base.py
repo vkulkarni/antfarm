@@ -193,7 +193,12 @@ class TaskBackend(ABC):
         ...
 
     @abstractmethod
-    def mark_merged(self, task_id: str, attempt_id: str) -> None:
+    def mark_merged(
+        self,
+        task_id: str,
+        attempt_id: str,
+        auto_merged: bool = False,
+    ) -> None:
         """Mark attempt as MERGED. Task stays DONE in done/ folder.
 
         Merged state is tracked on the attempt, not the task status.
@@ -201,6 +206,8 @@ class TaskBackend(ABC):
         Args:
             task_id: ID of the task.
             attempt_id: ID of the attempt that was merged.
+            auto_merged: If True, also record ``attempt["auto_merged"] = True``
+                so report.py can split merged counts into auto vs manual.
 
         Raises:
             ValueError: If attempt_id is not the current attempt.

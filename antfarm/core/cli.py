@@ -16,6 +16,8 @@ import time
 import click
 import httpx
 
+from antfarm.core.missions import VALID_AUTO_MERGE_MODES
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -63,6 +65,14 @@ def _delete(
         f"{colony_url.rstrip('/')}{path}", params=params or {}, headers=_auth_headers(token)
     )
     r.raise_for_status()
+
+
+def _patch(colony_url: str, path: str, payload: dict, token: str | None = None) -> dict | None:
+    r = httpx.patch(f"{colony_url.rstrip('/')}{path}", json=payload, headers=_auth_headers(token))
+    r.raise_for_status()
+    if r.status_code == 204:
+        return None
+    return r.json()
 
 
 # ---------------------------------------------------------------------------
@@ -1374,6 +1384,18 @@ def mission():
 @click.option("--max-builders", type=int, default=None, help="Max parallel builder workers.")
 @click.option("--max-attempts", type=int, default=None, help="Max attempts per task.")
 @click.option("--integration-branch", default=None, help="Integration branch for this mission.")
+@click.option(
+    "--auto-merge",
+    type=click.Choice(list(VALID_AUTO_MERGE_MODES)),
+    default=None,
+    help="Auto-merge policy: never, on-review-pass, on-review-pass-and-ci-green.",
+)
+@click.option(
+    "--allow-auto-merge-on-external",
+    is_flag=True,
+    default=False,
+    help="Permit auto-merge even when the viewer is not an ADMIN of the target repo.",
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def mission_create(
@@ -1383,6 +1405,8 @@ def mission_create(
     max_builders: int | None,
     max_attempts: int | None,
     integration_branch: str | None,
+    auto_merge: str | None,
+    allow_auto_merge_on_external: bool,
     colony_url: str,
     token: str | None,
 ):
@@ -1400,6 +1424,10 @@ def mission_create(
         config["max_attempts"] = max_attempts
     if integration_branch is not None:
         config["integration_branch"] = integration_branch
+    if auto_merge is not None:
+        config["auto_merge"] = auto_merge
+    if allow_auto_merge_on_external:
+        config["allow_auto_merge_on_external"] = True
     if config:
         payload["config"] = config
     if mission_id:
@@ -1426,6 +1454,9 @@ def mission_status(mission_id: str, colony_url: str, token: str | None):
         click.echo(f"Completion: {completion_mode} (treated as best_effort in v0.6.0)")
     else:
         click.echo(f"Completion: {completion_mode}")
+
+    auto_merge_mode = config.get("auto_merge", "never")
+    click.echo(f"Auto-merge: {auto_merge_mode}")
 
     task_ids = data.get("task_ids", [])
     click.echo(f"Tasks:      {len(task_ids)}")
@@ -1477,6 +1508,48 @@ def mission_report(mission_id: str, fmt: str, colony_url: str, token: str | None
                 title = t.get("title", t.get("id", "?"))[:28]
                 status = t.get("status", "unknown")
                 click.echo(f"{title:<30} {status:<12}")
+
+
+@mission.command("update")
+@click.argument("mission_id")
+@click.option(
+    "--auto-merge",
+    type=click.Choice(list(VALID_AUTO_MERGE_MODES)),
+    default=None,
+    help="Auto-merge policy: never, on-review-pass, on-review-pass-and-ci-green.",
+)
+@click.option(
+    "--allow-auto-merge-on-external",
+    is_flag=True,
+    default=None,
+    help="Permit auto-merge even when the viewer is not an ADMIN of the target repo.",
+)
+@COLONY_URL_OPTION
+@TOKEN_OPTION
+def mission_update(
+    mission_id: str,
+    auto_merge: str | None,
+    allow_auto_merge_on_external: bool | None,
+    colony_url: str,
+    token: str | None,
+):
+    """Update a mission's config in place. Only the provided fields are changed."""
+    partial: dict = {}
+    if auto_merge is not None:
+        partial["auto_merge"] = auto_merge
+    if allow_auto_merge_on_external is not None:
+        partial["allow_auto_merge_on_external"] = bool(allow_auto_merge_on_external)
+
+    if not partial:
+        click.echo("No updates specified. Use --auto-merge or --allow-auto-merge-on-external.")
+        return
+
+    # Fetch current config and shallow-merge so fields we did not touch are preserved.
+    current = _get(colony_url, f"/missions/{mission_id}", token=token)
+    merged = dict(current.get("config") or {})
+    merged.update(partial)
+    _patch(colony_url, f"/missions/{mission_id}", {"updates": {"config": merged}}, token=token)
+    click.echo(f"Mission {mission_id} updated: {partial}")
 
 
 @mission.command("cancel")

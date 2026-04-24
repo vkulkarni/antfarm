@@ -45,6 +45,8 @@ def build_report(mission: dict, tasks: list[dict]) -> MissionReport:
     total_lines_added = 0
     total_lines_removed = 0
     all_risks: list[str] = []
+    auto_merged_count = 0
+    manual_merged_count = 0
 
     for task in impl_tasks:
         attempts = task.get("attempts", [])
@@ -57,14 +59,20 @@ def build_report(mission: dict, tasks: list[dict]) -> MissionReport:
             files_changed = artifact.get("files_changed", [])
             risks = artifact.get("risks", [])
 
-            merged.append(MissionReportTask(
-                task_id=task["id"],
-                title=task.get("title", ""),
-                pr_url=pr_url,
-                lines_added=lines_added,
-                lines_removed=lines_removed,
-                files_changed=list(files_changed),
-            ))
+            merged.append(
+                MissionReportTask(
+                    task_id=task["id"],
+                    title=task.get("title", ""),
+                    pr_url=pr_url,
+                    lines_added=lines_added,
+                    lines_removed=lines_removed,
+                    files_changed=list(files_changed),
+                )
+            )
+            if merged_attempt.get("auto_merged", False):
+                auto_merged_count += 1
+            else:
+                manual_merged_count += 1
             if pr_url:
                 all_pr_urls.append(pr_url)
             branch = merged_attempt.get("branch")
@@ -79,13 +87,15 @@ def build_report(mission: dict, tasks: list[dict]) -> MissionReport:
             reason = _extract_blocked_reason(task)
             attempt_count = len(attempts)
             last_failure_type = _extract_last_failure_type(task)
-            blocked.append(MissionReportBlocked(
-                task_id=task["id"],
-                title=task.get("title", ""),
-                reason=reason,
-                attempt_count=attempt_count,
-                last_failure_type=last_failure_type,
-            ))
+            blocked.append(
+                MissionReportBlocked(
+                    task_id=task["id"],
+                    title=task.get("title", ""),
+                    reason=reason,
+                    attempt_count=attempt_count,
+                    last_failure_type=last_failure_type,
+                )
+            )
 
     # Failed reviews: review tasks with verdict needs_changes or blocked
     failed_reviews = 0
@@ -129,6 +139,8 @@ def build_report(mission: dict, tasks: list[dict]) -> MissionReport:
         total_lines_removed=total_lines_removed,
         files_changed=unique_files,
         generated_at=datetime.now(UTC).isoformat() + "Z",
+        auto_merged_tasks=auto_merged_count,
+        manual_merged_tasks=manual_merged_count,
     )
 
 
@@ -148,9 +160,7 @@ def render_terminal(report: MissionReport, use_rich: bool = False) -> str:
     Uses only ``textwrap`` from the stdlib. 80-column wrap by default.
     """
     if use_rich:
-        raise NotImplementedError(
-            "rich rendering is a v0.6.1+ opt-in; v0.6.0 is dependency-free"
-        )
+        raise NotImplementedError("rich rendering is a v0.6.1+ opt-in; v0.6.0 is dependency-free")
 
     lines: list[str] = []
     width = 80
@@ -170,9 +180,11 @@ def render_terminal(report: MissionReport, use_rich: bool = False) -> str:
     lines.append("")
 
     # Summary
-    lines.append(f"Tasks: {report.total_tasks} total, "
-                 f"{report.merged_tasks} merged, "
-                 f"{report.blocked_tasks} blocked")
+    lines.append(
+        f"Tasks: {report.total_tasks} total, "
+        f"{report.merged_tasks} merged, "
+        f"{report.blocked_tasks} blocked"
+    )
     if report.failed_reviews:
         lines.append(f"Failed reviews: {report.failed_reviews}")
     lines.append(f"Lines: +{report.total_lines_added} / -{report.total_lines_removed}")
@@ -194,8 +206,9 @@ def render_terminal(report: MissionReport, use_rich: bool = False) -> str:
         for mt in report.merged:
             pr_str = f"  PR: {mt.pr_url}" if mt.pr_url else ""
             lines.append(f"  [{mt.task_id}] {mt.title}{pr_str}")
-            lines.append(f"    +{mt.lines_added} / -{mt.lines_removed}, "
-                         f"{len(mt.files_changed)} files")
+            lines.append(
+                f"    +{mt.lines_added} / -{mt.lines_removed}, {len(mt.files_changed)} files"
+            )
         lines.append("")
 
     # Merged tasks (non-cancelled)
@@ -206,8 +219,9 @@ def render_terminal(report: MissionReport, use_rich: bool = False) -> str:
         for mt in report.merged:
             pr_str = f"  PR: {mt.pr_url}" if mt.pr_url else ""
             lines.append(f"  [{mt.task_id}] {mt.title}{pr_str}")
-            lines.append(f"    +{mt.lines_added} / -{mt.lines_removed}, "
-                         f"{len(mt.files_changed)} files")
+            lines.append(
+                f"    +{mt.lines_added} / -{mt.lines_removed}, {len(mt.files_changed)} files"
+            )
         lines.append("")
 
     # Blocked tasks
@@ -286,8 +300,9 @@ def render_markdown(report: MissionReport) -> str:
         for mt in report.merged:
             pr_link = f" ([PR]({mt.pr_url}))" if mt.pr_url else ""
             lines.append(f"- **{mt.task_id}**: {mt.title}{pr_link}")
-            lines.append(f"  - +{mt.lines_added} / -{mt.lines_removed}, "
-                         f"{len(mt.files_changed)} files")
+            lines.append(
+                f"  - +{mt.lines_added} / -{mt.lines_removed}, {len(mt.files_changed)} files"
+            )
         lines.append("")
 
     # Merged tasks (non-cancelled)
@@ -297,8 +312,9 @@ def render_markdown(report: MissionReport) -> str:
         for mt in report.merged:
             pr_link = f" ([PR]({mt.pr_url}))" if mt.pr_url else ""
             lines.append(f"- **{mt.task_id}**: {mt.title}{pr_link}")
-            lines.append(f"  - +{mt.lines_added} / -{mt.lines_removed}, "
-                         f"{len(mt.files_changed)} files")
+            lines.append(
+                f"  - +{mt.lines_added} / -{mt.lines_removed}, {len(mt.files_changed)} files"
+            )
         lines.append("")
 
     # Blocked tasks

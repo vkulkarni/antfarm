@@ -31,9 +31,12 @@ def test_mission_create_reads_spec_file_and_posts(tmp_path: Path):
         result = runner.invoke(
             main,
             [
-                "mission", "create",
-                "--spec", str(spec_file),
-                "--colony-url", "http://localhost:7433",
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -60,10 +63,13 @@ def test_mission_create_no_plan_review_flag_sets_config(tmp_path: Path):
         result = runner.invoke(
             main,
             [
-                "mission", "create",
-                "--spec", str(spec_file),
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
                 "--no-plan-review",
-                "--colony-url", "http://localhost:7433",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -88,10 +94,14 @@ def test_mission_create_max_builders_overrides_config(tmp_path: Path):
         result = runner.invoke(
             main,
             [
-                "mission", "create",
-                "--spec", str(spec_file),
-                "--max-builders", "8",
-                "--colony-url", "http://localhost:7433",
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
+                "--max-builders",
+                "8",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -195,8 +205,11 @@ def test_mission_report_terminal_format():
         result = runner.invoke(
             main,
             [
-                "mission", "report", "mission-auth-123",
-                "--colony-url", "http://localhost:7433",
+                "mission",
+                "report",
+                "mission-auth-123",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -219,9 +232,13 @@ def test_mission_report_markdown_format():
         result = runner.invoke(
             main,
             [
-                "mission", "report", "mission-auth-123",
-                "--format", "md",
-                "--colony-url", "http://localhost:7433",
+                "mission",
+                "report",
+                "mission-auth-123",
+                "--format",
+                "md",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -244,9 +261,13 @@ def test_mission_report_json_format():
         result = runner.invoke(
             main,
             [
-                "mission", "report", "mission-auth-123",
-                "--format", "json",
-                "--colony-url", "http://localhost:7433",
+                "mission",
+                "report",
+                "mission-auth-123",
+                "--format",
+                "json",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -304,9 +325,12 @@ def test_mission_list_filters_by_status():
         result = runner.invoke(
             main,
             [
-                "mission", "list",
-                "--status", "building",
-                "--colony-url", "http://localhost:7433",
+                "mission",
+                "list",
+                "--status",
+                "building",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 
@@ -337,6 +361,154 @@ def test_mission_list_empty():
 
 
 # ---------------------------------------------------------------------------
+# mission create --auto-merge (#353)
+# ---------------------------------------------------------------------------
+
+
+def test_mission_create_auto_merge_flag_sets_config(tmp_path: Path):
+    """--auto-merge sets auto_merge in config."""
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("spec")
+
+    runner = CliRunner()
+
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"mission_id": "m1"}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
+                "--auto-merge",
+                "on-review-pass-and-ci-green",
+                "--allow-auto-merge-on-external",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert payload["config"]["auto_merge"] == "on-review-pass-and-ci-green"
+        assert payload["config"]["allow_auto_merge_on_external"] is True
+
+
+def test_mission_create_rejects_invalid_auto_merge(tmp_path: Path):
+    """Click choice validation rejects unknown auto-merge modes."""
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("spec")
+
+    runner = CliRunner()
+
+    result = runner.invoke(
+        main,
+        [
+            "mission",
+            "create",
+            "--spec",
+            str(spec_file),
+            "--auto-merge",
+            "bogus-mode",
+            "--colony-url",
+            "http://localhost:7433",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "bogus-mode" in result.output or "Invalid value" in result.output
+
+
+def test_mission_update_patches_config_preserving_other_fields():
+    """mission update --auto-merge GETs, merges, then PATCHes config."""
+    runner = CliRunner()
+
+    current_mission = {
+        "mission_id": "m1",
+        "status": "building",
+        "config": {
+            "completion_mode": "best_effort",
+            "max_parallel_builders": 4,
+            "auto_merge": "never",
+        },
+        "task_ids": [],
+        "created_at": "2026-04-20T00:00:00Z",
+    }
+
+    with (
+        patch("antfarm.core.cli.httpx.get") as mock_get,
+        patch("antfarm.core.cli.httpx.patch") as mock_patch,
+    ):
+        mock_get_resp = MagicMock()
+        mock_get_resp.status_code = 200
+        mock_get_resp.json.return_value = current_mission
+        mock_get.return_value = mock_get_resp
+
+        mock_patch_resp = MagicMock()
+        mock_patch_resp.status_code = 200
+        mock_patch_resp.json.return_value = {"ok": True}
+        mock_patch.return_value = mock_patch_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "update",
+                "m1",
+                "--auto-merge",
+                "on-review-pass",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_patch.call_args.kwargs.get("json") or mock_patch.call_args[1]["json"]
+        merged_config = payload["updates"]["config"]
+        # Existing fields preserved
+        assert merged_config["completion_mode"] == "best_effort"
+        assert merged_config["max_parallel_builders"] == 4
+        # New value applied
+        assert merged_config["auto_merge"] == "on-review-pass"
+
+
+def test_mission_status_prints_auto_merge_line():
+    """mission status output includes Auto-merge: line."""
+    runner = CliRunner()
+
+    mission_data = {
+        "mission_id": "m1",
+        "status": "building",
+        "config": {
+            "completion_mode": "best_effort",
+            "auto_merge": "on-review-pass",
+        },
+        "task_ids": [],
+        "created_at": "2026-04-20T00:00:00Z",
+    }
+
+    with patch("antfarm.core.cli.httpx.get") as mock_get:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mission_data
+        mock_get.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            ["mission", "status", "m1", "--colony-url", "http://localhost:7433"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Auto-merge:" in result.output
+        assert "on-review-pass" in result.output
+
+
+# ---------------------------------------------------------------------------
 # carry --mission
 # ---------------------------------------------------------------------------
 
@@ -355,10 +527,14 @@ def test_carry_with_mission_option():
             main,
             [
                 "carry",
-                "--title", "Auth endpoint",
-                "--spec", "Build the auth endpoint",
-                "--mission", "mission-auth-123",
-                "--colony-url", "http://localhost:7433",
+                "--title",
+                "Auth endpoint",
+                "--spec",
+                "Build the auth endpoint",
+                "--mission",
+                "mission-auth-123",
+                "--colony-url",
+                "http://localhost:7433",
             ],
         )
 

@@ -626,7 +626,12 @@ class GitHubBackend(TaskBackend):
         task["updated_at"] = _now_iso()
         self._update_task_body(issue_number, task)
 
-    def mark_merged(self, task_id: str, attempt_id: str) -> None:
+    def mark_merged(
+        self,
+        task_id: str,
+        attempt_id: str,
+        auto_merged: bool = False,
+    ) -> None:
         """Close the issue, add antfarm:merged label.
 
         Raises:
@@ -648,6 +653,8 @@ class GitHubBackend(TaskBackend):
         for a in task["attempts"]:
             if a["attempt_id"] == attempt_id:
                 a["status"] = AttemptStatus.MERGED.value
+                if auto_merged:
+                    a["auto_merged"] = True
                 matched = True
                 break
 

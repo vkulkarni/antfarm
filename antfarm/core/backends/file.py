@@ -574,7 +574,12 @@ class FileBackend(TaskBackend):
             data["updated_at"] = _now_iso()
             self._write_json(done_path, data)
 
-    def mark_merged(self, task_id: str, attempt_id: str) -> None:
+    def mark_merged(
+        self,
+        task_id: str,
+        attempt_id: str,
+        auto_merged: bool = False,
+    ) -> None:
         """Update attempt status to MERGED in done/ task file. Task stays DONE.
 
         Raises:
@@ -598,6 +603,8 @@ class FileBackend(TaskBackend):
             for a in data["attempts"]:
                 if a["attempt_id"] == attempt_id:
                     a["status"] = AttemptStatus.MERGED.value
+                    if auto_merged:
+                        a["auto_merged"] = True
                     matched = True
                     break
 

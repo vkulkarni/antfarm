@@ -1,6 +1,5 @@
 """Thin synchronous httpx wrapper for the Antfarm Colony API."""
 
-
 import httpx
 
 
@@ -24,9 +23,7 @@ class ColonyClient:
         headers = {}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        self._client = client or httpx.Client(
-            base_url=self.base_url, timeout=30.0, headers=headers
-        )
+        self._client = client or httpx.Client(base_url=self.base_url, timeout=30.0, headers=headers)
         self._owns_client = client is None  # only close if we created it
 
     def register_node(
@@ -68,13 +65,16 @@ class ColonyClient:
         workspace_root: str,
         capabilities: list[str] | None = None,
     ) -> dict:
-        r = self._client.post("/workers/register", json={
-            "worker_id": worker_id,
-            "node_id": node_id,
-            "agent_type": agent_type,
-            "workspace_root": workspace_root,
-            "capabilities": capabilities or [],
-        })
+        r = self._client.post(
+            "/workers/register",
+            json={
+                "worker_id": worker_id,
+                "node_id": node_id,
+                "agent_type": agent_type,
+                "workspace_root": workspace_root,
+                "capabilities": capabilities or [],
+            },
+        )
         r.raise_for_status()
         return r.json()
 
@@ -115,17 +115,23 @@ class ColonyClient:
         return r.json()
 
     def trail(self, task_id: str, worker_id: str, message: str) -> None:
-        r = self._client.post(f"/tasks/{task_id}/trail", json={
-            "worker_id": worker_id,
-            "message": message,
-        })
+        r = self._client.post(
+            f"/tasks/{task_id}/trail",
+            json={
+                "worker_id": worker_id,
+                "message": message,
+            },
+        )
         r.raise_for_status()
 
     def signal(self, task_id: str, worker_id: str, message: str) -> None:
-        r = self._client.post(f"/tasks/{task_id}/signal", json={
-            "worker_id": worker_id,
-            "message": message,
-        })
+        r = self._client.post(
+            f"/tasks/{task_id}/signal",
+            json={
+                "worker_id": worker_id,
+                "message": message,
+            },
+        )
         r.raise_for_status()
 
     def carry(
@@ -188,26 +194,30 @@ class ColonyClient:
         payload: dict = {"reason": reason}
         if max_attempts is not None:
             payload["max_attempts"] = max_attempts
-        r = self._client.post(
-            f"/tasks/{task_id}/kickback", json=payload
-        )
+        r = self._client.post(f"/tasks/{task_id}/kickback", json=payload)
         r.raise_for_status()
 
     def mark_harvest_pending(self, task_id: str, attempt_id: str) -> None:
         r = self._client.post(f"/tasks/{task_id}/harvest-pending", json={"attempt_id": attempt_id})
         r.raise_for_status()
 
-    def store_review_verdict(
-        self, task_id: str, attempt_id: str, verdict: dict
-    ) -> None:
+    def store_review_verdict(self, task_id: str, attempt_id: str, verdict: dict) -> None:
         r = self._client.post(
             f"/tasks/{task_id}/review-verdict",
             json={"attempt_id": attempt_id, "verdict": verdict},
         )
         r.raise_for_status()
 
-    def mark_merged(self, task_id: str, attempt_id: str) -> None:
-        r = self._client.post(f"/tasks/{task_id}/merge", json={"attempt_id": attempt_id})
+    def mark_merged(
+        self,
+        task_id: str,
+        attempt_id: str,
+        auto_merged: bool = False,
+    ) -> None:
+        payload: dict = {"attempt_id": attempt_id}
+        if auto_merged:
+            payload["auto_merged"] = True
+        r = self._client.post(f"/tasks/{task_id}/merge", json=payload)
         r.raise_for_status()
 
     def rereview(
@@ -280,6 +290,22 @@ class ColonyClient:
         """Apply shallow updates to a mission."""
         r = self._client.patch(f"/missions/{mission_id}", json={"updates": updates})
         r.raise_for_status()
+
+    def update_mission_config(self, mission_id: str, partial_config: dict) -> dict:
+        """Shallow-merge ``partial_config`` into an existing mission's config.
+
+        GET the current mission, merge the partial config over it, then PATCH
+        ``/missions/{id}`` with ``{"updates": {"config": merged}}``. Returns
+        the merged config dict actually sent. Raises if the mission does not
+        exist (404 bubbles up as an HTTPError).
+        """
+        current = self.get_mission(mission_id)
+        if current is None:
+            raise FileNotFoundError(f"mission '{mission_id}' not found")
+        merged = dict(current.get("config") or {})
+        merged.update(partial_config)
+        self.update_mission(mission_id, {"config": merged})
+        return merged
 
     def cancel_mission(self, mission_id: str) -> None:
         """Cancel a mission."""
