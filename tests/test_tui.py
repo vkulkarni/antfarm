@@ -728,6 +728,130 @@ def test_render_workers_includes_soldier():
     assert result.row_count == 1  # soldier row only
 
 
+def test_format_activity_cell_fresh_is_green():
+    """Elapsed < fresh_ttl (30s by default) renders green (#348)."""
+    from datetime import UTC, datetime
+
+    tui = _make_tui()
+    now_iso = datetime.now(UTC).isoformat()
+    cell = tui._format_activity_cell("editing src/a.py", now_iso)
+    assert "editing src/a.py" in cell.plain
+    assert cell.style == "green"
+
+
+def test_format_activity_cell_warn_band_is_default_style():
+    """Elapsed in [fresh_ttl, warn_ttl) band uses no style (#348)."""
+    from datetime import UTC, datetime, timedelta
+
+    tui = _make_tui()
+    # 60s ago: above fresh_ttl (30) and below warn_ttl (90).
+    old_iso = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+    cell = tui._format_activity_cell("editing src/a.py", old_iso)
+    assert cell.style == ""
+
+
+def test_format_activity_cell_warn_band_is_yellow():
+    """Elapsed in [warn_ttl, stuck_ttl) band is yellow (#348).
+
+    warn_ttl defaults to 90s, stuck_ttl to 300s. 150s sits between them.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    tui = _make_tui()
+    old_iso = (datetime.now(UTC) - timedelta(seconds=150)).isoformat()
+    cell = tui._format_activity_cell("editing src/a.py", old_iso)
+    assert cell.style == "yellow"
+
+
+def test_format_activity_cell_stuck_is_red():
+    """Elapsed >= stuck_ttl (300s by default) renders red (#348)."""
+    from datetime import UTC, datetime, timedelta
+
+    tui = _make_tui()
+    old_iso = (datetime.now(UTC) - timedelta(seconds=600)).isoformat()
+    cell = tui._format_activity_cell("editing src/a.py", old_iso)
+    assert cell.style == "red"
+
+
+def test_format_activity_cell_accepts_now_arg():
+    """Callers can pass an explicit `now` for deterministic testing."""
+    from datetime import UTC, datetime, timedelta
+
+    tui = _make_tui()
+    start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    now = start + timedelta(seconds=42)
+    cell = tui._format_activity_cell("merging task-001", start.isoformat(), now=now)
+    assert "(42s)" in cell.plain
+
+
+def test_render_workers_shows_soldier_activity_row():
+    """Soldier synthetic row renders the soldier_activity text cell (#348).
+
+    We assert the Activity column cell for the soldier row contains the
+    synthesized text. Rich ``Table.columns`` exposes the per-row cells.
+    """
+    from datetime import UTC, datetime
+
+    tui = _make_tui()
+    soldier_activity = {
+        "action": "merging",
+        "target": "task-001",
+        "text": "merging task-001",
+        "since": datetime.now(UTC).isoformat(),
+    }
+    result = tui._render_workers(
+        [],
+        soldier_status="running",
+        soldier_activity=soldier_activity,
+    )
+    assert result.row_count == 1
+    activity_col = next(c for c in result.columns if c.header == "Activity")
+    cell = list(activity_col.cells)[0]
+    plain = cell.plain if hasattr(cell, "plain") else str(cell)
+    assert "merging task-001" in plain
+
+
+def test_render_workers_shows_doctor_activity_row():
+    """Doctor synthetic row only appears when doctor_activity is provided (#348)."""
+    from datetime import UTC, datetime
+
+    tui = _make_tui()
+    doctor_activity = {
+        "action": "scanning",
+        "target": "workers",
+        "text": "scanning workers",
+        "since": datetime.now(UTC).isoformat(),
+    }
+    # No soldier, with doctor.
+    result = tui._render_workers(
+        [],
+        soldier_status="disabled",
+        doctor_activity=doctor_activity,
+    )
+    assert isinstance(result, Table)
+    assert result.row_count == 1  # doctor row only
+
+    # Without doctor_activity, and no workers, table falls back to placeholder row.
+    result2 = tui._render_workers([], soldier_status="disabled")
+    assert result2.row_count == 1  # "no workers" placeholder
+
+
+def test_render_workers_shows_both_synthetic_rows():
+    """Both soldier and doctor rows render together when both are present."""
+    from datetime import UTC, datetime
+
+    tui = _make_tui()
+    since = datetime.now(UTC).isoformat()
+    result = tui._render_workers(
+        [],
+        soldier_status="running",
+        soldier_activity={"text": "polling", "since": since},
+        doctor_activity={"text": "scanning workers", "since": since},
+    )
+    # 1 soldier row + 1 doctor row.
+    assert result.row_count == 2
+
+
 def test_get_worker_type_builder():
     tui = _make_tui()
     assert tui._get_worker_type({"agent_type": "claude-code"}) == "builder"

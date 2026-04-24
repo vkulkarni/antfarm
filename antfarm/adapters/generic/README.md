@@ -100,6 +100,42 @@ curl -s "$ANTFARM_URL/workers/$WORKER_ID" -X DELETE
 Always deregister on clean shutdown so the worker slot is freed immediately
 rather than waiting for heartbeat timeout.
 
+## Reporting activity
+
+The activity endpoint accepts a structured `{action, target}` pair that the
+colony synthesizes into a human-readable line for the TUI's Activity column
+(#348). It's optional — agents that only send heartbeats still work.
+
+```bash
+curl -s -m 1 "$ANTFARM_URL/workers/$WORKER_ID/activity" -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"action":"running","target":"pytest -x","source":"worker"}' || true
+```
+
+Canonical verbs the server knows how to format:
+
+| Verb | Rendered as |
+|------|-------------|
+| `editing` | `editing <target>` |
+| `reading` | `reading <target>` |
+| `running` | `running <target>` |
+| `searching` | `searching <target>` |
+| `scanning` | `scanning <target>` |
+| `planning` | `planning` (target ignored) |
+| `awaiting` | `awaiting claude response` (target ignored) |
+| `rebasing` | `rebasing <target>` |
+| `merging` | `merging <target>` |
+| `running_tests` | `running tests (<target>)` |
+| `fast_forwarding` | `fast-forwarding <target>` |
+| `pushing` | `pushing <target>` |
+| `fetching` | `fetching <target>` |
+| `cleanup` | `cleanup` |
+| `polling` | `polling` |
+| `idle` | `idle` |
+
+Unknown verbs fall through to `"<action> <target>"`. Pass `{"action": null}`
+to clear the activity cell. Targets longer than 60 chars are truncated.
+
 ## Optional telemetry payload
 
 The heartbeat endpoint accepts an optional `status` dict for telemetry:

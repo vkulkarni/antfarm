@@ -663,6 +663,82 @@ def test_activity_endpoint_unknown_worker_noop(client):
     assert client.get("/workers").json() == []
 
 
+def test_activity_endpoint_accepts_action_plus_target(client):
+    """POST {action, target} is synthesized into current_action (#348)."""
+    _register_worker(client, "worker-syn")
+    r = client.post(
+        "/workers/worker-syn/activity",
+        json={"action": "editing", "target": "src/a.py", "source": "hook"},
+    )
+    assert r.status_code == 200
+
+    worker = next(w for w in client.get("/workers").json() if w["worker_id"] == "worker-syn")
+    assert worker["current_action"] == "editing src/a.py"
+    assert worker["current_action_at"] is not None
+
+
+def test_activity_endpoint_backcompat_freeform(client):
+    """Legacy callers posting {action: '<freeform>'} still work unchanged."""
+    _register_worker(client, "worker-legacy")
+    r = client.post(
+        "/workers/worker-legacy/activity",
+        json={"action": "Running: Bash"},
+    )
+    assert r.status_code == 200
+
+    worker = next(w for w in client.get("/workers").json() if w["worker_id"] == "worker-legacy")
+    assert worker["current_action"] == "Running: Bash"
+
+
+def test_activity_endpoint_accepts_explicit_text(client):
+    """Explicit text bypasses synthesis and is stored verbatim."""
+    _register_worker(client, "worker-text")
+    r = client.post(
+        "/workers/worker-text/activity",
+        json={"action": "editing", "target": "ignored", "text": "custom literal"},
+    )
+    assert r.status_code == 200
+    worker = next(w for w in client.get("/workers").json() if w["worker_id"] == "worker-text")
+    assert worker["current_action"] == "custom literal"
+
+
+def test_colony_activity_in_status_full(client):
+    """soldier_activity + doctor_activity are surfaced in /status/full (#348)."""
+    # Populate both via the internal helper.
+    serve_mod._set_colony_activity("soldier", "merging", "task-001")
+    serve_mod._set_colony_activity("doctor", "scanning", "workers")
+
+    r = client.get("/status/full")
+    assert r.status_code == 200
+    data = r.json()
+    assert "soldier_activity" in data
+    assert "doctor_activity" in data
+    assert data["soldier_activity"]["action"] == "merging"
+    assert data["soldier_activity"]["target"] == "task-001"
+    assert data["soldier_activity"]["text"] == "merging task-001"
+    assert data["soldier_activity"]["since"] is not None
+    assert data["doctor_activity"]["text"] == "scanning workers"
+
+
+def test_colony_activity_defaults_to_empty_in_status_full(tmp_path):
+    """When no subsystem has emitted activity, the dicts exist but are empty."""
+    from antfarm.core.backends.file import FileBackend
+
+    # Reset module state (tests run in-process and may have stale state).
+    serve_mod._soldier_activity.update(
+        {"action": None, "target": None, "text": None, "since": None}
+    )
+    serve_mod._doctor_activity.update({"action": None, "target": None, "text": None, "since": None})
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    local = TestClient(app)
+
+    data = local.get("/status/full").json()
+    assert data["soldier_activity"]["text"] is None
+    assert data["doctor_activity"]["text"] is None
+
+
 # ---------------------------------------------------------------------------
 # Rate limit: GET /workers endpoint
 # ---------------------------------------------------------------------------

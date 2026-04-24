@@ -165,6 +165,24 @@ def _emit(event_type: str, task_id: str, detail: str = "") -> None:
         logger.debug("soldier _emit: _emit_event(%s) raised", event_type, exc_info=True)
 
 
+def _set_activity(action: str, target: str = "") -> None:
+    """Publish soldier phase activity to the colony (#348).
+
+    Lazy-imports ``_set_colony_activity`` to avoid a circular import at module
+    load time. Best-effort: ANY failure inside the publish pipeline is
+    swallowed. The soldier must never break because the TUI sidecar is unhappy.
+    """
+    try:
+        from antfarm.core.serve import _set_colony_activity
+    except Exception:
+        logger.debug("soldier _set_activity: could not import helper", exc_info=True)
+        return
+    try:
+        _set_colony_activity("soldier", action, target)
+    except Exception:
+        logger.debug("soldier _set_activity(%s) raised", action, exc_info=True)
+
+
 def _stderr_tail(stderr_bytes: bytes, n: int = 20) -> str:
     """Return the last ``n`` lines of decoded stderr bytes.
 
@@ -257,6 +275,7 @@ class Soldier:
         """
         self._run_preflight_if_needed()
         while True:
+            _set_activity("polling", "")
             if self.require_review:
                 self.run_once_with_review()
             else:
@@ -712,6 +731,7 @@ class Soldier:
             )
             return MergeResult.FAILED
 
+        _set_activity("merging", task_id)
         # Canonical diagnostic event (new in 0.6.7).
         attempt_detail = f"attempt={attempt_id} branch={branch}"
         _emit("merge_attempted", task_id, attempt_detail)
@@ -738,6 +758,7 @@ class Soldier:
         temp_branch = "antfarm/temp-merge"
         try:
             # Fetch latest state from origin
+            _set_activity("fetching", "origin")
             r = subprocess.run(
                 ["git", "fetch", "origin"],
                 cwd=self.repo_path,
@@ -754,6 +775,7 @@ class Soldier:
                 return MergeResult.FAILED
 
             # Create temp branch from integration branch
+            _set_activity("rebasing", task_id)
             r = self._checkout_with_reclaim(
                 [
                     "checkout",
@@ -797,6 +819,7 @@ class Soldier:
                 )
 
             # Run tests
+            _set_activity("running_tests", task_id)
             r = subprocess.run(
                 self.test_command,
                 cwd=self.repo_path,
@@ -819,6 +842,7 @@ class Soldier:
                 return MergeResult.FAILED
 
             # Fast-forward integration branch
+            _set_activity("fast_forwarding", self.integration_branch)
             r = self._checkout_with_reclaim(["checkout", self.integration_branch])
             if r.returncode != 0:
                 self.last_failure_reason = (
@@ -847,6 +871,7 @@ class Soldier:
                 return MergeResult.FAILED
 
             # Push to origin
+            _set_activity("pushing", self.integration_branch)
             r = subprocess.run(
                 ["git", "push", "origin", self.integration_branch],
                 cwd=self.repo_path,
@@ -995,6 +1020,7 @@ class Soldier:
         Returns a definitive ``MergeResult`` — the caller must not re-attempt.
         """
         del initial_conflict_stderr  # captured for debugging; reason set below.
+        _set_activity("rebasing", f"{task_id} onto {self.integration_branch}")
 
         # 1) Abort the conflicting merge so we can move off temp_branch cleanly.
         subprocess.run(
@@ -1456,6 +1482,7 @@ class Soldier:
         - No temp branch
         - Clean working tree matching origin/{integration_branch}
         """
+        _set_activity("cleanup", "")
         # 1) Hard reset first — wipes conflict state / partial merge.
         subprocess.run(
             ["git", "reset", "--hard", "HEAD"],
@@ -1537,6 +1564,7 @@ class Soldier:
             detail = f"branch={head} dirty={dirty}"
             _emit("cleanup_incomplete", "", detail)
             logger.error("soldier cleanup incomplete: %s", detail)
+        _set_activity("idle", "")
 
     def _get_attempt_branch(self, task: dict) -> str | None:
         """Extract the branch from the task's current attempt.

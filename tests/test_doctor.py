@@ -2435,3 +2435,33 @@ def test_stale_worktree_parsing_hazard_unparseable_name(tmp_path):
     stale = [f for f in findings if f.check == "stale_worktree"]
     assert stale, "rule 4 should fire once dir mtime is past TTL"
     assert "reason=ttl" in stale[0].message
+
+
+# ---------------------------------------------------------------------------
+# Activity emission (#348)
+# ---------------------------------------------------------------------------
+
+
+def test_run_doctor_emits_activity_per_check(setup, monkeypatch):
+    """run_doctor publishes 'scanning' activity for each phase (#348)."""
+    from antfarm.core import serve
+
+    backend, config = setup
+    calls: list[tuple[str, str, str]] = []
+
+    def _capture(kind, action, target=""):
+        calls.append((kind, action, target))
+
+    monkeypatch.setattr(serve, "_set_colony_activity", _capture)
+
+    run_doctor(backend, config, fix=False)
+
+    doctor_calls = [c for c in calls if c[0] == "doctor"]
+    scanning = {c[2] for c in doctor_calls if c[1] == "scanning"}
+    # A handful of critical stages — don't pin the full list so new checks
+    # can be added without churning this test.
+    for expected in {"filesystem", "workers", "tasks", "guards"}:
+        assert expected in scanning, f"expected scanning target {expected!r}; got {scanning}"
+
+    # Final call is idle — doctor is done.
+    assert doctor_calls[-1] == ("doctor", "idle", "")
