@@ -1235,6 +1235,47 @@ class FileBackend(TaskBackend):
             data["updated_at"] = _now_iso()
             self._write_json(path, data)
 
+    # --- mission usage sidecar (v0.6.14 cost tripwire) -------------------
+
+    def _mission_usage_path(self, mission_id: str) -> Path:
+        return self._missions_dir() / f"{mission_id}_usage.json"
+
+    def get_mission_usage(self, mission_id: str) -> dict | None:
+        """Return the MissionUsage sidecar dict for a mission, or None."""
+        path = self._mission_usage_path(mission_id)
+        if not path.exists():
+            return None
+        try:
+            return self._read_json(path)
+        except (json.JSONDecodeError, KeyError):
+            return None
+
+    def update_mission_usage(self, mission_id: str, updater) -> dict:
+        """Atomic read-modify-write on the MissionUsage sidecar.
+
+        Takes a callable that transforms the current usage dict to the next
+        one. Called under self._lock so two concurrent POST /workers/.../usage
+        requests cannot clobber each other's aggregates.
+        """
+        from antfarm.core.missions import MissionUsage
+
+        with self._lock:
+            self._missions_dir().mkdir(parents=True, exist_ok=True)
+            path = self._mission_usage_path(mission_id)
+            if path.exists():
+                try:
+                    current = self._read_json(path)
+                except (json.JSONDecodeError, KeyError):
+                    current = MissionUsage(mission_id=mission_id).to_dict()
+            else:
+                current = MissionUsage(mission_id=mission_id).to_dict()
+
+            new_state = updater(current)
+            if not isinstance(new_state, dict):
+                raise TypeError("update_mission_usage updater must return a dict")
+            self._write_json(path, new_state)
+            return new_state
+
     def cancel_mission_tasks(self, mission_id: str, reason: str) -> list[str]:
         """Purge all non-terminal tasks for this mission into done/ and cancel the mission.
 

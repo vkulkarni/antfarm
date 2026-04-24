@@ -45,9 +45,10 @@ done
 HEARTBEAT_CMD="${ADAPTER_DIR}/hooks/heartbeat.sh"
 PRE_TOOL_CMD="${ADAPTER_DIR}/hooks/pre_tool.sh"
 POST_TOOL_CMD="${ADAPTER_DIR}/hooks/post_tool.sh"
+STOP_CMD="${ADAPTER_DIR}/hooks/stop.sh"
 
 if [ ! -f "${SETTINGS_FILE}" ]; then
-  # Create a minimal settings.json with heartbeat + activity hooks
+  # Create a minimal settings.json with heartbeat + activity + stop hooks
   cat > "${SETTINGS_FILE}" <<EOF
 {
   "hooks": {
@@ -76,11 +77,22 @@ if [ ! -f "${SETTINGS_FILE}" ]; then
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${STOP_CMD}"
+          }
+        ]
+      }
     ]
   }
 }
 EOF
-  echo "[created] ${SETTINGS_FILE} with heartbeat + activity hooks"
+  echo "[created] ${SETTINGS_FILE} with heartbeat + activity + stop hooks"
 else
   # Heartbeat already present?
   if grep -q "heartbeat.sh" "${SETTINGS_FILE}" 2>/dev/null; then
@@ -107,6 +119,17 @@ else
     echo "          and an additional PostToolUse entry pointing to ${POST_TOOL_CMD}."
     echo ""
   fi
+
+  # Stop hook already present?
+  if grep -q "stop.sh" "${SETTINGS_FILE}" 2>/dev/null; then
+    echo "[exists]  stop hook already in ${SETTINGS_FILE}"
+  else
+    echo ""
+    echo "[manual]  stop hook NOT added automatically — settings.json already exists."
+    echo "          Add a Stop entry pointing to ${STOP_CMD} so cost/usage"
+    echo "          from the final assistant message is reported to the colony."
+    echo ""
+  fi
 fi
 
 echo ""
@@ -116,6 +139,7 @@ echo "  .claude/agents/soldier.md  — v0.2 placeholder (conflict resolution)"
 echo "  .claude/agents/queen.md    — example: AI-driven task decomposition"
 echo "  PostToolUse heartbeat hook — keeps worker slot alive automatically"
 echo "  PreToolUse/PostToolUse activity hooks — surface current worker action in TUI"
+echo "  Stop hook                   — reports token usage + cost to the colony"
 echo ""
 echo "Set environment variables before starting a worker session:"
 echo "  export ANTFARM_URL=http://localhost:8000"

@@ -559,3 +559,67 @@ class Node:
             max_workers=data.get("max_workers", 4),
             capabilities=list(data.get("capabilities", [])),
         )
+
+
+# ---------------------------------------------------------------------------
+# UsageEvent (v0.6 cost tripwire)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class UsageEvent:
+    """A single reported usage/cost datapoint for a mission budget.
+
+    Emitted by worker-side hooks (Stop hook for Claude Code, heartbeat-delta
+    for other agents) and aggregated by the colony into a MissionUsage
+    sidecar. Idempotency is enforced by ``event_id``.
+    """
+
+    event_id: str
+    worker_id: str
+    task_id: str | None
+    attempt_id: str | None
+    mission_id: str | None
+    ts: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_creation_tokens: int
+    cost_usd: float
+    source: str  # "claude_stop_hook" | "heartbeat_delta" | "manual"
+
+    def to_dict(self) -> dict:
+        return {
+            "event_id": self.event_id,
+            "worker_id": self.worker_id,
+            "task_id": self.task_id,
+            "attempt_id": self.attempt_id,
+            "mission_id": self.mission_id,
+            "ts": self.ts,
+            "model": self.model,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "cost_usd": self.cost_usd,
+            "source": self.source,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> UsageEvent:
+        return cls(
+            event_id=data["event_id"],
+            worker_id=data["worker_id"],
+            task_id=data.get("task_id"),
+            attempt_id=data.get("attempt_id"),
+            mission_id=data.get("mission_id"),
+            ts=data["ts"],
+            model=data.get("model", ""),
+            input_tokens=int(data.get("input_tokens", 0)),
+            output_tokens=int(data.get("output_tokens", 0)),
+            cache_read_tokens=int(data.get("cache_read_tokens", 0)),
+            cache_creation_tokens=int(data.get("cache_creation_tokens", 0)),
+            cost_usd=float(data.get("cost_usd", 0.0)),
+            source=data.get("source", "manual"),
+        )

@@ -1545,3 +1545,118 @@ def test_re_plan_task_spec_embeds_parallelism_directives(env):
     assert "MANY SMALL INDEPENDENT" in spec
     assert "3" in spec  # configured cap survives into the re-plan prompt
     assert "split more" in spec  # reviewer feedback preserved
+
+
+# ---------------------------------------------------------------------------
+# Budget tripwire (v0.6.14 — issue #354)
+# ---------------------------------------------------------------------------
+
+
+def _seed_usage(backend: FileBackend, mission_id: str, *, cost: float = 0.0, tokens: int = 0):
+    """Populate a MissionUsage sidecar for a mission."""
+
+    def _updater(current: dict) -> dict:
+        current["total_cost_usd"] = cost
+        current["total_input_tokens"] = tokens
+        current["total_output_tokens"] = 0
+        current["event_count"] = 1 if (cost or tokens) else 0
+        return current
+
+    backend.update_mission_usage(mission_id, _updater)
+
+
+def test_queen_pauses_mission_on_cost_budget(env):
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(
+        backend,
+        mission_id="mission-budget-pause",
+        config_overrides={"max_cost_usd": 5.0, "budget_action": "pause"},
+    )
+    # Advance once so the mission has a plan_task and real status.
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    _seed_usage(backend, mission["mission_id"], cost=6.50)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] == "paused"
+    assert m.get("paused_from_status") == "planning"
+
+
+def test_queen_cancels_mission_on_token_budget(env):
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(
+        backend,
+        mission_id="mission-budget-cancel",
+        config_overrides={"max_tokens": 1000, "budget_action": "cancel"},
+    )
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    _seed_usage(backend, mission["mission_id"], tokens=2000)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] == "cancelled"
+
+
+def test_queen_no_trip_when_budget_unset(env):
+    """Regression: mission with no budget never hits the tripwire."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(backend, mission_id="mission-no-budget")
+    # Dump an absurdly large usage record — no budget means no pause.
+    _seed_usage(backend, mission["mission_id"], cost=999_999.99, tokens=999_999)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] not in ("paused", "cancelled")
+
+
+def test_queen_resume_after_extend_flips_back_to_building(env):
+    """When a paused mission's budget is extended, Queen should not re-pause it."""
+    backend = env["backend"]
+    queen = env["queen"]
+
+    mission = _create_mission(
+        backend,
+        mission_id="mission-resume-flow",
+        config_overrides={"max_cost_usd": 5.0, "budget_action": "pause"},
+    )
+    # Move mission past planning so paused_from_status is meaningful
+    backend.update_mission(mission["mission_id"], {"status": "building"})
+
+    _seed_usage(backend, mission["mission_id"], cost=6.00)
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] == "paused"
+    assert m.get("paused_from_status") == "building"
+
+    # Operator bumps the cap and flips status back to building (as HTTP does).
+    backend.update_mission(
+        mission["mission_id"],
+        {
+            "status": "building",
+            "paused_from_status": None,
+            "config": {**m["config"], "max_cost_usd": 100.0},
+        },
+    )
+
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    assert m["status"] == "building"

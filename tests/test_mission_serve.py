@@ -403,3 +403,191 @@ def test_create_mission_rejects_github_backend(tmp_path):
     assert r.status_code == 400
     assert "FileBackend" in r.json()["detail"]
     assert "v0.6.0" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Usage / budget (v0.6.14 — issue #354)
+# ---------------------------------------------------------------------------
+
+
+def _register_worker(client, worker_id: str = "node-1/w-1"):
+    client.post("/nodes", json={"node_id": "node-1"})
+    client.post(
+        "/workers/register",
+        json={
+            "worker_id": worker_id,
+            "node_id": "node-1",
+            "agent_type": "claude-code",
+            "workspace_root": "/tmp/ws",
+        },
+    )
+
+
+def _carry_task_in_mission(
+    client,
+    mission_id: str = "mission-b1",
+    task_id: str = "task-001",
+):
+    _create_mission(client, mission_id=mission_id)
+    _carry(client, task_id=task_id, mission_id=mission_id)
+    # Patch status past planning so the task is not skipped.
+    client.patch(
+        f"/missions/{mission_id}",
+        json={"updates": {"status": "building"}},
+    )
+
+
+def test_post_worker_usage_attributes_to_current_attempt(client):
+    """POST /workers/{id}/usage attributes cost to the worker's active task."""
+    _create_mission(client, mission_id="mission-usg")
+    client.patch(
+        "/missions/mission-usg",
+        json={"updates": {"status": "building"}},
+    )
+    _carry(client, task_id="task-usg-1", mission_id="mission-usg")
+    _register_worker(client, worker_id="node-1/w-1")
+
+    # Worker forages to claim the task.
+    r = client.post("/tasks/pull", json={"worker_id": "node-1/w-1"})
+    assert r.status_code == 200
+    task = r.json()
+    attempt_id = task["current_attempt"]
+
+    # Report usage.
+    r = client.post(
+        "/workers/node-1/w-1/usage",
+        json={
+            "event_id": "e-1",
+            "ts": "2026-04-22T10:00:00Z",
+            "model": "claude-sonnet-4-7",
+            "input_tokens": 1_000_000,
+            "output_tokens": 0,
+            "source": "claude_stop_hook",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["task_id"] == "task-usg-1"
+    assert body["mission_id"] == "mission-usg"
+    assert round(body["cost_usd"], 2) == 3.00
+    assert body["total_cost_usd"] > 0
+
+    # Usage is persisted against the mission.
+    usage = client.get("/missions/mission-usg/usage").json()
+    assert round(usage["total_cost_usd"], 2) == 3.00
+    assert usage["per_task"]["task-usg-1"]["top_attempt_id"] == attempt_id
+
+
+def test_post_worker_usage_is_idempotent(client):
+    """Duplicate event_id must not double-count."""
+    _create_mission(client, mission_id="mission-dedup")
+    client.patch(
+        "/missions/mission-dedup",
+        json={"updates": {"status": "building"}},
+    )
+    _carry(client, task_id="task-dedup-1", mission_id="mission-dedup")
+    _register_worker(client, worker_id="node-1/w-1")
+    client.post("/tasks/pull", json={"worker_id": "node-1/w-1"})
+
+    payload = {
+        "event_id": "e-dupe",
+        "ts": "2026-04-22T10:00:00Z",
+        "model": "claude-sonnet-4-7",
+        "input_tokens": 1_000_000,
+        "output_tokens": 0,
+        "source": "claude_stop_hook",
+    }
+    client.post("/workers/node-1/w-1/usage", json=payload)
+    client.post("/workers/node-1/w-1/usage", json=payload)
+    client.post("/workers/node-1/w-1/usage", json=payload)
+
+    usage = client.get("/missions/mission-dedup/usage").json()
+    assert usage["event_count"] == 1
+    assert round(usage["total_cost_usd"], 2) == 3.00
+
+
+def test_post_mission_extend_bumps_budget(client):
+    """POST /missions/{id}/extend bumps the budget."""
+    _create_mission(client, mission_id="mission-ext")
+    client.patch(
+        "/missions/mission-ext",
+        json={
+            "updates": {
+                "config": {
+                    "max_cost_usd": 5.0,
+                    "max_tokens": 1000,
+                    "budget_action": "pause",
+                }
+            }
+        },
+    )
+
+    r = client.post(
+        "/missions/mission-ext/extend",
+        json={"additional_usd": 10.0, "additional_tokens": 500},
+    )
+    assert r.status_code == 200
+    cfg = r.json()["config"]
+    assert cfg["max_cost_usd"] == 15.0
+    assert cfg["max_tokens"] == 1500
+
+
+def test_post_mission_extend_resumes_paused(client):
+    """extend resumes a mission paused by the tripwire."""
+    _create_mission(client, mission_id="mission-resume")
+    # Simulate the Queen marking it paused.
+    client.patch(
+        "/missions/mission-resume",
+        json={
+            "updates": {
+                "status": "paused",
+                "paused_from_status": "building",
+                "config": {
+                    "max_cost_usd": 1.0,
+                    "budget_action": "pause",
+                },
+            }
+        },
+    )
+    r = client.post(
+        "/missions/mission-resume/extend",
+        json={"additional_usd": 5.0},
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "building"
+    assert r.json().get("paused_from_status") is None
+
+
+def test_forage_skips_paused_mission(client):
+    """/tasks/pull returns 204 when all eligible tasks belong to paused missions."""
+    _create_mission(client, mission_id="mission-paused")
+    client.patch(
+        "/missions/mission-paused",
+        json={"updates": {"status": "paused"}},
+    )
+    _carry(client, task_id="task-paused-1", mission_id="mission-paused")
+    _register_worker(client, worker_id="node-1/w-1")
+
+    r = client.post("/tasks/pull", json={"worker_id": "node-1/w-1"})
+    assert r.status_code == 204
+
+    # Task was returned to ready/ (reassign supersedes the attempt).
+    tasks = client.get("/tasks").json()
+    paused_task = next(t for t in tasks if t["id"] == "task-paused-1")
+    assert paused_task["status"] == "ready"
+
+
+def test_get_mission_usage_returns_dict(client):
+    """GET /missions/{id}/usage returns an empty usage dict when none recorded."""
+    _create_mission(client, mission_id="mission-empty")
+    r = client.get("/missions/mission-empty/usage")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mission_id"] == "mission-empty"
+    assert body["total_cost_usd"] == 0.0
+    assert body["event_count"] == 0
+
+
+def test_get_mission_usage_missing_mission_returns_404(client):
+    r = client.get("/missions/nope/usage")
+    assert r.status_code == 404

@@ -274,3 +274,42 @@ def test_mission_report_defaults_auto_merge_counts_zero():
     report = _make_mission_report()
     assert report.auto_merged_tasks == 0
     assert report.manual_merged_tasks == 0
+
+
+# ---------------------------------------------------------------------------
+# Budget fields on MissionConfig (v0.6.14 — issue #354)
+# ---------------------------------------------------------------------------
+
+
+def test_mission_config_accepts_budget_fields():
+    cfg = MissionConfig(max_cost_usd=25.0, max_tokens=100_000, budget_action="cancel")
+    assert cfg.max_cost_usd == 25.0
+    assert cfg.max_tokens == 100_000
+    assert cfg.budget_action == "cancel"
+
+
+def test_mission_config_default_budget_action_is_pause():
+    cfg = MissionConfig()
+    assert cfg.budget_action == "pause"
+    assert cfg.max_cost_usd is None
+    assert cfg.max_tokens is None
+
+
+def test_mission_config_rejects_invalid_budget_action():
+    with pytest.raises(ValueError, match="budget_action must be one of"):
+        MissionConfig(budget_action="delete")
+
+
+def test_mission_config_round_trip_includes_budget_fields():
+    cfg = MissionConfig(max_cost_usd=5.5, max_tokens=42_000, budget_action="cancel")
+    d = cfg.to_dict()
+    assert d["max_cost_usd"] == 5.5
+    assert d["max_tokens"] == 42_000
+    assert d["budget_action"] == "cancel"
+
+    restored = MissionConfig.from_dict(d)
+    assert restored == cfg
+
+
+def test_mission_status_has_paused_value():
+    assert MissionStatus.PAUSED.value == "paused"

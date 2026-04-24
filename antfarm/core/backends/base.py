@@ -16,6 +16,7 @@ Superseded-PR hygiene:
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 
 
 class TaskBackend(ABC):
@@ -576,6 +577,41 @@ class TaskBackend(ABC):
     @abstractmethod
     def update_mission(self, mission_id: str, updates: dict) -> None:
         """Shallow-merge ``updates`` into the mission JSON. Atomic write."""
+        ...
+
+    @abstractmethod
+    def get_mission_usage(self, mission_id: str) -> dict | None:
+        """Return the MissionUsage sidecar for a mission, or None.
+
+        Args:
+            mission_id: ID of the mission.
+
+        Returns:
+            MissionUsage.to_dict() output, or None if no usage has been
+            recorded (or the mission does not exist).
+        """
+        ...
+
+    @abstractmethod
+    def update_mission_usage(self, mission_id: str, updater: Callable[[dict], dict]) -> dict:
+        """Atomic read-modify-write on the MissionUsage sidecar.
+
+        The implementation calls ``updater(current_dict)`` under the backend
+        lock and persists the returned dict atomically. If no usage file
+        exists yet, the updater is called with a freshly-initialized
+        ``MissionUsage(mission_id=...).to_dict()``.
+
+        Callers are responsible for idempotency (e.g. dedup by event_id).
+
+        Args:
+            mission_id: ID of the mission.
+            updater: Callable that takes the current usage dict and returns
+                the new usage dict. Must be pure (no I/O) — it runs inside
+                the backend lock.
+
+        Returns:
+            The new usage dict after persistence.
+        """
         ...
 
     @abstractmethod

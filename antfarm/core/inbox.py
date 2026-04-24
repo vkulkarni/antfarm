@@ -48,6 +48,7 @@ def collect_inbox_items(
     tasks: list[dict],
     workers: list[dict],
     *,
+    missions: list[dict] | None = None,
     stale_worker_ttl: float = 300.0,
     long_running_threshold: float = 3600.0,
     max_attempts_default: int = 3,
@@ -57,6 +58,8 @@ def collect_inbox_items(
     Args:
         tasks: List of task dicts from the colony.
         workers: List of worker dicts from the colony.
+        missions: Optional list of mission dicts — used to surface
+            budget-exceeded (paused) missions for operator attention.
         stale_worker_ttl: Seconds after which a worker heartbeat is stale.
         long_running_threshold: Seconds after which an active task is flagged.
         max_attempts_default: Default attempt ceiling when a task has no
@@ -69,9 +72,35 @@ def collect_inbox_items(
         - type: category string
         - message: human-readable explanation
         - action: recommended action
-        - task_id or worker_id: relevant entity
+        - task_id or worker_id or mission_id: relevant entity
     """
     items: list[dict] = []
+
+    # --- Missions paused on budget ---
+    for m in missions or []:
+        if m.get("status") != "paused":
+            continue
+        cfg = m.get("config") or {}
+        # Only treat pause as a budget tripwire when a budget was configured.
+        if cfg.get("max_cost_usd") is None and cfg.get("max_tokens") is None:
+            continue
+        mid = m.get("mission_id", "")
+        items.append(
+            {
+                "severity": "warning",
+                "type": "mission_budget_exceeded",
+                "message": (
+                    f"Mission '{mid}' paused — budget exceeded "
+                    f"(max_cost_usd={cfg.get('max_cost_usd')}, "
+                    f"max_tokens={cfg.get('max_tokens')})"
+                ),
+                "action": (
+                    f"Run: antfarm mission extend {mid} --additional-usd <N> "
+                    "(or cancel the mission)"
+                ),
+                "mission_id": mid,
+            }
+        )
 
     # --- Stale workers ---
     live_worker_ids: set[str] = set()
@@ -80,16 +109,18 @@ def collect_inbox_items(
         hb = w.get("last_heartbeat", "")
         age = _age_seconds(hb)
         if age > stale_worker_ttl:
-            items.append({
-                "severity": "error",
-                "type": "stale_worker",
-                "message": (
-                    f"Worker '{wid}' last heartbeat {int(age)}s ago "
-                    f"(TTL={int(stale_worker_ttl)}s)"
-                ),
-                "action": f"Run: antfarm doctor --fix (deregisters stale worker '{wid}')",
-                "worker_id": wid,
-            })
+            items.append(
+                {
+                    "severity": "error",
+                    "type": "stale_worker",
+                    "message": (
+                        f"Worker '{wid}' last heartbeat {int(age)}s ago "
+                        f"(TTL={int(stale_worker_ttl)}s)"
+                    ),
+                    "action": f"Run: antfarm doctor --fix (deregisters stale worker '{wid}')",
+                    "worker_id": wid,
+                }
+            )
         else:
             live_worker_ids.add(wid)
 
@@ -118,39 +149,44 @@ def collect_inbox_items(
             # Check trail for failure type
             trail = t.get("trail", [])
             last_msg = trail[-1].get("message", "") if trail else "unknown"
-            items.append({
-                "severity": "error",
-                "type": "failed_task",
-                "message": f"Task '{tid}' failed: {last_msg[:100]}",
-                "action": "Review failure, fix, and requeue or escalate",
-                "task_id": tid,
-            })
+            items.append(
+                {
+                    "severity": "error",
+                    "type": "failed_task",
+                    "message": f"Task '{tid}' failed: {last_msg[:100]}",
+                    "action": "Review failure, fix, and requeue or escalate",
+                    "task_id": tid,
+                }
+            )
 
         # --- Harvest-pending tasks (interrupted harvest) ---
         elif status == "harvest_pending":
-            items.append({
-                "severity": "error",
-                "type": "harvest_interrupted",
-                "message": (
-                    f"Task '{tid}' stuck in harvest_pending "
-                    "(worker may have died mid-harvest)"
-                ),
-                "action": "Run: antfarm doctor --fix or manually retry harvest",
-                "task_id": tid,
-            })
+            items.append(
+                {
+                    "severity": "error",
+                    "type": "harvest_interrupted",
+                    "message": (
+                        f"Task '{tid}' stuck in harvest_pending (worker may have died mid-harvest)"
+                    ),
+                    "action": "Run: antfarm doctor --fix or manually retry harvest",
+                    "task_id": tid,
+                }
+            )
 
         # --- Blocked tasks with unmet deps ---
         elif status in ("blocked", "ready"):
             deps = t.get("depends_on", [])
             unmet = [d for d in deps if d not in done_task_ids and d not in merged_task_ids]
             if unmet:
-                items.append({
-                    "severity": "warning",
-                    "type": "blocked_by_deps",
-                    "message": f"Task '{tid}' blocked by unmet deps: {', '.join(unmet)}",
-                    "action": f"Complete or unblock: {', '.join(unmet)}",
-                    "task_id": tid,
-                })
+                items.append(
+                    {
+                        "severity": "warning",
+                        "type": "blocked_by_deps",
+                        "message": f"Task '{tid}' blocked by unmet deps: {', '.join(unmet)}",
+                        "action": f"Complete or unblock: {', '.join(unmet)}",
+                        "task_id": tid,
+                    }
+                )
 
         # --- Active tasks running too long ---
         elif status == "active":
@@ -159,16 +195,18 @@ def collect_inbox_items(
                     started = a.get("started_at", "")
                     duration = _age_seconds(started)
                     if duration > long_running_threshold:
-                        items.append({
-                            "severity": "warning",
-                            "type": "long_running",
-                            "message": (
-                                f"Task '{tid}' active for {int(duration / 60)}min "
-                                f"(worker: {a.get('worker_id', '?')})"
-                            ),
-                            "action": "Check worker health or pause task",
-                            "task_id": tid,
-                        })
+                        items.append(
+                            {
+                                "severity": "warning",
+                                "type": "long_running",
+                                "message": (
+                                    f"Task '{tid}' active for {int(duration / 60)}min "
+                                    f"(worker: {a.get('worker_id', '?')})"
+                                ),
+                                "action": "Check worker health or pause task",
+                                "task_id": tid,
+                            }
+                        )
                     break
 
         # --- Kicked-back tasks (detected from trail on ready tasks) ---
@@ -177,18 +215,18 @@ def collect_inbox_items(
         if status == "ready":
             trail = t.get("trail", [])
             # A ready task with a superseded attempt was kicked back
-            has_superseded = any(
-                a.get("status") == "superseded" for a in t.get("attempts", [])
-            )
+            has_superseded = any(a.get("status") == "superseded" for a in t.get("attempts", []))
             if has_superseded and trail:
                 reason = trail[-1].get("message", "unknown")
-                items.append({
-                    "severity": "info",
-                    "type": "kicked_back",
-                    "message": f"Task '{tid}' was kicked back: {reason[:100]}",
-                    "action": "Review rejection reason and requeue",
-                    "task_id": tid,
-                })
+                items.append(
+                    {
+                        "severity": "info",
+                        "type": "kicked_back",
+                        "message": f"Task '{tid}' was kicked back: {reason[:100]}",
+                        "action": "Review rejection reason and requeue",
+                        "task_id": tid,
+                    }
+                )
 
         # --- Retry-pattern failures ---
         # Count finished (DONE or SUPERSEDED) attempts and compare to the
@@ -198,57 +236,57 @@ def collect_inbox_items(
         # skipped — they're handled by their own lifecycle.
         if not _is_infra_task_id(tid):
             attempts = t.get("attempts", [])
-            finished = sum(
-                1 for a in attempts if a.get("status") in ("done", "superseded")
-            )
+            finished = sum(1 for a in attempts if a.get("status") in ("done", "superseded"))
             effective_max = t.get("max_attempts") or max_attempts_default
             trail = t.get("trail", [])
             if finished >= effective_max and status == "blocked":
                 reason = _last_failure_reason(trail)
-                items.append({
-                    "severity": "error",
-                    "type": "retry_ceiling",
-                    "message": (
-                        f"Task '{tid}' has failed {finished}/{effective_max} "
-                        f"attempts. Last failure: {reason[:120]}"
-                    ),
-                    "action": (
-                        "Task is at the retry ceiling. Inspect trail or "
-                        f"unblock via: antfarm kickback {tid}"
-                    ),
-                    "task_id": tid,
-                })
-            elif (
-                finished >= effective_max - 1
-                and finished > 0
-                and status != "blocked"
-            ):
+                items.append(
+                    {
+                        "severity": "error",
+                        "type": "retry_ceiling",
+                        "message": (
+                            f"Task '{tid}' has failed {finished}/{effective_max} "
+                            f"attempts. Last failure: {reason[:120]}"
+                        ),
+                        "action": (
+                            "Task is at the retry ceiling. Inspect trail or "
+                            f"unblock via: antfarm kickback {tid}"
+                        ),
+                        "task_id": tid,
+                    }
+                )
+            elif finished >= effective_max - 1 and finished > 0 and status != "blocked":
                 reason = _last_failure_reason(trail)
-                items.append({
-                    "severity": "warning",
-                    "type": "retrying",
-                    "message": (
-                        f"Task '{tid}' has failed {finished} of max "
-                        f"{effective_max} attempts. Last failure: {reason[:120]}"
-                    ),
-                    "action": (
-                        "Task may block the mission if the next attempt fails. "
-                        "Inspect trail before it hits the retry ceiling."
-                    ),
-                    "task_id": tid,
-                })
+                items.append(
+                    {
+                        "severity": "warning",
+                        "type": "retrying",
+                        "message": (
+                            f"Task '{tid}' has failed {finished} of max "
+                            f"{effective_max} attempts. Last failure: {reason[:120]}"
+                        ),
+                        "action": (
+                            "Task may block the mission if the next attempt fails. "
+                            "Inspect trail before it hits the retry ceiling."
+                        ),
+                        "task_id": tid,
+                    }
+                )
 
         # --- Tasks with signals (need human input) ---
         signals = t.get("signals", [])
         if signals:
             last_signal = signals[-1]
-            items.append({
-                "severity": "info",
-                "type": "has_signal",
-                "message": f"Task '{tid}' has signal: {last_signal.get('message', '')[:100]}",
-                "action": "Review signal and take action",
-                "task_id": tid,
-            })
+            items.append(
+                {
+                    "severity": "info",
+                    "type": "has_signal",
+                    "message": f"Task '{tid}' has signal: {last_signal.get('message', '')[:100]}",
+                    "action": "Review signal and take action",
+                    "task_id": tid,
+                }
+            )
 
     # Sort: errors first, then warnings, then info
     severity_order = {"error": 0, "warning": 1, "info": 2}

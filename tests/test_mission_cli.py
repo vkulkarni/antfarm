@@ -586,3 +586,127 @@ def test_colony_no_queen_flag():
         assert result.exit_code == 0, result.output
         call_kwargs = mock_get_app.call_args
         assert call_kwargs.kwargs.get("enable_queen") is False
+
+
+# ---------------------------------------------------------------------------
+# mission create budget flags / mission extend / mission status budget
+# (v0.6.14 — issue #354)
+# ---------------------------------------------------------------------------
+
+
+def test_mission_create_with_max_cost_usd(tmp_path: Path):
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("spec")
+    runner = CliRunner()
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"mission_id": "m1"}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
+                "--max-cost-usd",
+                "25.5",
+                "--max-tokens",
+                "100000",
+                "--budget-action",
+                "cancel",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert payload["config"]["max_cost_usd"] == 25.5
+        assert payload["config"]["max_tokens"] == 100_000
+        assert payload["config"]["budget_action"] == "cancel"
+
+
+def test_mission_status_prints_budget_line():
+    runner = CliRunner()
+    with (
+        patch("antfarm.core.cli.httpx.get") as mock_get,
+    ):
+        # First call: /missions/<id>
+        mission_resp = MagicMock()
+        mission_resp.status_code = 200
+        mission_resp.json.return_value = {
+            "mission_id": "m-1",
+            "status": "building",
+            "config": {
+                "max_cost_usd": 10.0,
+                "max_tokens": 50_000,
+                "completion_mode": "best_effort",
+            },
+            "task_ids": ["task-1"],
+        }
+        # Second call: /missions/<id>/usage
+        usage_resp = MagicMock()
+        usage_resp.status_code = 200
+        usage_resp.json.return_value = {
+            "mission_id": "m-1",
+            "total_cost_usd": 2.50,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "per_task": {
+                "task-1": {"cost_usd": 2.50},
+            },
+        }
+        mock_get.side_effect = [mission_resp, usage_resp]
+
+        result = runner.invoke(
+            main,
+            ["mission", "status", "m-1", "--colony-url", "http://localhost:7433"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Budget:" in result.output
+        assert "$2.5000" in result.output or "$2.5" in result.output
+        assert "$10" in result.output
+        assert "Tokens:" in result.output
+        assert "1500" in result.output
+        assert "50000" in result.output
+        assert "Top spend" in result.output
+
+
+def test_mission_extend_command():
+    runner = CliRunner()
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "mission_id": "m-1",
+            "status": "building",
+            "config": {"max_cost_usd": 15.0, "max_tokens": 1500},
+        }
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "extend",
+                "m-1",
+                "--additional-usd",
+                "10.0",
+                "--additional-tokens",
+                "500",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        url = mock_post.call_args.args[0]
+        assert "/missions/m-1/extend" in url
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert payload["additional_usd"] == 10.0
+        assert payload["additional_tokens"] == 500
+        assert "15.0" in result.output
+        assert "1500" in result.output
