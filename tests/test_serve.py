@@ -721,22 +721,51 @@ def test_colony_activity_in_status_full(client):
 
 
 def test_colony_activity_defaults_to_empty_in_status_full(tmp_path):
-    """When no subsystem has emitted activity, the dicts exist but are empty."""
+    """When no subsystem has emitted activity, both activity fields are None (#359)."""
     from antfarm.core.backends.file import FileBackend
 
     # Reset module state (tests run in-process and may have stale state).
-    serve_mod._soldier_activity.update(
-        {"action": None, "target": None, "text": None, "since": None}
-    )
-    serve_mod._doctor_activity.update({"action": None, "target": None, "text": None, "since": None})
+    serve_mod._soldier_activity = None
+    serve_mod._doctor_activity = None
 
     backend = FileBackend(root=str(tmp_path / ".antfarm"))
     app = get_app(backend=backend, enable_soldier=False)
     local = TestClient(app)
 
     data = local.get("/status/full").json()
-    assert data["soldier_activity"]["text"] is None
-    assert data["doctor_activity"]["text"] is None
+    assert data["soldier_activity"] is None
+    assert data["doctor_activity"] is None
+
+
+def test_doctor_activity_none_when_no_doctor_emit(tmp_path):
+    """Confirms /status/full returns None for doctor_activity when doctor hasn't emitted (#359)."""
+    from antfarm.core.backends.file import FileBackend
+
+    serve_mod._doctor_activity = None
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    local = TestClient(app)
+
+    data = local.get("/status/full").json()
+    assert data["doctor_activity"] is None
+
+
+def test_soldier_activity_populated_after_emit(tmp_path):
+    """After _set_colony_activity('soldier', ...), /status/full has dict with text (#359)."""
+    from antfarm.core.backends.file import FileBackend
+
+    serve_mod._soldier_activity = None
+
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    app = get_app(backend=backend, enable_soldier=False)
+    local = TestClient(app)
+
+    serve_mod._set_colony_activity("soldier", "merging", "task-099")
+    data = local.get("/status/full").json()
+    assert data["soldier_activity"] is not None
+    assert data["soldier_activity"]["text"] == "merging task-099"
+    assert data["soldier_activity"]["since"] is not None
 
 
 # ---------------------------------------------------------------------------

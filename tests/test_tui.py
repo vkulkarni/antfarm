@@ -852,6 +852,32 @@ def test_render_workers_shows_both_synthetic_rows():
     assert result.row_count == 2
 
 
+def test_render_workers_hides_doctor_row_when_activity_none():
+    """Regression for #359: doctor row must not appear when doctor_activity is None.
+
+    Before the fix, _doctor_activity was initialised as a dict with all-None
+    values (truthy because non-empty), so the `if doctor_activity:` guard in
+    _render_workers always fired.  Now the server returns None until the first
+    emit, and this test ensures the TUI honours that.
+    """
+    tui = _make_tui()
+
+    # No doctor_activity (None) and no soldiers/workers — only placeholder row.
+    result = tui._render_workers([], soldier_status="disabled", doctor_activity=None)
+    assert result.row_count == 1  # placeholder "no workers" only
+
+    # Explicit empty dict also treated as falsy by tui — same expectation.
+    result2 = tui._render_workers([], soldier_status="disabled", doctor_activity={})
+    assert result2.row_count == 1
+
+    # Once doctor emits a real dict, the row does appear.
+    from datetime import UTC, datetime
+
+    real_activity = {"text": "scanning guards", "since": datetime.now(UTC).isoformat()}
+    result3 = tui._render_workers([], soldier_status="disabled", doctor_activity=real_activity)
+    assert result3.row_count == 1  # 1 doctor row (no placeholder when there are rows)
+
+
 def test_get_worker_type_builder():
     tui = _make_tui()
     assert tui._get_worker_type({"agent_type": "claude-code"}) == "builder"

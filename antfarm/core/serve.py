@@ -48,8 +48,8 @@ _autoscaler_instance = None
 # /status/full. Appends are guarded by _colony_activity_lock so readers never
 # observe a partially-mutated dict.
 _colony_activity_lock = threading.Lock()
-_soldier_activity: dict = {"action": None, "target": None, "text": None, "since": None}
-_doctor_activity: dict = {"action": None, "target": None, "text": None, "since": None}
+_soldier_activity: dict | None = None
+_doctor_activity: dict | None = None
 
 # SSE event bus
 _event_queue: collections.deque = collections.deque(maxlen=1000)
@@ -87,15 +87,15 @@ def _set_colony_activity(kind: str, action: str, target: str = "") -> None:
         since = _now_iso()
         with _colony_activity_lock:
             if kind == "soldier":
-                _soldier_activity["action"] = action
-                _soldier_activity["target"] = target
-                _soldier_activity["text"] = text
-                _soldier_activity["since"] = since
+                global _soldier_activity
+                _soldier_activity = {
+                    "action": action, "target": target, "text": text, "since": since
+                }
             elif kind == "doctor":
-                _doctor_activity["action"] = action
-                _doctor_activity["target"] = target
-                _doctor_activity["text"] = text
-                _doctor_activity["since"] = since
+                global _doctor_activity
+                _doctor_activity = {
+                    "action": action, "target": target, "text": text, "since": since
+                }
     except Exception:
         logger.debug("_set_colony_activity(%s) failed", kind, exc_info=True)
 
@@ -1502,8 +1502,8 @@ def get_app(
         # render them as synthetic rows (#348). Copies are shallow but all
         # values are primitives, so this is safe.
         with _colony_activity_lock:
-            soldier_activity = dict(_soldier_activity)
-            doctor_activity = dict(_doctor_activity)
+            soldier_activity = dict(_soldier_activity) if _soldier_activity is not None else None
+            doctor_activity = dict(_doctor_activity) if _doctor_activity is not None else None
         return {
             "status": _backend.status(),
             "tasks": _backend.list_tasks(),
