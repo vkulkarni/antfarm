@@ -4948,6 +4948,10 @@ def test_run_once_with_review_calls_reconcile_pass(soldier_env, monkeypatch):
     repo = soldier_env["repo_path"]
 
     # Build a soldier with require_review=True so we hit the right entry point.
+    # poll_external_merges=False prevents shelling out to ``gh pr view`` in CI
+    # environments where the GitHub CLI is installed — a real ``gh`` call on the
+    # fake PR URL would add non-deterministic latency without affecting the
+    # reconcile→get_done ordering guarantee we're testing here.
     review_soldier = Soldier(
         colony_url="http://testserver",
         repo_path=repo,
@@ -4955,6 +4959,7 @@ def test_run_once_with_review_calls_reconcile_pass(soldier_env, monkeypatch):
         test_command=["true"],
         poll_interval=0.0,
         require_review=True,
+        poll_external_merges=False,
         client=soldier_env["soldier"].colony._client,
     )
 
@@ -4982,7 +4987,12 @@ def test_run_once_with_review_calls_reconcile_pass(soldier_env, monkeypatch):
     assert "reconcile" in call_log, (
         f"run_once_with_review must invoke _reconcile_external_merges; got {call_log}"
     )
+    assert "get_done" in call_log, (
+        f"run_once_with_review must invoke _get_done_candidates; got {call_log}"
+    )
     # Reconcile must run BEFORE the merge-queue construction.
+    # With poll_external_merges=False, real_reconcile is a fast no-op so the
+    # call ordering is deterministic regardless of CI environment.
     assert call_log.index("reconcile") < call_log.index("get_done"), (
         f"reconcile must precede get_done_candidates; got {call_log}"
     )
