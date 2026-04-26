@@ -6,8 +6,10 @@ started workers on other machines are untouched.
 
 Depth-aware (issue #320): builder target is
 ``ceil(ready_unblocked * builder_depth_factor)`` clamped to
-``max_builders``. Scale-up is immediate once
-``builder_scale_up_threshold`` is met; scale-down is lazy — at most one
+``max_builders``. The first builder is always spawned when desired >= 1
+(otherwise a mission with a single root task would deadlock — issue
+#366). ``builder_scale_up_threshold`` only gates spawning ADDITIONAL
+builders beyond a baseline of one; scale-down is lazy — at most one
 builder is retired per tick, and only after it has been idle for
 ``builder_scale_down_idle_seconds``. The mission-wide
 ``max_parallel_builders`` is enforced as a hard cap.
@@ -232,8 +234,11 @@ class AutoscalerConfig:
     # target_builders = min(max_builders, max(1 if ready>0 else 0,
     #                                          ceil(ready * builder_depth_factor)))
     builder_depth_factor: float = 0.5
-    # Minimum ready_unblocked before the autoscaler will spawn a NEW builder
-    # beyond what's already running. Prevents flutter on a shallow queue.
+    # Minimum ready_unblocked before the autoscaler will spawn an ADDITIONAL
+    # builder beyond a baseline of one. The first builder is always spawned
+    # when desired >= 1 regardless of this threshold (see issue #366 — a
+    # single-root-task mission would otherwise never start). This threshold
+    # only prevents flutter when scaling above one already-running builder.
     builder_scale_up_threshold: int = 2
     # Seconds a builder must be idle before it is eligible for retirement.
     # Lazy scale-down: retire at most one idle builder per reconcile tick.
@@ -361,10 +366,12 @@ class Autoscaler:
     def _reconcile_builders(self, desired: int, actual: int, ready_unblocked: int) -> None:
         """Depth-aware reconciliation for the builder pool.
 
-        Scale-up: only spawn NEW builders above ``actual`` when the queue has
-        enough work to justify it (``ready_unblocked >=
-        builder_scale_up_threshold``). No cooldown — spawn the full delta
-        immediately when the threshold is met.
+        Scale-up: always spawn the first builder when ``actual == 0`` and
+        ``desired >= 1`` (otherwise missions with a single root task
+        deadlock — issue #366). Beyond ``actual >= 1``, only spawn
+        additional builders when ``ready_unblocked >=
+        builder_scale_up_threshold``. No cooldown — spawn the full delta
+        immediately when the gate is satisfied.
 
         Scale-down: lazy and conservative. Retire at most ONE builder per
         reconcile tick, and only when that builder has been idle for at least
@@ -372,11 +379,11 @@ class Autoscaler:
         """
         delta = desired - actual
         if delta > 0:
-            if ready_unblocked >= self.config.builder_scale_up_threshold:
+            if actual == 0 or ready_unblocked >= self.config.builder_scale_up_threshold:
                 while delta > 0:
                     self._start_worker("builder")
                     delta -= 1
-            # Otherwise: threshold not met, hold the current count steady.
+            # Otherwise: actual >= 1 and threshold not met — hold steady (anti-flutter).
             return
         if delta < 0:
             # Retire at most one builder per tick, and only after the idle

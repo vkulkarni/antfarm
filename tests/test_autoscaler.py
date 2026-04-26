@@ -828,8 +828,13 @@ class TestDepthAwareTarget:
 
 
 class TestScaleUpThreshold:
-    def test_scale_up_respects_threshold(self):
-        """ready_unblocked=1, builder_scale_up_threshold=2 -> do NOT spawn."""
+    def test_first_builder_spawns_when_actual_zero_and_one_ready(self):
+        """Bootstrap: actual=0, ready_unblocked=1 < threshold=2 -> spawn 1 (issue #366).
+
+        Without this carve-out, a mission with a single root task would
+        deadlock: desired=1, actual=0, but the threshold gate would refuse to
+        spawn the first builder, leaving the queue stuck forever.
+        """
         pm = _mock_pm()
         a = _make_autoscaler(
             _pm=pm,
@@ -837,15 +842,123 @@ class TestScaleUpThreshold:
             builder_depth_factor=0.5,
             builder_scale_up_threshold=2,
         )
-        # One ready unblocked task
         a.backend.list_tasks.return_value = [_task("task-1", status="ready")]
         a.backend.list_workers.return_value = []
 
         a._reconcile()
 
-        # compute_depth_aware_target(1, ...) == 1, actual == 0, delta == 1.
-        # But ready_unblocked (1) < threshold (2), so no spawn.
-        assert pm.start.call_count == 0
+        # Exactly one builder spawned despite ready_unblocked < threshold.
+        builder_starts = [
+            c for c in pm.start.call_args_list if "builder" in str(c)
+        ]
+        assert len(builder_starts) == 1
+
+    def test_no_spawn_when_actual_zero_and_no_ready_work(self):
+        """actual=0, ready_unblocked=0 -> desired=0, no spawn."""
+        pm = _mock_pm()
+        a = _make_autoscaler(
+            _pm=pm,
+            max_builders=5,
+            builder_depth_factor=0.5,
+            builder_scale_up_threshold=2,
+        )
+        # No ready build tasks (only an infra plan task, which doesn't count)
+        a.backend.list_tasks.return_value = [
+            _task("plan-001", status="ready", capabilities_required=["plan"]),
+        ]
+        a.backend.list_workers.return_value = []
+
+        a._reconcile()
+
+        builder_starts = [
+            c for c in pm.start.call_args_list if "builder" in str(c)
+        ]
+        assert len(builder_starts) == 0
+
+    def test_no_spawn_above_baseline_when_below_threshold(self):
+        """actual=1, ready_unblocked=1 < threshold=2 -> hold steady (anti-flutter).
+
+        Use builder_depth_factor=2.0 so ready=1 -> desired=ceil(2)=2 and
+        delta=1, exercising the anti-flutter gate above the bootstrap.
+        """
+        pm = _mock_pm()
+        a = _make_autoscaler(
+            _pm=pm,
+            max_builders=5,
+            builder_depth_factor=2.0,
+            builder_scale_up_threshold=2,
+        )
+        # Pre-existing managed builder so actual=1
+        a.managed["auto-builder-1"] = ManagedWorker(
+            name="auto-builder-1",
+            role="builder",
+            worker_id="local/auto-builder-1",
+        )
+        a.backend.list_tasks.return_value = [_task("task-1", status="ready")]
+        a.backend.list_workers.return_value = [
+            _worker("local/auto-builder-1", status="idle"),
+        ]
+
+        a._reconcile()
+
+        # desired=ceil(1*2.0)=2, actual=1, delta=1. ready_unblocked=1 < threshold=2
+        # AND actual != 0, so the anti-flutter branch holds steady.
+        builder_starts = [
+            c for c in pm.start.call_args_list if "builder" in str(c)
+        ]
+        assert len(builder_starts) == 0
+
+    def test_scale_up_above_baseline_when_threshold_met(self):
+        """actual=1, ready_unblocked=4 >= threshold=2 -> spawn delta builders."""
+        pm = _mock_pm()
+        a = _make_autoscaler(
+            _pm=pm,
+            max_builders=5,
+            builder_depth_factor=0.5,
+            builder_scale_up_threshold=2,
+        )
+        # Pre-existing managed builder so actual=1
+        a.managed["auto-builder-1"] = ManagedWorker(
+            name="auto-builder-1",
+            role="builder",
+            worker_id="local/auto-builder-1",
+        )
+        # 4 ready tasks: desired=ceil(4*0.5)=2, actual=1, delta=1. ready=4>=2.
+        a.backend.list_tasks.return_value = [
+            _task(f"task-{i}", status="ready") for i in range(1, 5)
+        ]
+        a.backend.list_workers.return_value = [
+            _worker("local/auto-builder-1", status="idle"),
+        ]
+
+        a._reconcile()
+
+        builder_starts = [
+            c for c in pm.start.call_args_list if "builder" in str(c)
+        ]
+        assert len(builder_starts) == 1
+
+    def test_first_spawn_respects_max_builders_cap(self):
+        """max_builders=1 caps desired even when bootstrap path applies."""
+        pm = _mock_pm()
+        a = _make_autoscaler(
+            _pm=pm,
+            max_builders=1,
+            builder_depth_factor=0.5,
+            builder_scale_up_threshold=2,
+        )
+        # Many ready tasks, but max_builders=1 caps desired at 1.
+        a.backend.list_tasks.return_value = [
+            _task(f"task-{i}", status="ready") for i in range(1, 11)
+        ]
+        a.backend.list_workers.return_value = []
+
+        a._reconcile()
+
+        builder_starts = [
+            c for c in pm.start.call_args_list if "builder" in str(c)
+        ]
+        assert len(builder_starts) == 1
 
 
 class TestDepthAwareScaleDown:
