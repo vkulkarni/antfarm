@@ -141,6 +141,27 @@ _MERGE_FAILED_REASONS = frozenset(
 # - auto_merge_refused: security guard refused auto-merge (viewer lacks
 #   permission or main/master without ADMIN). Surfaces once per PR until
 #   the backoff window expires.
+#
+# Reconciliation event vocabulary (#367)
+#
+# - reconciled_external: A PR was detected as MERGED on origin and the
+#   matching attempt was marked MERGED in antfarm. Emitted from both the
+#   per-task path (``_reconcile_external_merge``) and the mission-wide
+#   poll-pass (``_reconcile_external_merges``). The poll-pass variant
+#   includes ``source=poll_pass`` in the detail so operators can tell the
+#   two sources apart.
+#
+# - auto_merge_mark_drift: ``gh pr merge`` succeeded on origin but the
+#   subsequent ``mark_merged`` raised ``ValueError`` (typically attempt
+#   drift between the auto-merge decision and the antfarm-side write).
+#   The auto-merge tick still reports MERGED — the bulk reconciliation
+#   pass will catch the antfarm-side flag failure on a later tick.
+#
+# - auto_merge_mark_failed: ``gh pr merge`` succeeded but ``mark_merged``
+#   raised an unexpected (non-TypeError, non-ValueError) exception. Same
+#   recovery path as ``auto_merge_mark_drift`` — the next reconcile pass
+#   converges state. Detail includes ``type=<exception class>`` so the
+#   operator can grep for novel failure modes.
 # ---------------------------------------------------------------------------
 
 
@@ -252,6 +273,12 @@ class Soldier:
         self._auto_merge_last_checked: dict[str, float] = {}
         self._repo_permission_cache: dict[str, tuple[str, float]] = {}
         self.auto_merge_poll_backoff_seconds: float = 30.0
+        # Mission-wide reconciliation (#367): per-task TTL cache for
+        # ``gh pr view`` calls during the bulk reconciliation pass at the
+        # top of every poll. Keyed by task_id, value is the last-checked
+        # monotonic timestamp.
+        self._reconcile_last_checked: dict[str, float] = {}
+        self.reconcile_backoff_seconds: float = 60.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -276,6 +303,10 @@ class Soldier:
         self._run_preflight_if_needed()
         while True:
             _set_activity("polling", "")
+            # #367: bulk reconciliation pass MUST run before any merge-queue
+            # construction so upstream desync (PR merged on origin but
+            # antfarm attempt still un-MERGED) doesn't block dependents.
+            self._reconcile_external_merges(self.colony.list_tasks())
             if self.require_review:
                 self.run_once_with_review()
             else:
@@ -301,6 +332,10 @@ class Soldier:
             List of (task_id, MergeResult) tuples for each task processed.
         """
         self._run_preflight_if_needed()
+        # #367: bulk reconciliation pass MUST run before any merge-queue
+        # construction so upstream desync (PR merged on origin but
+        # antfarm attempt still un-MERGED) doesn't block dependents.
+        self._reconcile_external_merges(self.colony.list_tasks())
         if self.require_review:
             self.process_done_tasks()
         results = []
@@ -412,6 +447,10 @@ class Soldier:
         Returns:
             List of (task_id, MergeResult) tuples.
         """
+        # #367: bulk reconciliation pass MUST run before any merge-queue
+        # construction so upstream desync (PR merged on origin but
+        # antfarm attempt still un-MERGED) doesn't block dependents.
+        self._reconcile_external_merges(self.colony.list_tasks())
         results: list[tuple[str, MergeResult]] = []
         queue = self._get_done_candidates()
         all_tasks = self.colony.list_tasks()
@@ -1718,6 +1757,81 @@ class Soldier:
         _emit("reconciled_external", task_id, f"pr={pr}")
         return True
 
+    def _reconcile_external_merges(self, all_tasks: list[dict]) -> int:
+        """Mission-wide reconciliation pass at the top of every soldier poll.
+
+        For every done, non-infra task with an unmerged current attempt and a
+        PR URL, query ``gh pr view`` to detect cases where the PR was merged
+        externally (or by a prior auto-merge that succeeded on origin but
+        whose antfarm-side ``mark_merged`` failed silently — see #367).
+
+        A per-task TTL cache (``self._reconcile_last_checked``) gates how
+        often each task is polled. The default backoff is 60s.
+
+        Returns the number of attempts that were reconciled this pass.
+        Returns 0 when ``poll_external_merges`` is disabled.
+
+        This pass MUST run before ``get_merge_queue`` / ``_get_done_candidates``
+        so an upstream desync is corrected before downstream dep_unmerged
+        filtering blocks dependent tasks.
+        """
+        if not self.poll_external_merges:
+            return 0
+
+        reconciled = 0
+        now = time.time()
+        cutoff = now - self.reconcile_backoff_seconds
+
+        for task in all_tasks:
+            if is_infra_task(task):
+                continue
+            if task.get("status") != "done":
+                continue
+            if self._has_merged_attempt(task):
+                continue
+            attempt_id = task.get("current_attempt")
+            if not attempt_id:
+                continue
+            pr = self._get_attempt_pr(task)
+            if not pr:
+                continue
+            task_id = task.get("id", "")
+            last_checked = self._reconcile_last_checked.get(task_id)
+            if last_checked is not None and last_checked > cutoff:
+                continue
+
+            merged = self._check_pr_merged_on_origin(pr)
+            # Update cache regardless of result so a transient gh outage or an
+            # OPEN state doesn't hammer the API every tick.
+            self._reconcile_last_checked[task_id] = now
+            if merged is not True:
+                continue
+
+            logger.info(
+                "reconcile pass: PR %s for task %s is MERGED on origin; marking attempt %s",
+                pr,
+                task_id,
+                attempt_id,
+            )
+            try:
+                marked = self._safe_mark_merged(task_id, attempt_id)
+            except ValueError as exc:
+                logger.warning(
+                    "reconcile pass: mark_merged ValueError task=%s attempt=%s err=%s",
+                    task_id,
+                    attempt_id,
+                    exc,
+                )
+                continue
+            if marked:
+                _emit(
+                    "reconciled_external",
+                    task_id,
+                    f"pr={pr} source=poll_pass",
+                )
+                reconciled += 1
+        return reconciled
+
     @staticmethod
     def _has_merged_attempt(task: dict) -> bool:
         """Return True if the task has at least one attempt with status MERGED."""
@@ -2222,9 +2336,7 @@ class Soldier:
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            logger.debug(
-                "auto-merge: remote branch delete timed out for %r", branch
-            )
+            logger.debug("auto-merge: remote branch delete timed out for %r", branch)
         except Exception:
             logger.debug(
                 "auto-merge: remote branch delete raised for %r",
@@ -2494,11 +2606,54 @@ class Soldier:
                 task_id,
                 f"pr={outcome.pr} mode={outcome.mode} reason={outcome.reason}",
             )
+            # #367: gh pr merge already succeeded on origin. Antfarm-side
+            # mark_merged failures must NOT cause us to retry the merge or
+            # report FAILED — the next reconciliation pass will catch the
+            # drift and converge state. Tighten the exception net so a
+            # ValueError (the actual symptom in #367) is logged + emitted
+            # instead of bubbling out of the auto-merge tick.
             try:
                 self.colony.mark_merged(task_id, attempt_id, auto_merged=True)
+                logger.info(
+                    "auto_merge: mark_merged ok task=%s attempt=%s pr=%s",
+                    task_id,
+                    attempt_id,
+                    outcome.pr,
+                )
             except TypeError:
                 # Older colony/backends may not accept the kwarg — degrade gracefully.
                 self.colony.mark_merged(task_id, attempt_id)
+                logger.info(
+                    "auto_merge: mark_merged ok (no auto_merged kwarg) task=%s attempt=%s",
+                    task_id,
+                    attempt_id,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "auto_merge: mark_merged ValueError after successful gh pr merge "
+                    "task=%s attempt=%s pr=%s err=%s — relying on reconciliation pass",
+                    task_id,
+                    attempt_id,
+                    outcome.pr,
+                    exc,
+                )
+                _emit(
+                    "auto_merge_mark_drift",
+                    task_id,
+                    f"pr={outcome.pr} attempt={attempt_id} err={exc}",
+                )
+            except Exception as exc:
+                logger.exception(
+                    "auto_merge: mark_merged unexpected failure task=%s attempt=%s pr=%s",
+                    task_id,
+                    attempt_id,
+                    outcome.pr,
+                )
+                _emit(
+                    "auto_merge_mark_failed",
+                    task_id,
+                    f"pr={outcome.pr} attempt={attempt_id} type={type(exc).__name__}",
+                )
             return MergeResult.MERGED
 
         if outcome.action == "rebase":
@@ -2577,6 +2732,8 @@ class Soldier:
         instance._auto_merge_last_checked = {}
         instance._repo_permission_cache = {}
         instance.auto_merge_poll_backoff_seconds = 30.0
+        instance._reconcile_last_checked = {}
+        instance.reconcile_backoff_seconds = 60.0
         return instance
 
 

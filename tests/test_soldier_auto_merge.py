@@ -42,6 +42,8 @@ def _make_soldier(integration_branch: str = "main", monkeypatch=None) -> Soldier
     s._auto_merge_last_checked = {}
     s._repo_permission_cache = {}
     s.auto_merge_poll_backoff_seconds = 30.0
+    s._reconcile_last_checked = {}
+    s.reconcile_backoff_seconds = 60.0
     return s
 
 
@@ -563,6 +565,8 @@ def _make_soldier_for_gh() -> Soldier:
     s._auto_merge_last_checked = {}
     s._repo_permission_cache = {}
     s.auto_merge_poll_backoff_seconds = 30.0
+    s._reconcile_last_checked = {}
+    s.reconcile_backoff_seconds = 60.0
     return s
 
 
@@ -699,9 +703,7 @@ def test_gh_pr_merge_squash_nonzero_but_merged(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         if cmd[:3] == ["gh", "pr", "merge"]:
-            return SimpleNamespace(
-                returncode=1, stdout="", stderr="already merged or transient"
-            )
+            return SimpleNamespace(returncode=1, stdout="", stderr="already merged or transient")
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -746,9 +748,7 @@ def test_gh_pr_merge_squash_nonzero_state_unknown(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         if cmd[:3] == ["gh", "pr", "merge"]:
-            return SimpleNamespace(
-                returncode=1, stdout="", stderr="network blip"
-            )
+            return SimpleNamespace(returncode=1, stdout="", stderr="network blip")
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(subprocess, "run", fake_run)

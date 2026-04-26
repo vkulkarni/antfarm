@@ -1370,7 +1370,14 @@ def test_get_merge_queue_skips_review_capability_task(soldier_env):
 
 
 def test_run_once_skips_externally_merged_pr(soldier_env, monkeypatch):
-    """When gh reports the PR as MERGED, mark_merged is called and attempt_merge is skipped."""
+    """When gh reports the PR as MERGED, mark_merged is called and attempt_merge is skipped.
+
+    #367: the bulk reconcile pass at the top of ``run_once`` reconciles the
+    attempt to MERGED before ``get_merge_queue`` is constructed. The merge
+    queue is then empty (already-merged tasks are filtered out), so
+    ``run_once`` returns ``[]``. The load-bearing assertion is that the
+    attempt's status flips to MERGED and ``attempt_merge`` was never called.
+    """
     soldier = soldier_env["soldier"]
     cc = soldier_env["colony_client"]
     repo = soldier_env["repo_path"]
@@ -1386,8 +1393,7 @@ def test_run_once_skips_externally_merged_pr(soldier_env, monkeypatch):
 
     monkeypatch.setattr(Soldier, "attempt_merge", _fail)
 
-    results = soldier.run_once()
-    assert results == [("task-ext-merged", MergeResult.MERGED)]
+    soldier.run_once()
 
     task = cc.get_task("task-ext-merged")
     attempts = task["attempts"]
@@ -1561,7 +1567,13 @@ def test_soldier_emits_reconciled_external_and_skips_merge_events(
     soldier_env, clear_events, monkeypatch
 ):
     """When the PR is already merged on origin, soldier emits reconciled_external and
-    does not run the attempt_merge path (so no merge_started/succeeded fire)."""
+    does not run the attempt_merge path (so no merge_started/succeeded fire).
+
+    #367: the bulk pre-pass reconciles the attempt before the merge queue is
+    constructed, so ``run_once`` returns ``[]``. The load-bearing assertions
+    are the ``reconciled_external`` event and the absence of merge_started/
+    merge_succeeded.
+    """
     soldier = soldier_env["soldier"]
     cc = soldier_env["colony_client"]
     repo = soldier_env["repo_path"]
@@ -1570,11 +1582,10 @@ def test_soldier_emits_reconciled_external_and_skips_merge_events(
 
     monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", lambda self, pr: True)
 
-    results = soldier.run_once()
-    assert results == [("task-ev-ext", MergeResult.MERGED)]
+    soldier.run_once()
 
     reconciled = _events_of_type(clear_events, "reconciled_external")
-    assert len(reconciled) == 1
+    assert len(reconciled) >= 1
     assert reconciled[0]["actor"] == "soldier"
     assert reconciled[0]["task_id"] == "task-ev-ext"
     assert reconciled[0]["detail"].startswith("pr=")
@@ -2779,7 +2790,10 @@ def test_p3_git_failure_falls_through_safely(tmp_path, monkeypatch):
         prior_verdict=_pass_verdict(old_sha),
     )
 
-    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path))
+    # #367: bulk reconcile pass shells out via `gh pr view`. This test's
+    # subprocess assertion-trap is intentionally narrow (P3 git fall-through
+    # only), so disable external-merge polling to avoid a false trip.
+    soldier = Soldier.from_backend(backend, repo_path=str(tmp_path), poll_external_merges=False)
 
     class _FakeCompleted:
         def __init__(self, returncode=1, stdout="", stderr="boom"):
@@ -4654,4 +4668,321 @@ def test_cleanup_site_1433_NOT_wrapped(tmp_path, monkeypatch):
     assert helper_called["n"] == 0, (
         "_cleanup must NOT invoke _checkout_with_reclaim — see #352 comment "
         "in soldier._cleanup about finally-block safety."
+    )
+
+
+# ---------------------------------------------------------------------------
+# #367: mission-wide reconciliation pass + tightened auto_merge error handling
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_external_merges_fixes_desynced_attempt(soldier_env, monkeypatch):
+    """Bulk reconcile pass marks externally-merged PRs as MERGED.
+
+    Repro for #367: a PR was merged on origin (e.g. by ``gh pr merge`` whose
+    antfarm-side ``mark_merged`` raised), but the antfarm attempt is still
+    DONE (not MERGED). The pass at the top of every poll must detect this
+    and converge state.
+    """
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-desync", "feat/task-desync")
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", lambda self, pr: True)
+
+    all_tasks = cc.list_tasks()
+    n = soldier._reconcile_external_merges(all_tasks)
+
+    assert n == 1
+    task = cc.get_task("task-desync")
+    assert any(a["status"] == "merged" for a in task["attempts"])
+
+
+def test_reconcile_external_merges_no_op_when_pr_open(soldier_env, monkeypatch):
+    """When gh reports state=OPEN (returns False), reconciler does nothing."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-open", "feat/task-open")
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", lambda self, pr: False)
+
+    n = soldier._reconcile_external_merges(cc.list_tasks())
+
+    assert n == 0
+    task = cc.get_task("task-open")
+    # Attempt is still DONE, never marked merged.
+    assert not any(a["status"] == "merged" for a in task["attempts"])
+
+
+def test_reconcile_external_merges_no_op_when_pr_state_unknown(soldier_env, monkeypatch):
+    """When gh returns None (network error / missing tool), reconciler skips."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-unknown", "feat/task-unknown")
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", lambda self, pr: None)
+
+    n = soldier._reconcile_external_merges(cc.list_tasks())
+
+    assert n == 0
+    task = cc.get_task("task-unknown")
+    assert not any(a["status"] == "merged" for a in task["attempts"])
+
+
+def test_reconcile_external_merges_respects_60s_backoff(soldier_env, monkeypatch):
+    """Per-task TTL gates how often each PR is queried (default 60s).
+
+    Two consecutive reconcile passes within the backoff window must result
+    in only ONE call to ``_check_pr_merged_on_origin`` per task.
+    """
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-backoff", "feat/task-backoff")
+
+    call_count = {"n": 0}
+
+    def fake_check(self, pr):
+        call_count["n"] += 1
+        return False  # not merged — keep re-evaluating without short-circuit
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", fake_check)
+
+    soldier._reconcile_external_merges(cc.list_tasks())
+    soldier._reconcile_external_merges(cc.list_tasks())
+
+    assert call_count["n"] == 1, (
+        "second pass within backoff window must reuse cached result; "
+        f"got {call_count['n']} gh calls"
+    )
+
+
+def test_reconcile_external_merges_skips_already_merged(soldier_env, monkeypatch):
+    """Tasks whose current attempt is already MERGED must be skipped (no gh call)."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    task = _carry_and_harvest(cc, repo, "task-already", "feat/task-already")
+    cc.mark_merged(task_id="task-already", attempt_id=task["current_attempt"])
+
+    call_count = {"n": 0}
+
+    def fake_check(self, pr):  # pragma: no cover — should never run
+        call_count["n"] += 1
+        return True
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", fake_check)
+
+    n = soldier._reconcile_external_merges(cc.list_tasks())
+
+    assert n == 0
+    assert call_count["n"] == 0, "must not gh-poll already-merged tasks"
+
+
+def test_reconcile_external_merges_skips_infra_tasks(soldier_env, monkeypatch):
+    """Infra tasks (review-*) must be skipped — they are informational, not merge candidates."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+
+    # Synthesize a done infra task by direct backend write — no harvest path
+    # for review-* tasks since they aren't real builders.
+    cc._client.post(
+        "/tasks",
+        json={
+            "id": "review-task-infra",
+            "title": "review for task-infra",
+            "spec": "review",
+            "capabilities_required": ["review"],
+        },
+    ).raise_for_status()
+
+    call_count = {"n": 0}
+
+    def fake_check(self, pr):  # pragma: no cover — should never run
+        call_count["n"] += 1
+        return True
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", fake_check)
+
+    soldier._reconcile_external_merges(cc.list_tasks())
+
+    assert call_count["n"] == 0, "must not gh-poll infra tasks"
+
+
+def test_reconcile_external_merges_disabled_when_poll_external_merges_false(
+    soldier_env, monkeypatch
+):
+    """When ``poll_external_merges=False`` the entire pass is a no-op (early return)."""
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    _carry_and_harvest(cc, repo, "task-disabled", "feat/task-disabled")
+
+    soldier.poll_external_merges = False
+
+    call_count = {"n": 0}
+
+    def fake_check(self, pr):  # pragma: no cover — should never run
+        call_count["n"] += 1
+        return True
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", fake_check)
+
+    n = soldier._reconcile_external_merges(cc.list_tasks())
+
+    assert n == 0
+    assert call_count["n"] == 0
+
+
+def test_reconcile_unblocks_dependency_cascade(soldier_env, monkeypatch):
+    """E2E: upstream desync → reconcile → downstream becomes merge-eligible.
+
+    task-up's PR is merged on origin but its antfarm attempt was left as
+    DONE (not MERGED) — the bug from #367. task-down depends on task-up,
+    so without reconciliation it would be filtered as ``dep_unmerged``.
+    The pass at the top of run_once converges upstream first, allowing
+    task-down to merge in the same tick.
+    """
+    soldier = soldier_env["soldier"]
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    up = _carry_and_harvest(cc, repo, "task-up", "feat/task-up")
+    _carry_and_harvest(cc, repo, "task-down", "feat/task-down", depends_on=["task-up"])
+
+    # Pretend gh reports task-up's PR as MERGED. Other PR queries return False.
+    def fake_check(self, pr):
+        return "task-up" in pr
+
+    monkeypatch.setattr(Soldier, "_check_pr_merged_on_origin", fake_check)
+
+    results = soldier.run_once()
+
+    # task-up is reconciled → marked MERGED
+    up_task = cc.get_task("task-up")
+    assert any(a["status"] == "merged" for a in up_task["attempts"]), (
+        "expected task-up to be marked MERGED via reconciliation pass; "
+        f"attempts={up_task['attempts']}"
+    )
+    # task-down is now merge-eligible (deps satisfied) and merges this tick.
+    down_results = [r for r in results if r[0] == "task-down"]
+    assert down_results == [("task-down", MergeResult.MERGED)], (
+        f"expected task-down to merge after reconcile unblocked it; results={results}"
+    )
+    # Sanity: 'up' was the up-front attempt id — never disturbed by the cascade.
+    assert up["current_attempt"] == up_task["current_attempt"]
+
+
+def test_handle_auto_merge_outcome_swallows_value_error(soldier_env, monkeypatch, captured_emits):
+    """gh pr merge succeeded → mark_merged raises ValueError → still MERGED.
+
+    Root cause of #367: ``mark_merged`` raised ``ValueError`` (e.g., attempt
+    drift) and the previous code only caught ``TypeError``. The exception
+    bubbled out of the auto-merge tick, leaving origin merged but antfarm
+    state unchanged. The fix tightens the net so ValueError is logged +
+    emitted as ``auto_merge_mark_drift`` and the result remains MERGED —
+    the next reconciliation pass converges state.
+    """
+    from antfarm.core.auto_merge import AutoMergeOutcome
+
+    soldier = soldier_env["soldier"]
+
+    # gh pr merge succeeds.
+    monkeypatch.setattr(Soldier, "_gh_pr_merge_squash", lambda self, pr, branch=None: (True, ""))
+    monkeypatch.setattr(Soldier, "_sync_integration_branch_after_auto_merge", lambda self: None)
+
+    # mark_merged ALWAYS raises ValueError — simulates #367 race.
+    def fake_mark_merged(task_id, attempt_id, **_):
+        raise ValueError("attempt drift")
+
+    soldier.colony.mark_merged = fake_mark_merged  # type: ignore[method-assign]
+
+    task = {
+        "id": "task-drift-am",
+        "current_attempt": "att-1",
+        "attempts": [
+            {
+                "attempt_id": "att-1",
+                "status": "done",
+                "branch": "feat/task-drift-am",
+                "pr": "https://github.com/x/y/pull/9",
+            }
+        ],
+    }
+    outcome = AutoMergeOutcome(
+        action="merge",
+        pr="https://github.com/x/y/pull/9",
+        mode="on-review-pass",
+        reason="clean",
+    )
+
+    result = soldier._handle_auto_merge_outcome(outcome, task)
+
+    # gh pr merge already succeeded — caller must see MERGED, not FAILED.
+    assert result == MergeResult.MERGED
+
+    drift_emits = [
+        c for c in captured_emits if c[0] == "auto_merge_mark_drift" and c[1] == "task-drift-am"
+    ]
+    assert drift_emits, f"expected auto_merge_mark_drift event; got {captured_emits}"
+    assert "err=" in drift_emits[0][2]
+
+
+def test_run_once_with_review_calls_reconcile_pass(soldier_env, monkeypatch):
+    """The review-orchestration entry point invokes the bulk reconcile pass.
+
+    Asserts that ``run_once_with_review`` calls ``_reconcile_external_merges``
+    BEFORE constructing the merge queue — the load-bearing ordering for #367
+    when the dep-cascade involves review-gated tasks.
+    """
+    cc = soldier_env["colony_client"]
+    repo = soldier_env["repo_path"]
+
+    # Build a soldier with require_review=True so we hit the right entry point.
+    review_soldier = Soldier(
+        colony_url="http://testserver",
+        repo_path=repo,
+        integration_branch="dev",
+        test_command=["true"],
+        poll_interval=0.0,
+        require_review=True,
+        client=soldier_env["soldier"].colony._client,
+    )
+
+    _carry_and_harvest(cc, repo, "task-rcw", "feat/task-rcw")
+
+    call_log: list[str] = []
+
+    real_reconcile = Soldier._reconcile_external_merges
+
+    def tracked_reconcile(self, all_tasks):
+        call_log.append("reconcile")
+        return real_reconcile(self, all_tasks)
+
+    real_get_done = Soldier._get_done_candidates
+
+    def tracked_get_done(self):
+        call_log.append("get_done")
+        return real_get_done(self)
+
+    monkeypatch.setattr(Soldier, "_reconcile_external_merges", tracked_reconcile)
+    monkeypatch.setattr(Soldier, "_get_done_candidates", tracked_get_done)
+
+    review_soldier.run_once_with_review()
+
+    assert "reconcile" in call_log, (
+        f"run_once_with_review must invoke _reconcile_external_merges; got {call_log}"
+    )
+    # Reconcile must run BEFORE the merge-queue construction.
+    assert call_log.index("reconcile") < call_log.index("get_done"), (
+        f"reconcile must precede get_done_candidates; got {call_log}"
     )
