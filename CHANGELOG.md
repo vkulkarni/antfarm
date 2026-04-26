@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-04-25
+
+### Fixed
+- fix(autoscaler): always spawn first builder regardless of `builder_scale_up_threshold` — prevents deadlock on missions with single-root dependency graphs (#366)
+- fix(soldier): bulk reconciliation pass detects PRs merged on GitHub but not flagged in antfarm; tightened `_handle_auto_merge_outcome` exception handling (`ValueError` from attempt drift now caught + emitted as `auto_merge_mark_drift`); 60s per-task gh-view TTL bounds calls (#367)
+
 ## [0.6.14] - 2026-04-23
 
 ### Added
