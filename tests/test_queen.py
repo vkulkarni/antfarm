@@ -547,7 +547,11 @@ def test_queen_review_needs_changes_triggers_re_plan(env):
 
 def test_queen_review_verdict_needs_changes_twice_fails_with_review_prefix(env):
     backend = env["backend"]
-    queen = env["queen"]
+    # Preserve original test intent under the new default of max_re_plans=2:
+    # this scenario validates that the *second* needs_changes verdict trips
+    # the failure path. Pin the Queen to the legacy limit of 1 re-plan.
+    fake_time = env["fake_time"]
+    queen = Queen(backend, config=QueenConfig(max_re_plans=1), clock=lambda: fake_time[0])
 
     mission = _create_mission(backend)
     m = backend.get_mission(mission["mission_id"])
@@ -594,6 +598,94 @@ def test_queen_review_verdict_needs_changes_twice_fails_with_review_prefix(env):
     m = backend.get_mission(mission["mission_id"])
     assert m["status"] == "failed"
     assert m.get("failure_reason", "").startswith("review: ")
+
+
+# ---------------------------------------------------------------------------
+# Test 11b: Default max_re_plans=2 allows 2 re-plan cycles, fails on 3rd (#364)
+# ---------------------------------------------------------------------------
+
+
+def _run_needs_changes_cycle(
+    backend, queen, mission_id: str, attempt_id: str, summary: str
+) -> None:
+    """Drive one full cycle: advance → harvest re-plan → advance → reject."""
+    # advance: PLANNING → creates re-plan task
+    m = backend.get_mission(mission_id)
+    queen._advance(m)
+    m = backend.get_mission(mission_id)
+    plan_task_id = m["plan_task_id"]
+    assert plan_task_id is not None
+    artifact = _make_plan_artifact(plan_task_id=plan_task_id, attempt_id=attempt_id)
+    _harvest_plan_task_with_artifact(backend, plan_task_id, artifact)
+
+    # advance: → REVIEWING_PLAN
+    m = backend.get_mission(mission_id)
+    queen._advance(m)
+
+    # set review verdict to needs_changes
+    review_task_id = f"review-plan-{mission_id}"
+    _set_review_verdict_on_task(
+        backend, review_task_id, _make_review_verdict("needs_changes", summary)
+    )
+
+    # advance: consumes the verdict
+    m = backend.get_mission(mission_id)
+    queen._advance(m)
+
+
+def test_queen_default_max_re_plans_allows_two_cycles_fails_on_third(env):
+    """With Queen default max_re_plans=2, two needs_changes verdicts re-plan
+    and the third one fails the mission."""
+    backend = env["backend"]
+    queen = env["queen"]  # uses QueenConfig() default — max_re_plans=2
+
+    mission = _create_mission(backend)
+    mid = mission["mission_id"]
+
+    # Cycle 1: re_plan_count goes 0 → 1
+    _run_needs_changes_cycle(backend, queen, mid, "att-001", "needs work")
+    m = backend.get_mission(mid)
+    assert m["status"] == "planning"
+    assert m["re_plan_count"] == 1
+
+    # Cycle 2: re_plan_count goes 1 → 2
+    _run_needs_changes_cycle(backend, queen, mid, "att-re1", "still needs work")
+    m = backend.get_mission(mid)
+    assert m["status"] == "planning"
+    assert m["re_plan_count"] == 2
+
+    # Cycle 3: re_plan_count is already at the limit (2) — must fail
+    _run_needs_changes_cycle(backend, queen, mid, "att-re2", "give up")
+    m = backend.get_mission(mid)
+    assert m["status"] == "failed"
+    assert m.get("failure_reason", "").startswith("review: ")
+
+
+# ---------------------------------------------------------------------------
+# Test 11c: Per-mission max_re_plans=0 overrides Queen default (#364)
+# ---------------------------------------------------------------------------
+
+
+def test_queen_per_mission_max_re_plans_zero_overrides_queen_default(tmp_path):
+    """Mission-level max_re_plans=0 wins over a permissive Queen default."""
+    backend = FileBackend(root=str(tmp_path / ".antfarm"))
+    fake_time = [time.time()]
+    # Queen permissively allows 5, but the per-mission cap of 0 should apply.
+    queen = Queen(backend, config=QueenConfig(max_re_plans=5), clock=lambda: fake_time[0])
+
+    mission = _create_mission(
+        backend,
+        mission_id="mission-zero-cap",
+        config_overrides={"max_re_plans": 0},
+    )
+    mid = mission["mission_id"]
+
+    # First cycle: with cap=0, re_plan_count(0) >= 0 → mission fails immediately.
+    _run_needs_changes_cycle(backend, queen, mid, "att-001", "no replans allowed")
+    m = backend.get_mission(mid)
+    assert m["status"] == "failed"
+    assert m.get("failure_reason", "").startswith("review: ")
+    assert m["re_plan_count"] == 0
 
 
 # ---------------------------------------------------------------------------

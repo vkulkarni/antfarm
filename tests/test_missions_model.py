@@ -313,3 +313,41 @@ def test_mission_config_round_trip_includes_budget_fields():
 
 def test_mission_status_has_paused_value():
     assert MissionStatus.PAUSED.value == "paused"
+
+
+# ---------------------------------------------------------------------------
+# max_re_plans per-mission override (#364)
+# ---------------------------------------------------------------------------
+
+
+def test_mission_config_default_max_re_plans_is_none():
+    cfg = MissionConfig()
+    assert cfg.max_re_plans is None
+
+
+def test_mission_config_round_trip_max_re_plans_none():
+    cfg = MissionConfig()
+    d = cfg.to_dict()
+    assert d["max_re_plans"] is None
+    restored = MissionConfig.from_dict(d)
+    assert restored.max_re_plans is None
+    assert restored == cfg
+
+
+def test_mission_config_round_trip_max_re_plans_explicit():
+    cfg = MissionConfig(max_re_plans=5)
+    d = cfg.to_dict()
+    assert d["max_re_plans"] == 5
+    restored = MissionConfig.from_dict(d)
+    assert restored.max_re_plans == 5
+    assert restored == cfg
+
+
+def test_mission_config_accepts_max_re_plans_zero():
+    cfg = MissionConfig(max_re_plans=0)
+    assert cfg.max_re_plans == 0
+
+
+def test_mission_config_rejects_negative_max_re_plans():
+    with pytest.raises(ValueError, match="max_re_plans must be non-negative"):
+        MissionConfig(max_re_plans=-1)

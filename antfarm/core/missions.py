@@ -50,6 +50,9 @@ class MissionStatus(StrEnum):
 @dataclass
 class MissionConfig:
     max_attempts: int = 3
+    # Per-mission override for Queen.config.max_re_plans. None defers to the
+    # Queen-wide default. Negative values are rejected.
+    max_re_plans: int | None = None
     max_parallel_builders: int = 4
     require_plan_review: bool = True
     stall_threshold_minutes: int = 30
@@ -76,10 +79,13 @@ class MissionConfig:
             raise ValueError(f"auto_merge must be one of {VALID_AUTO_MERGE_MODES}")
         if self.budget_action not in VALID_BUDGET_ACTIONS:
             raise ValueError(f"budget_action must be one of {VALID_BUDGET_ACTIONS}")
+        if self.max_re_plans is not None and self.max_re_plans < 0:
+            raise ValueError("max_re_plans must be non-negative")
 
     def to_dict(self) -> dict:
         return {
             "max_attempts": self.max_attempts,
+            "max_re_plans": self.max_re_plans,
             "max_parallel_builders": self.max_parallel_builders,
             "require_plan_review": self.require_plan_review,
             "stall_threshold_minutes": self.stall_threshold_minutes,
@@ -99,6 +105,7 @@ class MissionConfig:
     def from_dict(cls, data: dict) -> MissionConfig:
         return cls(
             max_attempts=data.get("max_attempts", 3),
+            max_re_plans=data.get("max_re_plans"),
             max_parallel_builders=data.get("max_parallel_builders", 4),
             require_plan_review=data.get("require_plan_review", True),
             stall_threshold_minutes=data.get("stall_threshold_minutes", 30),

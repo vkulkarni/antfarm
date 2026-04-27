@@ -83,7 +83,7 @@ class QueenConfig:
     base_interval: float = 30.0
     active_interval: float = 10.0
     idle_interval: float = 60.0
-    max_re_plans: int = 1
+    max_re_plans: int = 2
     enable_mission_context: bool = True
 
 
@@ -360,7 +360,9 @@ class Queen:
             self._transition(mission, MissionStatus.BUILDING)
             self._maybe_generate_context(mission)
         elif verdict["verdict"] == "needs_changes":
-            if mission["re_plan_count"] >= self.config.max_re_plans:
+            per_mission = mission.get("config", {}).get("max_re_plans")
+            limit = per_mission if per_mission is not None else self.config.max_re_plans
+            if mission["re_plan_count"] >= limit:
                 summary = verdict.get("summary", "no summary")
                 self._fail(mission, f"review: plan rejected - {summary}")
                 return

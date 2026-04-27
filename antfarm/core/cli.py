@@ -1384,6 +1384,12 @@ def mission():
 @click.option("--no-plan-review", is_flag=True, default=False, help="Skip plan review step.")
 @click.option("--max-builders", type=int, default=None, help="Max parallel builder workers.")
 @click.option("--max-attempts", type=int, default=None, help="Max attempts per task.")
+@click.option(
+    "--max-re-plans",
+    type=int,
+    default=None,
+    help="Max re-plan cycles before mission fails. Overrides Queen-wide default.",
+)
 @click.option("--integration-branch", default=None, help="Integration branch for this mission.")
 @click.option(
     "--auto-merge",
@@ -1424,6 +1430,7 @@ def mission_create(
     no_plan_review: bool,
     max_builders: int | None,
     max_attempts: int | None,
+    max_re_plans: int | None,
     integration_branch: str | None,
     auto_merge: str | None,
     allow_auto_merge_on_external: bool,
@@ -1445,6 +1452,8 @@ def mission_create(
         config["max_parallel_builders"] = max_builders
     if max_attempts is not None:
         config["max_attempts"] = max_attempts
+    if max_re_plans is not None:
+        config["max_re_plans"] = max_re_plans
     if integration_branch is not None:
         config["integration_branch"] = integration_branch
     if auto_merge is not None:
@@ -1624,12 +1633,19 @@ def mission_report(mission_id: str, fmt: str, colony_url: str, token: str | None
     default=None,
     help="Permit auto-merge even when the viewer is not an ADMIN of the target repo.",
 )
+@click.option(
+    "--max-re-plans",
+    type=int,
+    default=None,
+    help="Max re-plan cycles before mission fails. Overrides Queen-wide default.",
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def mission_update(
     mission_id: str,
     auto_merge: str | None,
     allow_auto_merge_on_external: bool | None,
+    max_re_plans: int | None,
     colony_url: str,
     token: str | None,
 ):
@@ -1639,9 +1655,14 @@ def mission_update(
         partial["auto_merge"] = auto_merge
     if allow_auto_merge_on_external is not None:
         partial["allow_auto_merge_on_external"] = bool(allow_auto_merge_on_external)
+    if max_re_plans is not None:
+        partial["max_re_plans"] = max_re_plans
 
     if not partial:
-        click.echo("No updates specified. Use --auto-merge or --allow-auto-merge-on-external.")
+        click.echo(
+            "No updates specified. "
+            "Use --auto-merge, --allow-auto-merge-on-external, or --max-re-plans."
+        )
         return
 
     # Fetch current config and shallow-merge so fields we did not touch are preserved.
