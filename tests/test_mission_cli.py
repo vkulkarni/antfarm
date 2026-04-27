@@ -710,3 +710,94 @@ def test_mission_extend_command():
         assert payload["additional_tokens"] == 500
         assert "15.0" in result.output
         assert "1500" in result.output
+
+
+# ---------------------------------------------------------------------------
+# mission create / update --max-re-plans (#364)
+# ---------------------------------------------------------------------------
+
+
+def test_mission_create_max_re_plans_persists_to_config(tmp_path: Path):
+    """--max-re-plans threads max_re_plans into config payload."""
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("spec")
+
+    runner = CliRunner()
+
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"mission_id": "m1"}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
+                "--max-re-plans",
+                "3",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert payload["config"]["max_re_plans"] == 3
+
+
+def test_mission_update_max_re_plans_patches_config_preserving_other_fields():
+    """mission update --max-re-plans GETs, merges, then PATCHes config."""
+    runner = CliRunner()
+
+    current_mission = {
+        "mission_id": "m1",
+        "status": "building",
+        "config": {
+            "completion_mode": "best_effort",
+            "max_parallel_builders": 4,
+            "auto_merge": "never",
+        },
+        "task_ids": [],
+        "created_at": "2026-04-22T00:00:00Z",
+    }
+
+    with (
+        patch("antfarm.core.cli.httpx.get") as mock_get,
+        patch("antfarm.core.cli.httpx.patch") as mock_patch,
+    ):
+        mock_get_resp = MagicMock()
+        mock_get_resp.status_code = 200
+        mock_get_resp.json.return_value = current_mission
+        mock_get.return_value = mock_get_resp
+
+        mock_patch_resp = MagicMock()
+        mock_patch_resp.status_code = 200
+        mock_patch_resp.json.return_value = {"ok": True}
+        mock_patch.return_value = mock_patch_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "update",
+                "m1",
+                "--max-re-plans",
+                "0",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_patch.call_args.kwargs.get("json") or mock_patch.call_args[1]["json"]
+        merged_config = payload["updates"]["config"]
+        # Existing fields preserved
+        assert merged_config["completion_mode"] == "best_effort"
+        assert merged_config["max_parallel_builders"] == 4
+        assert merged_config["auto_merge"] == "never"
+        # New value applied
+        assert merged_config["max_re_plans"] == 0
