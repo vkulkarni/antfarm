@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-04-26
+
+### Fixed
+- fix(queen): `max_re_plans` default raised from 1 to 2; `MissionConfig.max_re_plans` field added so per-mission override is possible (`--max-re-plans` on `mission create` and `mission update`); explicit `0` honored as a tightening override (#364)
+- fix(soldier,auto_merge): auto-merge now detects `mergeable=CONFLICTING` and kicks back immediately instead of looping rebase forever; per-attempt rebase counter (`auto_merge_max_rebase_attempts=2`) bounds retry escalation as a safety net (#365)
+
 ## [0.6.15] - 2026-04-25
 
 ### Fixed
