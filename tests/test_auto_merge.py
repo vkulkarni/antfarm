@@ -88,6 +88,42 @@ def test_decide_on_review_pass_behind_rebase():
     assert out.action == "rebase"
 
 
+def test_decide_on_review_pass_dirty_conflicting_kicks_back():
+    """#365: DIRTY + mergeable=CONFLICTING means real merge conflict.
+    Must route to kickback_ci, not rebase, so the worker fixes it in a
+    fresh attempt instead of looping the soldier on a doomed rebase."""
+    out = decide(
+        "on-review-pass",
+        verdict_passed=True,
+        pr_state=_state(mergeStateStatus="DIRTY", mergeable="CONFLICTING"),
+        pr="p",
+    )
+    assert out.action == "kickback_ci"
+    assert out.reason == "merge_conflict"
+
+
+def test_decide_on_review_pass_dirty_mergeable_still_rebases():
+    """#365: DIRTY + mergeable=MERGEABLE remains a rebase (no conflict)."""
+    out = decide(
+        "on-review-pass",
+        verdict_passed=True,
+        pr_state=_state(mergeStateStatus="DIRTY", mergeable="MERGEABLE"),
+        pr="p",
+    )
+    assert out.action == "rebase"
+
+
+def test_decide_on_review_pass_behind_mergeable_rebases():
+    """#365: BEHIND + mergeable=MERGEABLE remains a rebase."""
+    out = decide(
+        "on-review-pass",
+        verdict_passed=True,
+        pr_state=_state(mergeStateStatus="BEHIND", mergeable="MERGEABLE"),
+        pr="p",
+    )
+    assert out.action == "rebase"
+
+
 def test_decide_on_review_pass_blocked_ci_failing_kicks_back():
     out = decide(
         "on-review-pass",
@@ -169,6 +205,18 @@ def test_decide_on_review_pass_and_ci_green_dirty_rebase():
         pr="p",
     )
     assert out.action == "rebase"
+
+
+def test_decide_on_review_pass_and_ci_green_dirty_conflicting_kicks_back():
+    """#365: same precedence in CI-green mode."""
+    out = decide(
+        "on-review-pass-and-ci-green",
+        verdict_passed=True,
+        pr_state=_state(mergeStateStatus="DIRTY", mergeable="CONFLICTING"),
+        pr="p",
+    )
+    assert out.action == "kickback_ci"
+    assert out.reason == "merge_conflict"
 
 
 def test_decide_on_review_pass_and_ci_green_blocked_ci_kicks_back():

@@ -273,6 +273,13 @@ class Soldier:
         self._auto_merge_last_checked: dict[str, float] = {}
         self._repo_permission_cache: dict[str, tuple[str, float]] = {}
         self.auto_merge_poll_backoff_seconds: float = 30.0
+        # Auto-merge rebase loop bound (#365): per-attempt counter so a
+        # CONFLICTING-but-DIRTY PR (or any other rebase that GitHub never
+        # marks CLEAN) can't pin the soldier in an infinite rebase loop.
+        # Keyed by attempt_id; cleared on MERGED, exhausted on >=
+        # ``auto_merge_max_rebase_attempts``.
+        self._auto_merge_rebase_attempts: dict[str, int] = {}
+        self.auto_merge_max_rebase_attempts: int = 2
         # Mission-wide reconciliation (#367): per-task TTL cache for
         # ``gh pr view`` calls during the bulk reconciliation pass at the
         # top of every poll. Keyed by task_id, value is the last-checked
@@ -2471,9 +2478,15 @@ class Soldier:
         Wraps the existing deterministic rebase helper. Any failure is
         logged and surfaces as an ``auto_merge_rebasing`` event with
         ``status=failed`` so the next tick re-evaluates.
+
+        #365: tracks the per-attempt rebase counter so the outer
+        ``_handle_auto_merge_outcome`` can bound retries. Increments on any
+        non-MERGED outcome (we did spend a rebase attempt) and pops on
+        MERGED so a successful path leaves no stale counter behind.
         """
         branch = self._get_attempt_branch(task) or ""
         task_id = task.get("id", "")
+        attempt_id = task.get("current_attempt") or ""
         if not branch:
             _emit("auto_merge_rebasing", task_id, f"pr={pr} status=failed reason=no_branch")
             return
@@ -2486,6 +2499,13 @@ class Soldier:
             temp_branch="antfarm/temp-merge",
             initial_conflict_stderr="auto-merge triggered rebase",
         )
+        if attempt_id:
+            if outcome == MergeResult.MERGED:
+                self._auto_merge_rebase_attempts.pop(attempt_id, None)
+            else:
+                self._auto_merge_rebase_attempts[attempt_id] = (
+                    self._auto_merge_rebase_attempts.get(attempt_id, 0) + 1
+                )
         detail = f"pr={pr} branch={branch} result={outcome.value}"
         _emit("auto_merge_rebasing", task_id, detail)
 
@@ -2654,9 +2674,33 @@ class Soldier:
                     task_id,
                     f"pr={outcome.pr} attempt={attempt_id} type={type(exc).__name__}",
                 )
+            # #365: clear rebase counter on successful merge so a future
+            # re-attempt of the same attempt_id (rare, but possible if the
+            # task is replayed) starts fresh.
+            self._auto_merge_rebase_attempts.pop(attempt_id, None)
             return MergeResult.MERGED
 
         if outcome.action == "rebase":
+            # #365: bound rebase attempts per attempt_id so a PR GitHub keeps
+            # reporting as DIRTY/BEHIND can't trap us in an infinite loop. The
+            # decide() module already routes CONFLICTING away from rebase, but
+            # the counter is the belt-and-suspenders guard for any other
+            # case where the rebase never converges.
+            current_attempts = self._auto_merge_rebase_attempts.get(attempt_id, 0)
+            if current_attempts >= self.auto_merge_max_rebase_attempts:
+                cascade_reason = f"auto_merge_rebase_exhausted attempts={current_attempts}"
+                _emit(
+                    "auto_merge_kickback",
+                    task_id,
+                    f"pr={outcome.pr} mode={outcome.mode} reason={cascade_reason}",
+                )
+                self.last_failure_reason = cascade_reason
+                try:
+                    self.kickback_with_cascade(task_id, self.last_failure_reason)
+                except Exception:
+                    logger.exception("auto-merge: kickback_with_cascade failed for %s", task_id)
+                self._auto_merge_rebase_attempts.pop(attempt_id, None)
+                return MergeResult.FAILED
             _emit(
                 "auto_merge_rebasing",
                 task_id,
@@ -2679,7 +2723,14 @@ class Soldier:
                 task_id,
                 f"pr={outcome.pr} mode={outcome.mode} reason={outcome.reason}",
             )
-            self.last_failure_reason = f"auto_merge_ci_failed: {outcome.reason}"
+            # #365: distinguish merge-conflict kickbacks from CI-failure
+            # kickbacks so worker-side review prompts and cascade logs make
+            # the cause unambiguous.
+            if (outcome.reason or "").startswith("merge_conflict"):
+                cascade_reason = f"auto_merge_merge_conflict: {outcome.reason}"
+            else:
+                cascade_reason = f"auto_merge_ci_failed: {outcome.reason}"
+            self.last_failure_reason = cascade_reason
             try:
                 self.kickback_with_cascade(task_id, self.last_failure_reason)
             except Exception:
@@ -2732,6 +2783,8 @@ class Soldier:
         instance._auto_merge_last_checked = {}
         instance._repo_permission_cache = {}
         instance.auto_merge_poll_backoff_seconds = 30.0
+        instance._auto_merge_rebase_attempts = {}
+        instance.auto_merge_max_rebase_attempts = 2
         instance._reconcile_last_checked = {}
         instance.reconcile_backoff_seconds = 60.0
         return instance
