@@ -42,6 +42,8 @@ def _make_soldier(integration_branch: str = "main", monkeypatch=None) -> Soldier
     s._auto_merge_last_checked = {}
     s._repo_permission_cache = {}
     s.auto_merge_poll_backoff_seconds = 30.0
+    s._auto_merge_rebase_attempts = {}
+    s.auto_merge_max_rebase_attempts = 2
     s._reconcile_last_checked = {}
     s.reconcile_backoff_seconds = 60.0
     return s
@@ -260,10 +262,12 @@ def test_blocked_missing_reviews_pauses_mission(monkeypatch):
 def test_dirty_triggers_rebase(monkeypatch):
     s = _make_soldier()
     s.colony.get_mission.return_value = _mission(auto_merge="on-review-pass")
+    # #365: DIRTY only triggers rebase when mergeable=MERGEABLE. The
+    # CONFLICTING case is now routed to kickback_ci by the decide() module.
     monkeypatch.setattr(
         s,
         "_query_pr_state",
-        lambda pr: PRState("DIRTY", "CONFLICTING", "APPROVED", "SUCCESS"),
+        lambda pr: PRState("DIRTY", "MERGEABLE", "APPROVED", "SUCCESS"),
     )
     monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
     monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
@@ -280,6 +284,157 @@ def test_dirty_triggers_rebase(monkeypatch):
     result = s._handle_auto_merge_outcome(outcome, task)
     assert result == MergeResult.NEEDS_REVIEW
     assert rebase_called == [("task-1", "https://github.com/org/repo/pull/1")]
+
+
+# ---------------------------------------------------------------------------
+# #365: CONFLICTING => kickback_ci, no rebase
+# ---------------------------------------------------------------------------
+
+
+def test_conflicting_triggers_kickback_no_rebase(monkeypatch):
+    """#365: DIRTY + mergeable=CONFLICTING must route to kickback with the
+    auto_merge_merge_conflict reason, and the rebase helper must NOT fire."""
+    s = _make_soldier()
+    s.colony.get_mission.return_value = _mission(auto_merge="on-review-pass")
+    monkeypatch.setattr(
+        s,
+        "_query_pr_state",
+        lambda pr: PRState("DIRTY", "CONFLICTING", "APPROVED", "SUCCESS"),
+    )
+    monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
+    monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
+
+    rebase_called: list[tuple] = []
+    monkeypatch.setattr(
+        s,
+        "_rebase_pr_branch_for_auto_merge",
+        lambda task, pr: rebase_called.append((task["id"], pr)),
+    )
+
+    kickback_calls: list[tuple[str, str]] = []
+
+    def fake_kickback(task_id, reason, **kw):
+        kickback_calls.append((task_id, reason))
+
+    monkeypatch.setattr(s, "kickback_with_cascade", fake_kickback)
+
+    task = _task()
+    outcome = s._attempt_auto_merge(task)
+    assert outcome.action == "kickback_ci"
+    assert outcome.reason == "merge_conflict"
+
+    result = s._handle_auto_merge_outcome(outcome, task)
+    assert result == MergeResult.FAILED
+    assert rebase_called == [], "rebase helper must not fire on CONFLICTING"
+    assert kickback_calls and kickback_calls[0][0] == "task-1"
+    assert "auto_merge_merge_conflict" in kickback_calls[0][1]
+    assert "merge_conflict" in kickback_calls[0][1]
+
+
+# ---------------------------------------------------------------------------
+# #365: bounded rebase attempts — exhaustion triggers kickback
+# ---------------------------------------------------------------------------
+
+
+def test_rebase_attempts_counter_increments_then_kicks_back(monkeypatch):
+    """#365: two consecutive rebase outcomes increment the counter; the
+    third dispatch finds the cap reached and kicks back with
+    auto_merge_rebase_exhausted."""
+    s = _make_soldier()
+    s.colony.get_mission.return_value = _mission(auto_merge="on-review-pass")
+    monkeypatch.setattr(
+        s,
+        "_query_pr_state",
+        lambda pr: PRState("BEHIND", "MERGEABLE", "APPROVED", "SUCCESS"),
+    )
+    monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
+    monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
+
+    # Rebase always fails — every attempt bumps the counter.
+    monkeypatch.setattr(
+        s,
+        "_rebase_and_retry_merge",
+        lambda task_id, branch, temp_branch, initial_conflict_stderr: MergeResult.FAILED,
+    )
+    monkeypatch.setattr(s, "_get_attempt_branch", lambda task: "feat/task-1")
+
+    kickback_calls: list[tuple[str, str]] = []
+
+    def fake_kickback(task_id, reason, **kw):
+        kickback_calls.append((task_id, reason))
+
+    monkeypatch.setattr(s, "kickback_with_cascade", fake_kickback)
+
+    task = _task()
+
+    # First two ticks: rebase dispatched, counter increments.
+    for _ in range(s.auto_merge_max_rebase_attempts):
+        # Reset poll backoff so each tick re-queries.
+        s._auto_merge_last_checked.clear()
+        outcome = s._attempt_auto_merge(task)
+        assert outcome.action == "rebase"
+        result = s._handle_auto_merge_outcome(outcome, task)
+        assert result == MergeResult.NEEDS_REVIEW
+
+    assert s._auto_merge_rebase_attempts.get("att-1") == s.auto_merge_max_rebase_attempts
+    assert kickback_calls == []  # not yet exhausted at dispatch time
+
+    # Third tick: counter at cap → kickback.
+    s._auto_merge_last_checked.clear()
+    outcome = s._attempt_auto_merge(task)
+    assert outcome.action == "rebase"
+    result = s._handle_auto_merge_outcome(outcome, task)
+    assert result == MergeResult.FAILED
+    assert kickback_calls and kickback_calls[0][0] == "task-1"
+    assert "auto_merge_rebase_exhausted" in kickback_calls[0][1]
+    assert f"attempts={s.auto_merge_max_rebase_attempts}" in kickback_calls[0][1]
+    # Counter cleared after exhaustion.
+    assert "att-1" not in s._auto_merge_rebase_attempts
+
+
+def test_rebase_attempts_counter_clears_on_success(monkeypatch):
+    """#365: a MERGED outcome from the rebase helper pops the counter."""
+    s = _make_soldier()
+    monkeypatch.setattr(s, "_get_attempt_branch", lambda task: "feat/task-1")
+    monkeypatch.setattr(
+        s,
+        "_rebase_and_retry_merge",
+        lambda task_id, branch, temp_branch, initial_conflict_stderr: MergeResult.MERGED,
+    )
+
+    task = _task()
+    # Pre-seed a counter to verify it is cleared.
+    s._auto_merge_rebase_attempts["att-1"] = 1
+    s._rebase_pr_branch_for_auto_merge(task, "https://github.com/org/repo/pull/1")
+    assert "att-1" not in s._auto_merge_rebase_attempts
+
+
+def test_rebase_attempts_counter_keyed_by_attempt_id(monkeypatch):
+    """#365: distinct attempt_ids must keep independent counters so the
+    same task being retried under a fresh attempt doesn't inherit prior
+    rebase exhaustion."""
+    s = _make_soldier()
+    monkeypatch.setattr(s, "_get_attempt_branch", lambda task: "feat/x")
+    monkeypatch.setattr(
+        s,
+        "_rebase_and_retry_merge",
+        lambda task_id, branch, temp_branch, initial_conflict_stderr: MergeResult.FAILED,
+    )
+
+    task_a = _task(task_id="task-a")
+    task_a["current_attempt"] = "att-A"
+    task_a["attempts"][0]["attempt_id"] = "att-A"
+
+    task_b = _task(task_id="task-b")
+    task_b["current_attempt"] = "att-B"
+    task_b["attempts"][0]["attempt_id"] = "att-B"
+
+    s._rebase_pr_branch_for_auto_merge(task_a, "pr-a")
+    s._rebase_pr_branch_for_auto_merge(task_a, "pr-a")
+    s._rebase_pr_branch_for_auto_merge(task_b, "pr-b")
+
+    assert s._auto_merge_rebase_attempts["att-A"] == 2
+    assert s._auto_merge_rebase_attempts["att-B"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +720,8 @@ def _make_soldier_for_gh() -> Soldier:
     s._auto_merge_last_checked = {}
     s._repo_permission_cache = {}
     s.auto_merge_poll_backoff_seconds = 30.0
+    s._auto_merge_rebase_attempts = {}
+    s.auto_merge_max_rebase_attempts = 2
     s._reconcile_last_checked = {}
     s.reconcile_backoff_seconds = 60.0
     return s

@@ -95,6 +95,14 @@ def decide(
     unexpected mergeStateStatus collapses to ``skip`` rather than guessing
     an action.
 
+    Precedence inside DIRTY/BEHIND (#365): GitHub keeps reporting
+    ``mergeStateStatus=DIRTY`` (or BEHIND) even after a rebase resolves
+    nothing — when ``mergeable=="CONFLICTING"`` the branch has real merge
+    conflicts that no amount of rebasing will clear. Detect that case
+    BEFORE dispatching ``rebase`` and route to ``kickback_ci`` so the worker
+    fixes the conflict in a fresh attempt instead of looping the soldier
+    on a doomed rebase.
+
     Args:
         mode: One of ``never``, ``on-review-pass``,
             ``on-review-pass-and-ci-green``. Unknown modes collapse to
@@ -119,6 +127,8 @@ def decide(
         if status == "UNSTABLE":
             # CI-agnostic mode: proceed despite failing/pending checks.
             return AutoMergeOutcome(action="merge", pr=pr, mode=mode, reason="UNSTABLE ci-agnostic")
+        if status in ("DIRTY", "BEHIND") and (pr_state.mergeable or "").upper() == "CONFLICTING":
+            return AutoMergeOutcome(action="kickback_ci", pr=pr, mode=mode, reason="merge_conflict")
         if status in ("DIRTY", "BEHIND"):
             return AutoMergeOutcome(
                 action="rebase", pr=pr, mode=mode, reason=f"{status} needs rebase"
@@ -156,6 +166,8 @@ def decide(
             )
         if status == "PENDING":
             return AutoMergeOutcome(action="wait_ci", pr=pr, mode=mode, reason="PENDING")
+        if status in ("DIRTY", "BEHIND") and (pr_state.mergeable or "").upper() == "CONFLICTING":
+            return AutoMergeOutcome(action="kickback_ci", pr=pr, mode=mode, reason="merge_conflict")
         if status in ("DIRTY", "BEHIND"):
             return AutoMergeOutcome(
                 action="rebase", pr=pr, mode=mode, reason=f"{status} needs rebase"
