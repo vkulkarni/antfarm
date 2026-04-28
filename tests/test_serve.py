@@ -1437,3 +1437,146 @@ def test_emit_event_ordering_preserved_under_concurrency():
     ids = [e["id"] for e in serve_mod._event_queue]
     assert len(set(ids)) == len(ids)
     assert ids == sorted(ids), "deque insertion order does not match id order"
+
+
+# ---------------------------------------------------------------------------
+# Activity Feed SSE emission (#372)
+# ---------------------------------------------------------------------------
+
+
+def _worker_activity_events_for(actor: str) -> list[dict]:
+    """Filter the SSE queue down to worker_activity events for ``actor``.
+
+    The process-wide _event_queue can contain noise from background daemon
+    threads spawned by other tests in the same session (notably the Soldier
+    singleton from ``test_soldier_singleton_guard``). Filtering by actor lets
+    each test assert only on the events it actually generated.
+    """
+    return [
+        e
+        for e in serve_mod._event_queue
+        if e.get("type") == "worker_activity" and e.get("actor") == actor
+    ]
+
+
+def test_worker_activity_emits_sse_event(client):
+    """POST /workers/{id}/activity emits a worker_activity SSE event."""
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+    _register_worker(client, "worker-feed")
+
+    r = client.post(
+        "/workers/worker-feed/activity",
+        json={"action": "editing", "target": "foo.py"},
+    )
+    assert r.status_code == 200
+
+    events = _worker_activity_events_for("worker-feed")
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["actor"] == "worker-feed"
+    assert ev["detail"] == "editing foo.py"
+    assert ev["task_id"] == ""
+
+
+def test_worker_activity_clear_does_not_emit(client):
+    """Clearing activity (action=null) must NOT emit an SSE event."""
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+    _register_worker(client, "worker-clr")
+
+    r = client.post("/workers/worker-clr/activity", json={"action": None})
+    assert r.status_code == 200
+
+    assert _worker_activity_events_for("worker-clr") == []
+
+
+def test_worker_activity_event_includes_data_blob(client):
+    """worker_activity SSE event carries structured action/target/text fields."""
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+    _register_worker(client, "worker-data")
+
+    r = client.post(
+        "/workers/worker-data/activity",
+        json={"action": "editing", "target": "x.py"},
+    )
+    assert r.status_code == 200
+
+    events = _worker_activity_events_for("worker-data")
+    assert len(events) == 1
+    ev = events[0]
+    # Data blob fields are merged into the event dict.
+    assert ev["action"] == "editing"
+    assert ev["target"] == "x.py"
+    assert ev["text"] == "editing x.py"
+
+
+def test_set_colony_activity_emits_sse_for_soldier():
+    """_set_colony_activity('soldier', ...) mirrors onto the SSE bus."""
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+    serve_mod._soldier_activity = None
+
+    serve_mod._set_colony_activity("soldier", "merging", "task-007")
+
+    events = [
+        e
+        for e in serve_mod._event_queue
+        if e.get("type") == "worker_activity"
+        and e.get("actor") == "soldier"
+        and e.get("target") == "task-007"
+    ]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["detail"] == "merging task-007"
+    assert ev.get("action") == "merging"
+
+
+def test_set_colony_activity_emits_sse_for_doctor():
+    """_set_colony_activity('doctor', ...) mirrors onto the SSE bus.
+
+    Uses a non-heartbeat action ("checking") so the filter doesn't drop it.
+    """
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+    serve_mod._doctor_activity = None
+
+    serve_mod._set_colony_activity("doctor", "checking", "tasks")
+
+    events = [
+        e
+        for e in serve_mod._event_queue
+        if e.get("type") == "worker_activity"
+        and e.get("actor") == "doctor"
+        and e.get("target") == "tasks"
+    ]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.get("action") == "checking"
+
+
+def test_set_colony_activity_filters_heartbeat_verbs():
+    """Heartbeat-style verbs do NOT emit SSE events.
+
+    Soldier calls ``_set_colony_activity('soldier', 'polling', '')`` on every
+    loop tick; Doctor calls ``_set_colony_activity('doctor', 'scanning', ...)``
+    a dozen times per sweep. Emitting SSE for those would drown the Activity
+    Feed in noise. They still flow into the dedicated soldier_activity /
+    doctor_activity panels via ``/status/full`` (#372).
+    """
+    serve_mod._event_queue.clear()
+    serve_mod._event_counter = 0
+
+    for kind, action in [
+        ("soldier", "polling"),
+        ("soldier", "cleanup"),
+        ("doctor", "idle"),
+        ("doctor", "scanning"),
+    ]:
+        serve_mod._set_colony_activity(kind, action, "")
+
+    events = [
+        e for e in serve_mod._event_queue if e.get("type") == "worker_activity"
+    ]
+    assert events == []
