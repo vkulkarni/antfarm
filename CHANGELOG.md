@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.18] - 2026-04-28
+
+### Added
+- feat(soldier,auto_merge): new `--auto-merge on-review-pass-and-local-tests` mode runs `test_command` before `gh pr merge --squash` on CLEAN PRs; defends against repos without GitHub Actions CI where the LLM reviewer was the only gate (#374)
+
 ## [0.6.17] - 2026-04-27
 
 ### Added
