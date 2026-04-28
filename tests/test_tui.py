@@ -1515,3 +1515,120 @@ def test_activity_loop_resets_backoff_on_success(monkeypatch):
 
     # Failure -> backoff 1.0s; success -> 0.5s rate-limit; failure -> 1.0s again.
     assert sleeps == [1.0, 0.5, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# Activity Feed: worker_activity rendering + worker color palette (#372)
+# ---------------------------------------------------------------------------
+
+
+def test_render_activity_renders_worker_activity_event():
+    """worker_activity events render as 'HH:MM:SS  actor  text' (no type/task cols)."""
+    tui = _make_tui()
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "worker_activity",
+            "actor": "node1/worker-a",
+            "detail": "editing src/foo.py",
+            "task_id": "",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    )
+    rendered = tui._render_activity()
+    plain = rendered.plain
+
+    # Synthesized text appears verbatim.
+    assert "editing src/foo.py" in plain
+    # Type column ("worker_activity") is suppressed in the compact layout.
+    assert "worker_activity" not in plain
+    # Actor (truncated/padded to 12) is on the line.
+    assert "node1/worker" in plain
+
+
+def test_color_for_worker_is_deterministic():
+    """Same actor -> same palette entry, every call. Two distinct actors may
+    collide (mod 8) — that's expected; we only assert determinism here."""
+    tui = _make_tui()
+    a1 = tui._color_for_worker("node1/worker-a")
+    a2 = tui._color_for_worker("node1/worker-a")
+    assert a1 == a2
+    # Empty actor still returns a valid palette entry, deterministically.
+    e1 = tui._color_for_worker("")
+    e2 = tui._color_for_worker("")
+    assert e1 == e2
+    # All returned colors are members of the declared palette.
+    assert a1 in tui._WORKER_PALETTE
+    assert e1 in tui._WORKER_PALETTE
+
+
+def test_render_activity_max_rows_20():
+    """Activity panel renders up to 20 rows when max_rows=20 (#372)."""
+    tui = _make_tui()
+    for i in range(1, 26):
+        tui._ingest_event(
+            {
+                "id": i,
+                "type": "worker_activity",
+                "actor": "node1/worker-a",
+                "detail": f"edit-{i}",
+                "task_id": "",
+                "ts": "2026-04-16T14:32:11+00:00",
+            }
+        )
+    rendered = tui._render_activity(max_rows=20)
+    lines = rendered.plain.split("\n")
+    assert len(lines) == 20
+    # Newest event ends up last.
+    assert "edit-25" in lines[-1]
+    assert "edit-6" in lines[0]
+
+
+def test_render_activity_colors_only_workers_not_colony():
+    """For non-worker_activity events, the heuristic distinguishes worker actors
+    (colored from the palette) from subsystem actors (colony, soldier, doctor,
+    queen, autoscaler — kept in default style)."""
+    tui = _make_tui()
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "harvested",
+            "actor": "node1/worker-a",
+            "detail": "pr=https://x/y/1",
+            "task_id": "task-001",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    )
+    tui._ingest_event(
+        {
+            "id": 2,
+            "type": "merged",
+            "actor": "soldier",
+            "detail": "merged task-001",
+            "task_id": "task-001",
+            "ts": "2026-04-16T14:32:12+00:00",
+        }
+    )
+    rendered = tui._render_activity()
+    palette = set(tui._WORKER_PALETTE)
+    expected_color = tui._color_for_worker("node1/worker-a")
+
+    # Find the actor span for the worker line — it should carry the palette
+    # color. The soldier line's actor span must NOT carry a palette color
+    # (subsystems are exempt from the per-worker palette).
+    worker_styles: list[str] = []
+    soldier_styles: list[str] = []
+    for span in rendered.spans:
+        substr = rendered.plain[span.start : span.end]
+        style_str = str(span.style)
+        if "node1/worker" in substr:
+            worker_styles.append(style_str)
+        if substr.startswith("soldier"):
+            soldier_styles.append(style_str)
+
+    assert any(expected_color in s for s in worker_styles), (
+        f"worker actor span missing palette color: {worker_styles}"
+    )
+    assert all(not any(c in s for c in palette) for s in soldier_styles), (
+        f"soldier actor span unexpectedly colored: {soldier_styles}"
+    )

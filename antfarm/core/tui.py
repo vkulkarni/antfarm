@@ -239,7 +239,7 @@ class AntfarmTUI:
             Layout(name="review", size=12),
             Layout(name="merge_ready", size=6),
             Layout(name="merged", size=6),
-            Layout(name="activity", size=8),
+            Layout(name="activity", size=22),
         ]
         if snap.warnings:
             column_slices.insert(0, Layout(name="warnings", size=warnings_size))
@@ -375,7 +375,7 @@ class AntfarmTUI:
 
         layout["activity"].update(
             Panel(
-                self._render_activity(max_rows=6),
+                self._render_activity(max_rows=20),
                 title="[bold white]Activity[/bold white]",
             )
         )
@@ -962,8 +962,57 @@ class AntfarmTUI:
         self._add_overflow_hint(table, len(tasks), max_shown)
         return table
 
+    # Subsystem actors are *not* worker_ids; render them in the row's default
+    # column color (no per-worker palette mapping). Anything else is treated
+    # as a worker_id for coloring purposes (#372).
+    _NON_WORKER_ACTORS: frozenset[str] = frozenset(
+        {"colony", "queen", "autoscaler", "soldier", "doctor"}
+    )
+
+    # Deterministic palette so the same worker always gets the same color
+    # across renders and across colony restarts (#372).
+    _WORKER_PALETTE: tuple[str, ...] = (
+        "cyan",
+        "magenta",
+        "green",
+        "yellow",
+        "blue",
+        "bright_cyan",
+        "bright_magenta",
+        "bright_green",
+    )
+
+    def _color_for_worker(self, actor: str) -> str:
+        """Return a deterministic color for a worker_id from a small palette.
+
+        Hash-mod-N over the actor string. Same actor -> same color forever.
+        Used by the Activity panel so the eye can quickly cluster lines that
+        belong to the same worker (#372).
+        """
+        if not actor:
+            return self._WORKER_PALETTE[0]
+        # Built-in hash() varies by process (PYTHONHASHSEED); use a stable
+        # checksum so the test suite and live session agree on colors.
+        h = sum(ord(c) for c in actor)
+        return self._WORKER_PALETTE[h % len(self._WORKER_PALETTE)]
+
     def _render_activity(self, max_rows: int = 6) -> Text:
-        """Render the tail of the activity event deque as timestamped lines."""
+        """Render the tail of the activity event deque as timestamped lines.
+
+        Two row formats coexist:
+
+        * ``worker_activity`` events render as ``HH:MM:SS  actor  text`` --
+          the live per-worker action feed (#372). The ``text`` comes from
+          the event's ``detail`` field (the synthesized line like
+          ``editing src/foo.py``).
+        * Every other event type keeps the legacy
+          ``time  actor  type  task  detail`` layout used by harvest, merge,
+          and kickback rows.
+
+        Worker actors get a deterministic color via ``_color_for_worker``.
+        Subsystem actors (colony, soldier, doctor, queen, autoscaler) keep
+        the default style so they stay visually distinct from workers.
+        """
         with self._activity_lock:
             events = list(self._activity_events)
 
@@ -981,22 +1030,49 @@ class AntfarmTUI:
             except (ValueError, TypeError):
                 time_str = "--:--:--"
 
-            actor = (ev.get("actor") or "-")[:12].ljust(12)
-            event_type = (ev.get("type") or "-")[:16].ljust(16)
-            raw_tid = ev.get("task_id") or ""
-            tid_short = (raw_tid.rsplit("-", 1)[-1] if raw_tid else "")[:8].ljust(10)
-            detail = ev.get("detail") or "-"
+            event_type_raw = ev.get("type") or "-"
+            actor_raw = ev.get("actor") or "-"
+            actor = actor_raw[:12].ljust(12)
 
-            if "failed" in event_type:
-                style = "red"
-            elif "kick" in event_type:
-                style = "yellow"
-            else:
-                style = ""
-            text.append(
-                f"{time_str}  {actor}  {event_type}  {tid_short}  {detail}",
-                style=style,
+            # Per-worker color: applies for explicit worker_activity events
+            # OR when the actor isn't a known subsystem (heuristic - covers
+            # legacy events that pre-date the worker_activity type).
+            actor_is_worker = (
+                event_type_raw == "worker_activity"
+                or actor_raw not in self._NON_WORKER_ACTORS
             )
+
+            # Row-level style for special event kinds - overrides actor color
+            # so the entire line is unmistakably red/yellow.
+            if "failed" in event_type_raw:
+                row_style = "red"
+            elif "kick" in event_type_raw:
+                row_style = "yellow"
+            else:
+                row_style = ""
+
+            text.append(f"{time_str}  ", style=row_style)
+            if actor_is_worker and not row_style:
+                text.append(actor, style=self._color_for_worker(actor_raw))
+            else:
+                text.append(actor, style=row_style)
+
+            if event_type_raw == "worker_activity":
+                # Compact two-column layout: actor + text. The synthesized
+                # text already encodes the verb+target, so we drop the type
+                # and task_id columns here for readability.
+                detail = ev.get("detail") or "-"
+                text.append(f"  {detail}", style=row_style)
+            else:
+                event_type = event_type_raw[:16].ljust(16)
+                raw_tid = ev.get("task_id") or ""
+                tid_short = (raw_tid.rsplit("-", 1)[-1] if raw_tid else "")[:8].ljust(10)
+                detail = ev.get("detail") or "-"
+                text.append(
+                    f"  {event_type}  {tid_short}  {detail}",
+                    style=row_style,
+                )
+
             if i < len(tail) - 1:
                 text.append("\n")
 

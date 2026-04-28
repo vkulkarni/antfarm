@@ -96,11 +96,40 @@ def _set_colony_activity(kind: str, action: str, target: str = "") -> None:
                 _doctor_activity = {
                     "action": action, "target": target, "text": text, "since": since
                 }
+            else:
+                # Unknown kind — don't emit an SSE event for it either.
+                return
+        # Mirror onto the SSE bus so the Activity panel surfaces soldier/doctor
+        # work alongside per-worker actions (#372). Emitted outside the
+        # _colony_activity_lock to avoid holding two locks.
+        #
+        # Filter out heartbeat-style verbs that fire on every soldier/doctor
+        # tick. They would drown the feed in noise without communicating
+        # anything actionable. The /status/full sidecar still surfaces them
+        # for the dedicated soldier_activity / doctor_activity panels.
+        #
+        # - "polling" / "idle": every soldier loop iteration
+        # - "scanning":         12+ per doctor sweep (one per check group)
+        # - "cleanup":          per-merge git housekeeping
+        if action not in {"polling", "idle", "scanning", "cleanup"}:
+            _emit_event(
+                "worker_activity",
+                task_id="",
+                detail=text,
+                actor=kind,
+                data={"action": action, "target": target, "text": text},
+            )
     except Exception:
         logger.debug("_set_colony_activity(%s) failed", kind, exc_info=True)
 
 
-def _emit_event(event_type: str, task_id: str, detail: str = "", actor: str = "colony") -> None:
+def _emit_event(
+    event_type: str,
+    task_id: str,
+    detail: str = "",
+    actor: str = "colony",
+    data: dict | None = None,
+) -> None:
     """Append an event to the SSE event bus.
 
     Thread-safe: counter increment and queue append are performed under
@@ -114,21 +143,30 @@ def _emit_event(event_type: str, task_id: str, detail: str = "", actor: str = "c
         actor: Subsystem emitting the event (e.g. "colony", "queen", "autoscaler",
             "soldier", "doctor", "worker"). Defaults to "colony" for legacy emitters
             inside colony HTTP handlers.
+        data: Optional structured payload merged into the event dict. Keys in
+            ``data`` take precedence over the canonical fields above only if
+            they don't collide; reserved keys (id, epoch, actor, type, task_id,
+            detail, ts) are never overwritten. Used by the live Activity Feed
+            (#372) to ship structured fields like ``action``/``target`` without
+            stuffing them into the freeform ``detail`` string.
     """
     global _event_counter
     with _event_lock:
         _event_counter += 1
-        _event_queue.append(
-            {
-                "id": _event_counter,
-                "epoch": _server_epoch,
-                "actor": actor,
-                "type": event_type,
-                "task_id": task_id,
-                "detail": detail,
-                "ts": _now_iso(),
-            }
-        )
+        event: dict = {
+            "id": _event_counter,
+            "epoch": _server_epoch,
+            "actor": actor,
+            "type": event_type,
+            "task_id": task_id,
+            "detail": detail,
+            "ts": _now_iso(),
+        }
+        if data:
+            for k, v in data.items():
+                if k not in event:
+                    event[k] = v
+        _event_queue.append(event)
 
 
 def _warn_if_data_dir_not_gitignored(repo_path: str, data_dir_name: str) -> None:
@@ -696,6 +734,21 @@ def get_app(
             # prior behavior for freeform callers like legacy hooks.
             resolved = synthesized if synthesized is not None else req.action
         _backend.update_worker_activity(worker_id, resolved)
+        # Emit on SSE so the TUI Activity panel can render a live feed of
+        # per-worker actions (#372). Skip clears (resolved is None) — they are
+        # uninteresting noise in the feed.
+        if resolved is not None:
+            _emit_event(
+                "worker_activity",
+                task_id="",
+                detail=resolved,
+                actor=worker_id,
+                data={
+                    "action": req.action,
+                    "target": req.target,
+                    "text": resolved,
+                },
+            )
         return {"ok": True}
 
     @app.get("/workers", status_code=200)

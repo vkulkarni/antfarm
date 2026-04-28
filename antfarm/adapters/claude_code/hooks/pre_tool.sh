@@ -4,8 +4,11 @@
 # See: https://docs.claude.ai/en/docs/claude-code/hooks (PreToolUse)
 #
 # Emits {action, target, source:"hook"} so the colony server can synthesize
-# a human-readable line like "editing src/foo.py" or "running pytest -x"
+# a human-readable line like "editing foo.py" or "running pytest -x"
 # and store it in the worker's current_action field (#348).
+#
+# Targets are tuned for the live Activity Feed (#372): file basenames,
+# longer Bash command prefixes, host+path for URLs, and quoted patterns.
 #
 # Graceful fallback: without jq, action/target stay empty and the server
 # clamps to sensible defaults. curl with || true ensures the hook never fails.
@@ -21,21 +24,23 @@ if command -v jq >/dev/null 2>&1 && [ -n "$HOOK_INPUT" ]; then
   TOOL_NAME=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_name // ""' 2>/dev/null || echo "")
   case "$TOOL_NAME" in
     Edit|Write)
-      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.file_path // ""' 2>/dev/null || echo "")
+      # Basename only — full repo paths waste activity-feed columns.
+      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.file_path | split("/") | .[-1] // ""' 2>/dev/null || echo "")
       ACTION=editing
       ;;
     Read)
-      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.file_path // ""' 2>/dev/null || echo "")
+      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.file_path | split("/") | .[-1] // ""' 2>/dev/null || echo "")
       ACTION=reading
       ;;
     Bash)
-      # First three space-separated tokens of the command — enough to show
-      # what's running without leaking args/secrets.
-      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.command // "" | split(" ") | .[0:3] | join(" ")' 2>/dev/null || echo "")
+      # First 60 chars of the command — enough context for the feed without
+      # blowing past the activity column. Server also clamps to 60.
+      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.command // "" | .[:60]' 2>/dev/null || echo "")
       ACTION=running
       ;;
     WebFetch)
-      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.url // ""' 2>/dev/null || echo "")
+      # Strip scheme + query string — the host+path is what's interesting.
+      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.url // "" | sub("^https?://"; "") | sub("\\?.*"; "")' 2>/dev/null || echo "")
       ACTION=searching
       ;;
     WebSearch)
@@ -43,7 +48,8 @@ if command -v jq >/dev/null 2>&1 && [ -n "$HOOK_INPUT" ]; then
       ACTION=searching
       ;;
     Glob|Grep)
-      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.pattern // .tool_input.path // ""' 2>/dev/null || echo "")
+      # Single-quote the pattern so it's visually distinct in the feed.
+      TARGET=$(printf '%s' "$HOOK_INPUT" | jq -r '.tool_input.pattern // .tool_input.path // ""' 2>/dev/null | sed "s/^\(.*\)$/'\1'/" || echo "")
       ACTION=scanning
       ;;
     TodoWrite)
