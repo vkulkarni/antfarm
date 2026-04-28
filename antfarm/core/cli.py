@@ -1395,7 +1395,10 @@ def mission():
     "--auto-merge",
     type=click.Choice(list(VALID_AUTO_MERGE_MODES)),
     default=None,
-    help="Auto-merge policy: never, on-review-pass, on-review-pass-and-ci-green.",
+    help=(
+        "Auto-merge policy: never, on-review-pass, on-review-pass-and-ci-green, "
+        "on-review-pass-and-local-tests."
+    ),
 )
 @click.option(
     "--allow-auto-merge-on-external",
@@ -1625,7 +1628,10 @@ def mission_report(mission_id: str, fmt: str, colony_url: str, token: str | None
     "--auto-merge",
     type=click.Choice(list(VALID_AUTO_MERGE_MODES)),
     default=None,
-    help="Auto-merge policy: never, on-review-pass, on-review-pass-and-ci-green.",
+    help=(
+        "Auto-merge policy: never, on-review-pass, on-review-pass-and-ci-green, "
+        "on-review-pass-and-local-tests."
+    ),
 )
 @click.option(
     "--allow-auto-merge-on-external",

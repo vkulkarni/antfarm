@@ -19,7 +19,12 @@ if TYPE_CHECKING:
 
 VALID_COMPLETION_MODES = ("best_effort", "all_or_nothing")
 VALID_BLOCKED_TIMEOUT_ACTIONS = ("wait", "fail")
-VALID_AUTO_MERGE_MODES = ("never", "on-review-pass", "on-review-pass-and-ci-green")
+VALID_AUTO_MERGE_MODES = (
+    "never",
+    "on-review-pass",
+    "on-review-pass-and-ci-green",
+    "on-review-pass-and-local-tests",
+)
 VALID_BUDGET_ACTIONS = ("pause", "cancel")
 
 # Bounded FIFO of recent UsageEvent IDs kept per-mission for dedup.

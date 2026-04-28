@@ -112,6 +112,7 @@ _MERGE_FAILED_REASONS = frozenset(
         "checkout_failed",  # could not checkout integration branch / temp
         "repo_dirty",  # soldier clone was dirty and recovery failed
         "auto_merge_ci_failed",  # CI on PR reported FAILURE while mode gated on CI
+        "auto_merge_local_test_failed",  # local pre-merge tests failed (#374)
         "auto_merge_refused",  # security guard refused auto-merge on this repo
         "unknown",  # catch-all for unclassified failures
     }
@@ -132,8 +133,10 @@ _MERGE_FAILED_REASONS = frozenset(
 #   on the next tick.
 # - auto_merge_waiting_ci: ``on-review-pass-and-ci-green`` mode, PR
 #   mergeStateStatus is UNSTABLE or PENDING. Soldier skips this tick.
-# - auto_merge_kickback: mergeStateStatus=BLOCKED with failing CI. Soldier
-#   kicks back the task with reason=auto_merge_ci_failed so the worker
+# - auto_merge_kickback: mergeStateStatus=BLOCKED with failing CI, or local
+#   pre-merge tests failed in ``on-review-pass-and-local-tests`` mode (#374).
+#   Soldier kicks back the task with the appropriate reason
+#   (auto_merge_ci_failed / auto_merge_local_test_failed) so the worker
 #   re-attempts with fixed code.
 # - auto_merge_blocked: mergeStateStatus=BLOCKED with missing reviews or
 #   other unresolved reason. Soldier pauses the parent mission (sets
@@ -2610,6 +2613,93 @@ class Soldier:
         attempt_id = task.get("current_attempt") or ""
 
         if outcome.action == "merge":
+            if outcome.mode == "on-review-pass-and-local-tests":
+                # Pre-merge local test gate (#374). Run the configured
+                # ``test_command`` on the PR branch in the soldier's working
+                # clone before invoking ``gh pr merge --squash``. Any failure
+                # (missing branch, checkout error, non-zero test exit) kicks
+                # back the task with ``auto_merge_local_test_failed``. The
+                # integration branch is restored unconditionally so subsequent
+                # ticks find a clean clone.
+                pretest_branch = self._get_attempt_branch(task) or ""
+                if not pretest_branch:
+                    self.last_failure_reason = (
+                        "auto_merge_local_test_failed: no branch on attempt"
+                    )
+                    _emit(
+                        "auto_merge_kickback",
+                        task_id,
+                        f"pr={outcome.pr} mode={outcome.mode} "
+                        f"reason=auto_merge_local_test_failed",
+                    )
+                    try:
+                        self.kickback_with_cascade(task_id, self.last_failure_reason)
+                    except Exception:
+                        logger.exception("kickback_with_cascade failed for %s", task_id)
+                    return MergeResult.FAILED
+
+                try:
+                    # Fetch the PR branch (it may not be local yet in this clone).
+                    subprocess.run(
+                        ["git", "fetch", "origin", pretest_branch],
+                        cwd=self.repo_path,
+                        capture_output=True,
+                        check=False,
+                    )
+                    co = self._checkout_with_reclaim(
+                        ["checkout", "-B", pretest_branch, f"origin/{pretest_branch}"]
+                    )
+                    if co.returncode != 0:
+                        stderr_text = co.stderr.decode(errors="replace").strip()[:200]
+                        self.last_failure_reason = (
+                            f"auto_merge_local_test_failed: checkout_failed: {stderr_text}"
+                        )
+                        _emit(
+                            "auto_merge_kickback",
+                            task_id,
+                            f"pr={outcome.pr} mode={outcome.mode} "
+                            f"reason=auto_merge_local_test_failed",
+                        )
+                        try:
+                            self.kickback_with_cascade(task_id, self.last_failure_reason)
+                        except Exception:
+                            logger.exception("kickback_with_cascade failed for %s", task_id)
+                        return MergeResult.FAILED
+
+                    _set_activity("running_tests", task_id)
+                    tr = subprocess.run(
+                        self.test_command,
+                        cwd=self.repo_path,
+                        capture_output=True,
+                        check=False,
+                    )
+                    if tr.returncode != 0:
+                        tail = (
+                            (tr.stderr or b"")
+                            .decode("utf-8", errors="replace")
+                            .strip()[-200:]
+                        )
+                        self.last_failure_reason = f"auto_merge_local_test_failed: {tail}"
+                        _emit(
+                            "auto_merge_kickback",
+                            task_id,
+                            f"pr={outcome.pr} mode={outcome.mode} "
+                            f"reason=auto_merge_local_test_failed",
+                        )
+                        try:
+                            self.kickback_with_cascade(task_id, self.last_failure_reason)
+                        except Exception:
+                            logger.exception("kickback_with_cascade failed for %s", task_id)
+                        return MergeResult.FAILED
+                    # tests pass → fall through to the normal gh pr merge path
+                finally:
+                    # ALWAYS restore the integration branch so the next tick
+                    # starts from a known good state.
+                    try:
+                        self._checkout_with_reclaim(["checkout", self.integration_branch])
+                    except Exception:
+                        logger.exception("post-test branch restore failed")
+
             branch = self._get_attempt_branch(task)
             ok, stderr_tail = self._gh_pr_merge_squash(outcome.pr, branch=branch)
             if not ok:

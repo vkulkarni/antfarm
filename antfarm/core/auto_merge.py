@@ -105,8 +105,8 @@ def decide(
 
     Args:
         mode: One of ``never``, ``on-review-pass``,
-            ``on-review-pass-and-ci-green``. Unknown modes collapse to
-            ``skip``.
+            ``on-review-pass-and-ci-green``, ``on-review-pass-and-local-tests``.
+            Unknown modes collapse to ``skip``.
         verdict_passed: Whether the internal antfarm review verdict passed.
         pr_state: Freshly fetched PR mergeability snapshot, or ``None`` when
             the lookup failed.
@@ -121,7 +121,7 @@ def decide(
 
     status = (pr_state.mergeStateStatus or "").upper()
 
-    if mode == "on-review-pass":
+    if mode in ("on-review-pass", "on-review-pass-and-local-tests"):
         if status == "CLEAN":
             return AutoMergeOutcome(action="merge", pr=pr, mode=mode, reason="CLEAN")
         if status == "UNSTABLE":

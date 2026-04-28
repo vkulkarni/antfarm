@@ -245,6 +245,59 @@ def test_decide_on_review_pass_and_ci_green_blocked_missing_reviews_pauses():
     assert out.action == "pause_mission"
 
 
+# ---------------------------------------------------------------------------
+# on-review-pass-and-local-tests — routing mirrors on-review-pass (#374).
+# The local pre-merge test gate is enforced in the soldier handler, NOT in
+# decide(). decide() must classify identically to on-review-pass so the
+# state-machine transitions stay aligned.
+# ---------------------------------------------------------------------------
+
+
+def test_decide_on_review_pass_and_local_tests_clean_merges():
+    out = decide(
+        "on-review-pass-and-local-tests",
+        verdict_passed=True,
+        pr_state=_state(mergeStateStatus="CLEAN"),
+        pr="p",
+    )
+    assert out.action == "merge"
+    assert out.mode == "on-review-pass-and-local-tests"
+
+
+def test_decide_on_review_pass_and_local_tests_dirty_rebase():
+    out = decide(
+        "on-review-pass-and-local-tests",
+        verdict_passed=True,
+        pr_state=_state(mergeStateStatus="DIRTY", mergeable="MERGEABLE"),
+        pr="p",
+    )
+    assert out.action == "rebase"
+
+
+def test_decide_on_review_pass_and_local_tests_blocked_ci_failing_kicks_back():
+    out = decide(
+        "on-review-pass-and-local-tests",
+        verdict_passed=True,
+        pr_state=_state(
+            mergeStateStatus="BLOCKED",
+            review_decision="APPROVED",
+            ci_conclusion="FAILURE",
+        ),
+        pr="p",
+    )
+    assert out.action == "kickback_ci"
+
+
+def test_decide_on_review_pass_and_local_tests_unstable_merges_ci_agnostic():
+    out = decide(
+        "on-review-pass-and-local-tests",
+        verdict_passed=True,
+        pr_state=_state(mergeStateStatus="UNSTABLE"),
+        pr="p",
+    )
+    assert out.action == "merge"
+
+
 def test_decide_has_hooks_is_skip():
     out = decide(
         "on-review-pass",

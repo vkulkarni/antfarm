@@ -940,5 +940,298 @@ def test_gh_pr_merge_squash_remote_branch_delete_fails(monkeypatch):
     assert tail == ""
 
 
+# ---------------------------------------------------------------------------
+# #374: on-review-pass-and-local-tests pre-merge gate
+# ---------------------------------------------------------------------------
+
+
+def test_local_tests_mode_clean_runs_tests_then_merges(monkeypatch):
+    """CLEAN PR + local tests pass → gh pr merge fires, MergeResult.MERGED,
+    and the integration branch is restored as the last checkout call."""
+    s = _make_soldier()
+    s.test_command = ["pytest", "-x", "-q"]
+    s.colony.get_mission.return_value = _mission(
+        auto_merge="on-review-pass-and-local-tests"
+    )
+    monkeypatch.setattr(
+        s,
+        "_query_pr_state",
+        lambda pr: PRState("CLEAN", "MERGEABLE", "APPROVED", "SUCCESS"),
+    )
+    monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
+    monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
+
+    merge_calls: list[tuple[str, str | None]] = []
+
+    def fake_merge(pr: str, branch: str | None = None):
+        merge_calls.append((pr, branch))
+        return True, ""
+
+    monkeypatch.setattr(s, "_gh_pr_merge_squash", fake_merge)
+    monkeypatch.setattr(s, "_sync_integration_branch_after_auto_merge", lambda: None)
+
+    checkout_calls: list[list[str]] = []
+
+    def fake_checkout(args):
+        checkout_calls.append(list(args))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(s, "_checkout_with_reclaim", fake_checkout)
+
+    run_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        run_calls.append(list(cmd))
+        # Both git fetch and the test_command return rc=0.
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    task = _task()
+    outcome = s._attempt_auto_merge(task)
+    assert outcome.action == "merge"
+    assert outcome.mode == "on-review-pass-and-local-tests"
+
+    result = s._handle_auto_merge_outcome(outcome, task)
+    assert result == MergeResult.MERGED
+    # gh pr merge invoked once with the expected branch.
+    assert merge_calls == [("https://github.com/org/repo/pull/1", "feat/task-1")]
+    # The test_command was run in the repo (subprocess.run was called with it).
+    assert any(cmd == s.test_command for cmd in run_calls), (
+        f"expected test_command in subprocess.run calls, got {run_calls}"
+    )
+    # Last checkout call must restore the integration branch.
+    assert checkout_calls, "expected at least one _checkout_with_reclaim call"
+    assert checkout_calls[-1] == ["checkout", s.integration_branch]
+
+
+def test_local_tests_mode_clean_test_failure_kicks_back_no_merge(monkeypatch):
+    """CLEAN PR + tests fail (rc=1) → kickback with auto_merge_local_test_failed,
+    gh pr merge NOT called, integration branch still restored."""
+    s = _make_soldier()
+    s.test_command = ["pytest", "-x", "-q"]
+    s.colony.get_mission.return_value = _mission(
+        auto_merge="on-review-pass-and-local-tests"
+    )
+    monkeypatch.setattr(
+        s,
+        "_query_pr_state",
+        lambda pr: PRState("CLEAN", "MERGEABLE", "APPROVED", "SUCCESS"),
+    )
+    monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
+    monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
+
+    merge_calls: list[tuple[str, str | None]] = []
+
+    def fake_merge(pr, branch=None):
+        merge_calls.append((pr, branch))
+        return True, ""
+
+    monkeypatch.setattr(s, "_gh_pr_merge_squash", fake_merge)
+    monkeypatch.setattr(s, "_sync_integration_branch_after_auto_merge", lambda: None)
+
+    checkout_calls: list[list[str]] = []
+
+    def fake_checkout(args):
+        checkout_calls.append(list(args))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(s, "_checkout_with_reclaim", fake_checkout)
+
+    def fake_run(cmd, **kwargs):
+        # git fetch returns 0; test_command returns 1.
+        if cmd[:2] == ["git", "fetch"]:
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if list(cmd) == s.test_command:
+            return SimpleNamespace(
+                returncode=1, stdout=b"", stderr=b"E   assert 1 == 2\n"
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    kickback_calls: list[tuple[str, str]] = []
+
+    def fake_kickback(task_id, reason, **kw):
+        kickback_calls.append((task_id, reason))
+
+    monkeypatch.setattr(s, "kickback_with_cascade", fake_kickback)
+
+    task = _task()
+    outcome = s._attempt_auto_merge(task)
+    assert outcome.action == "merge"
+
+    result = s._handle_auto_merge_outcome(outcome, task)
+    assert result == MergeResult.FAILED
+    assert merge_calls == [], "gh pr merge must not be called on test failure"
+    assert kickback_calls and kickback_calls[0][0] == "task-1"
+    assert kickback_calls[0][1].startswith("auto_merge_local_test_failed")
+    # Integration branch still restored as the LAST checkout call.
+    assert checkout_calls, "expected at least one _checkout_with_reclaim call"
+    assert checkout_calls[-1] == ["checkout", s.integration_branch]
+
+
+def test_local_tests_mode_checkout_failure_kicks_back(monkeypatch):
+    """Checkout to PR branch fails → kickback fires, no test_command run,
+    no gh pr merge."""
+    s = _make_soldier()
+    s.test_command = ["pytest", "-x", "-q"]
+    s.colony.get_mission.return_value = _mission(
+        auto_merge="on-review-pass-and-local-tests"
+    )
+    monkeypatch.setattr(
+        s,
+        "_query_pr_state",
+        lambda pr: PRState("CLEAN", "MERGEABLE", "APPROVED", "SUCCESS"),
+    )
+    monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
+    monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
+
+    merge_called: list[tuple[str, str | None]] = []
+
+    def fake_merge(pr, branch=None):
+        merge_called.append((pr, branch))
+        return True, ""
+
+    monkeypatch.setattr(s, "_gh_pr_merge_squash", fake_merge)
+
+    checkout_calls: list[list[str]] = []
+
+    def fake_checkout(args):
+        checkout_calls.append(list(args))
+        # First call (checkout -B PR branch) fails. Subsequent restore call
+        # to integration branch succeeds.
+        if args[:1] == ["checkout"] and len(args) >= 2 and args[1] == "-B":
+            return SimpleNamespace(
+                returncode=1,
+                stdout=b"",
+                stderr=b"error: pathspec 'origin/feat/task-1' did not match\n",
+            )
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(s, "_checkout_with_reclaim", fake_checkout)
+
+    run_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        run_calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    kickback_calls: list[tuple[str, str]] = []
+
+    def fake_kickback(task_id, reason, **kw):
+        kickback_calls.append((task_id, reason))
+
+    monkeypatch.setattr(s, "kickback_with_cascade", fake_kickback)
+
+    task = _task()
+    outcome = s._attempt_auto_merge(task)
+    assert outcome.action == "merge"
+
+    result = s._handle_auto_merge_outcome(outcome, task)
+    assert result == MergeResult.FAILED
+    assert merge_called == [], "gh pr merge must not run after checkout failure"
+    assert kickback_calls and kickback_calls[0][0] == "task-1"
+    assert kickback_calls[0][1].startswith("auto_merge_local_test_failed")
+    assert "checkout_failed" in kickback_calls[0][1]
+    # test_command must NOT have been executed.
+    assert not any(list(cmd) == s.test_command for cmd in run_calls), (
+        f"test_command should not run after checkout failure, got {run_calls}"
+    )
+    # Integration branch restore still attempted.
+    assert checkout_calls[-1] == ["checkout", s.integration_branch]
+
+
+def test_local_tests_mode_dirty_takes_rebase_path_no_extra_pretest(monkeypatch):
+    """DIRTY PR in local-tests mode → rebase path; the new pre-test gate
+    must NOT be entered (no test_command runs, no PR-branch checkout)."""
+    s = _make_soldier()
+    s.test_command = ["pytest", "-x", "-q"]
+    s.colony.get_mission.return_value = _mission(
+        auto_merge="on-review-pass-and-local-tests"
+    )
+    monkeypatch.setattr(
+        s,
+        "_query_pr_state",
+        lambda pr: PRState("DIRTY", "MERGEABLE", "APPROVED", "SUCCESS"),
+    )
+    monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
+    monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
+
+    rebase_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        s,
+        "_rebase_pr_branch_for_auto_merge",
+        lambda task, pr: rebase_calls.append((task["id"], pr)),
+    )
+
+    run_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        run_calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    checkout_calls: list[list[str]] = []
+
+    def fake_checkout(args):
+        checkout_calls.append(list(args))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(s, "_checkout_with_reclaim", fake_checkout)
+
+    task = _task()
+    outcome = s._attempt_auto_merge(task)
+    assert outcome.action == "rebase"
+
+    result = s._handle_auto_merge_outcome(outcome, task)
+    assert result == MergeResult.NEEDS_REVIEW
+    assert rebase_calls == [("task-1", "https://github.com/org/repo/pull/1")]
+    # Pre-test gate must not have run the test_command.
+    assert not any(list(cmd) == s.test_command for cmd in run_calls), (
+        f"test_command must not run on rebase path, got {run_calls}"
+    )
+
+
+def test_on_review_pass_clean_does_not_run_local_tests_regression(monkeypatch):
+    """Default on-review-pass mode + CLEAN PR must NOT trigger the local
+    test gate. subprocess.run is never called with self.test_command."""
+    s = _make_soldier()
+    s.test_command = ["pytest", "-x", "-q"]
+    s.colony.get_mission.return_value = _mission(auto_merge="on-review-pass")
+    monkeypatch.setattr(
+        s,
+        "_query_pr_state",
+        lambda pr: PRState("CLEAN", "MERGEABLE", "APPROVED", "SUCCESS"),
+    )
+    monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
+    monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
+    monkeypatch.setattr(s, "_gh_pr_merge_squash", lambda pr, branch=None: (True, ""))
+    monkeypatch.setattr(s, "_sync_integration_branch_after_auto_merge", lambda: None)
+
+    run_calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        run_calls.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    task = _task()
+    outcome = s._attempt_auto_merge(task)
+    assert outcome.action == "merge"
+    assert outcome.mode == "on-review-pass"
+
+    result = s._handle_auto_merge_outcome(outcome, task)
+    assert result == MergeResult.MERGED
+    # Default mode must NOT call subprocess.run with the test_command.
+    assert not any(list(cmd) == s.test_command for cmd in run_calls), (
+        f"on-review-pass mode must not run test_command, got {run_calls}"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-x", "-q"])
