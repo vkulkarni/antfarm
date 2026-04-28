@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.17] - 2026-04-27
+
+### Added
+- feat(tui,worker): live Activity Feed panel — last 20 events across workers + soldier + doctor, color-coded by worker_id; richer `pre_tool` hook payloads (file basenames, full Bash command up to 60 chars, host+path for WebFetch, single-quoted Grep/Glob patterns); `_emit_event` accepts optional structured `data` blob (#372)
+
 ## [0.6.16] - 2026-04-26
 
 ### Fixed
