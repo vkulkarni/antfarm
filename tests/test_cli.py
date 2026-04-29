@@ -250,12 +250,16 @@ def test_scout_watch_streams_events():
         )
 
     assert result.exit_code == 0, result.output
-    assert "14:32:11" in result.output
+    # Timestamps render in local TZ; assert the stable seconds field instead
+    # of the literal hour. Formatter output is human form, not raw key=value.
+    assert ":32:11" in result.output
     assert "runner" in result.output
-    assert "pr=42 branch=feat/x" in result.output
-    assert "14:33:02" in result.output
+    assert "harvested" in result.output
+    assert "task-1" in result.output
+    assert "PR 42" in result.output
+    assert ":33:02" in result.output
     assert "soldier" in result.output
-    assert "attempt=att-001" in result.output
+    assert "merged" in result.output
 
 
 def test_scout_watch_tracks_cursor_across_reconnects():
@@ -302,8 +306,11 @@ def test_scout_watch_tracks_cursor_across_reconnects():
     assert result.exit_code == 0, result.output
     assert calls[0].get("after") == 0
     assert calls[1].get("after") == 3
-    assert "d1" in result.output
-    assert "d2" in result.output
+    # Each batch is rendered via the human formatter; assert task ids and
+    # event keywords (the raw d1/d2 detail blobs no longer appear verbatim).
+    assert "task-a" in result.output
+    assert "harvested" in result.output
+    assert "merged" in result.output
 
 
 def test_scout_watch_ctrl_c_exits_cleanly():
@@ -366,6 +373,134 @@ def test_scout_watch_reconnects_on_http_error():
     assert calls[1].get("after") == 5
     # Third call (after HTTPError backoff) retains the advanced cursor.
     assert calls[2].get("after") == 5
+
+
+def test_scout_watch_json_passthrough():
+    """``--watch --json`` echoes raw SSE JSON without human reformatting."""
+    runner = CliRunner()
+
+    events = [
+        {
+            "id": 1,
+            "type": "harvested",
+            "actor": "runner",
+            "task_id": "task-1",
+            "detail": "pr=42 branch=feat/x",
+            "ts": "2026-04-16T14:32:11+00:00",
+        }
+    ]
+    lines = [f"data: {json.dumps(e)}" for e in events]
+
+    call_count = {"n": 0}
+
+    def fake_stream(method, url, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _make_stream_ctx(lines)
+        raise KeyboardInterrupt
+
+    with patch("antfarm.core.cli.httpx.stream", side_effect=fake_stream):
+        result = runner.invoke(
+            main,
+            ["scout", "--watch", "--json", "--colony-url", "http://localhost:7433"],
+        )
+
+    assert result.exit_code == 0, result.output
+    # Raw JSON object passes through verbatim — the human formatter is bypassed.
+    assert '"type": "harvested"' in result.output
+    assert '"pr=42 branch=feat/x"' in result.output
+    # No human-reformatting sentinel.
+    assert "PR 42" not in result.output
+
+
+def test_scout_watch_filters_low_signal_by_default():
+    """Default ``--watch`` suppresses heartbeat-grade noise (polling/idle/etc)."""
+    runner = CliRunner()
+
+    events = [
+        {
+            "id": 1,
+            "type": "polling",
+            "actor": "soldier",
+            "task_id": "",
+            "detail": "tick",
+            "ts": "2026-04-16T14:32:00+00:00",
+        },
+        {
+            "id": 2,
+            "type": "harvested",
+            "actor": "runner",
+            "task_id": "task-1",
+            "detail": "pr=42 branch=feat/x",
+            "ts": "2026-04-16T14:32:11+00:00",
+        },
+    ]
+    lines = [f"data: {json.dumps(e)}" for e in events]
+
+    call_count = {"n": 0}
+
+    def fake_stream(method, url, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _make_stream_ctx(lines)
+        raise KeyboardInterrupt
+
+    with patch("antfarm.core.cli.httpx.stream", side_effect=fake_stream):
+        result = runner.invoke(
+            main,
+            ["scout", "--watch", "--colony-url", "http://localhost:7433"],
+        )
+
+    assert result.exit_code == 0, result.output
+    # Heartbeat-grade event is hidden.
+    assert "polling" not in result.output
+    # High-signal event is shown.
+    assert "harvested" in result.output
+    assert "PR 42" in result.output
+
+
+def test_scout_watch_verbose_includes_low_signal():
+    """``-v`` / ``--verbose`` keeps heartbeat-grade events in the stream."""
+    runner = CliRunner()
+
+    events = [
+        {
+            "id": 1,
+            "type": "polling",
+            "actor": "soldier",
+            "task_id": "",
+            "detail": "tick",
+            "ts": "2026-04-16T14:32:00+00:00",
+        },
+        {
+            "id": 2,
+            "type": "harvested",
+            "actor": "runner",
+            "task_id": "task-1",
+            "detail": "pr=42 branch=feat/x",
+            "ts": "2026-04-16T14:32:11+00:00",
+        },
+    ]
+    lines = [f"data: {json.dumps(e)}" for e in events]
+
+    call_count = {"n": 0}
+
+    def fake_stream(method, url, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return _make_stream_ctx(lines)
+        raise KeyboardInterrupt
+
+    with patch("antfarm.core.cli.httpx.stream", side_effect=fake_stream):
+        result = runner.invoke(
+            main,
+            ["scout", "--watch", "-v", "--colony-url", "http://localhost:7433"],
+        )
+
+    assert result.exit_code == 0, result.output
+    # Both event types make it through.
+    assert "polling" in result.output
+    assert "harvested" in result.output
 
 
 def test_scout_oneshot_unchanged():

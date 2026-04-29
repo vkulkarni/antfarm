@@ -643,20 +643,33 @@ def _render_scout(status: dict, prev: dict | None) -> None:
 
 
 def _format_event(event: dict) -> str:
-    """Format an SSE event dict as an activity-feed line: ``HH:MM:SS  <actor:12>  <detail>``."""
-    ts = event.get("ts", "") or ""
-    time_part = ts.split("T", 1)[1][:8] if "T" in ts else ts[:8]
-    actor = str(event.get("actor") or event.get("type") or "")
-    detail = event.get("detail", "")
-    return f"{time_part}  {actor:<12}  {detail}"
+    """Format an SSE event dict as an activity-feed line.
+
+    Thin wrapper that delegates to :mod:`antfarm.core.watch_format` so the
+    pure formatting logic lives in a tested module and the CLI keeps only
+    httpx/click wiring (#377).
+    """
+    from antfarm.core import watch_format
+
+    return watch_format.format_event_human(event)
 
 
-def _scout_watch(colony_url: str, token: str | None) -> None:
+def _scout_watch(colony_url: str, token: str | None, json_mode: bool, verbose: bool) -> None:
     """Stream ``/events`` via SSE, printing one formatted line per event.
 
     Reconnects on connection close and carries the cursor forward so no events
     are lost across reconnects. Exits cleanly on KeyboardInterrupt.
+
+    Args:
+        colony_url: Base URL of the colony API.
+        token: Optional bearer token.
+        json_mode: When True, emit raw SSE JSON passthrough (no human
+            reformatting, no filtering). Useful for piping to ``jq``.
+        verbose: When True, include low-signal events (heartbeat, polling,
+            idle, scanning, cleanup). Default hides them.
     """
+    from antfarm.core import watch_format
+
     events_url = f"{colony_url.rstrip('/')}/events"
     headers = _auth_headers(token)
     cursor = 0
@@ -679,10 +692,17 @@ def _scout_watch(colony_url: str, token: str | None) -> None:
                             event = json.loads(raw)
                         except json.JSONDecodeError:
                             continue
+                        # Cursor advance happens BEFORE filtering so reconnects
+                        # don't replay events we've already seen and dropped.
                         event_id = event.get("id")
                         if isinstance(event_id, int) and event_id > cursor:
                             cursor = event_id
-                        click.echo(_format_event(event))
+                        if json_mode:
+                            click.echo(raw)
+                            continue
+                        if not verbose and watch_format.is_low_signal(event):
+                            continue
+                        click.echo(watch_format.format_event_human(event))
             except httpx.HTTPError:
                 # Brief backoff before reconnect; cursor is preserved.
                 time.sleep(1)
@@ -704,12 +724,28 @@ def _scout_watch(colony_url: str, token: str | None) -> None:
     show_default=True,
     help="Seconds between TUI refreshes (with --tui).",
 )
+@click.option(
+    "--json",
+    "json_mode",
+    is_flag=True,
+    default=False,
+    help="With --watch, emit raw SSE JSON passthrough (no human reformatting).",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    is_flag=True,
+    default=False,
+    help="With --watch, include low-signal events (heartbeat, polling, idle).",
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def scout(
     watch: bool,
     tui: bool,
     refresh: float,
+    json_mode: bool,
+    verbose: bool,
     colony_url: str,
     token: str | None,
 ):
@@ -722,7 +758,7 @@ def scout(
         return
 
     if watch:
-        _scout_watch(colony_url, token)
+        _scout_watch(colony_url, token, json_mode=json_mode, verbose=verbose)
         return
 
     status = _get(colony_url, "/status", token=token)
