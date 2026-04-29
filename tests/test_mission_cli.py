@@ -509,6 +509,169 @@ def test_mission_status_prints_auto_merge_line():
 
 
 # ---------------------------------------------------------------------------
+# mission create / update --test-command (#363)
+# ---------------------------------------------------------------------------
+
+
+def test_mission_create_test_command_flag_sets_config(tmp_path: Path):
+    """--test-command repeated tokens are collected into a list in config."""
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("spec")
+
+    runner = CliRunner()
+
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"mission_id": "m1"}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
+                "--test-command",
+                "pytest",
+                "--test-command",
+                "-x",
+                "--test-command",
+                "-q",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert payload["config"]["test_command"] == ["pytest", "-x", "-q"]
+
+
+def test_mission_create_test_command_with_bash_c_form(tmp_path: Path):
+    """--test-command preserves multi-token shell forms like `bash -c "..."`."""
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("spec")
+
+    runner = CliRunner()
+
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"mission_id": "m1"}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
+                "--test-command",
+                "bash",
+                "--test-command",
+                "-c",
+                "--test-command",
+                "pytest && mypy",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert payload["config"]["test_command"] == ["bash", "-c", "pytest && mypy"]
+
+
+def test_mission_create_no_test_command_omits_key(tmp_path: Path):
+    """Without --test-command, the key is absent from config."""
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("spec")
+
+    runner = CliRunner()
+
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"mission_id": "m1"}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert "test_command" not in payload.get("config", {})
+
+
+def test_mission_update_test_command_patches_config():
+    """mission update --test-command GETs, merges, then PATCHes config preserving fields."""
+    runner = CliRunner()
+
+    current_mission = {
+        "mission_id": "m1",
+        "status": "building",
+        "config": {
+            "completion_mode": "best_effort",
+            "max_parallel_builders": 4,
+            "auto_merge": "never",
+        },
+        "task_ids": [],
+        "created_at": "2026-04-20T00:00:00Z",
+    }
+
+    with (
+        patch("antfarm.core.cli.httpx.get") as mock_get,
+        patch("antfarm.core.cli.httpx.patch") as mock_patch,
+    ):
+        mock_get_resp = MagicMock()
+        mock_get_resp.status_code = 200
+        mock_get_resp.json.return_value = current_mission
+        mock_get.return_value = mock_get_resp
+
+        mock_patch_resp = MagicMock()
+        mock_patch_resp.status_code = 200
+        mock_patch_resp.json.return_value = {"ok": True}
+        mock_patch.return_value = mock_patch_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "update",
+                "m1",
+                "--test-command",
+                "pytest",
+                "--test-command",
+                "-x",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_patch.call_args.kwargs.get("json") or mock_patch.call_args[1]["json"]
+        merged_config = payload["updates"]["config"]
+        # Existing fields preserved
+        assert merged_config["completion_mode"] == "best_effort"
+        assert merged_config["max_parallel_builders"] == 4
+        assert merged_config["auto_merge"] == "never"
+        # New test_command applied
+        assert merged_config["test_command"] == ["pytest", "-x"]
+
+
+# ---------------------------------------------------------------------------
 # carry --mission
 # ---------------------------------------------------------------------------
 
