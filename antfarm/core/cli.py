@@ -1425,6 +1425,18 @@ def mission():
     show_default=True,
     help="Action taken when the budget is exceeded.",
 )
+@click.option(
+    "--test-command",
+    "test_command",
+    multiple=True,
+    default=None,
+    help=(
+        "Override the test command (repeat the flag for each token: "
+        "--test-command pytest --test-command -x --test-command -q). "
+        "Mission soldier runs this on the merge gate. Defaults to the "
+        "soldier's built-in command."
+    ),
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def mission_create(
@@ -1440,6 +1452,7 @@ def mission_create(
     max_cost_usd: float | None,
     max_tokens: int | None,
     budget_action: str,
+    test_command: tuple[str, ...],
     colony_url: str,
     token: str | None,
 ):
@@ -1467,6 +1480,8 @@ def mission_create(
         config["max_cost_usd"] = max_cost_usd
     if max_tokens is not None:
         config["max_tokens"] = max_tokens
+    if test_command:
+        config["test_command"] = list(test_command)
     # Always thread budget_action — even when budgets are unset it's harmless
     # and keeps round-trips deterministic.
     config["budget_action"] = budget_action
@@ -1645,6 +1660,18 @@ def mission_report(mission_id: str, fmt: str, colony_url: str, token: str | None
     default=None,
     help="Max re-plan cycles before mission fails. Overrides Queen-wide default.",
 )
+@click.option(
+    "--test-command",
+    "test_command",
+    multiple=True,
+    default=None,
+    help=(
+        "Override the test command (repeat the flag for each token: "
+        "--test-command pytest --test-command -x --test-command -q). "
+        "Mission soldier runs this on the merge gate. Defaults to the "
+        "soldier's built-in command."
+    ),
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def mission_update(
@@ -1652,6 +1679,7 @@ def mission_update(
     auto_merge: str | None,
     allow_auto_merge_on_external: bool | None,
     max_re_plans: int | None,
+    test_command: tuple[str, ...],
     colony_url: str,
     token: str | None,
 ):
@@ -1663,11 +1691,14 @@ def mission_update(
         partial["allow_auto_merge_on_external"] = bool(allow_auto_merge_on_external)
     if max_re_plans is not None:
         partial["max_re_plans"] = max_re_plans
+    if test_command:
+        partial["test_command"] = list(test_command)
 
     if not partial:
         click.echo(
             "No updates specified. "
-            "Use --auto-merge, --allow-auto-merge-on-external, or --max-re-plans."
+            "Use --auto-merge, --allow-auto-merge-on-external, "
+            "--max-re-plans, or --test-command."
         )
         return
 
