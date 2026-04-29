@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.19] - 2026-04-28
+
+### Added
+- feat(cli): `--test-command` flag on `mission create` and `mission update` (repeat per token); operators no longer need to POST raw JSON to override soldier's test command (#363)
+
 ## [0.6.18] - 2026-04-28
 
 ### Added
