@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.20] - 2026-04-28
+
+### Added
+- feat(cli): `antfarm scout --watch` now renders SSE events as a human-readable color-coded log (`HH:MM:SS  actor  detail`); per-event-type formatters for ~23 event types; `--json` flag preserves raw passthrough; `-v / --verbose` includes low-signal events. New module `antfarm/core/watch_format.py` (#377)
+
 ## [0.6.19] - 2026-04-28
 
 ### Added
