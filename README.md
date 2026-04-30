@@ -112,17 +112,36 @@ cd antfarm && pip install -e .
 cd /path/to/your/repo
 antfarm doctor                      # pre-flight
 antfarm colony --autoscaler &       # queen, soldier, doctor, autoscaler all in-process
-antfarm mission create --spec specs/my-feature.md
-antfarm scout --tui                 # or: scout --watch for raw event feed
+
+# Submit a mission. Auto-merge + cost cap are opt-in.
+antfarm mission create --spec specs/my-feature.md \
+  --auto-merge on-review-pass-and-ci-green \
+  --max-cost-usd 10
+
+antfarm scout --tui                 # rich dashboard
+# or: scout --watch                 # color-coded event log (--json for raw)
 ```
 
 A spec file is a Markdown document describing the change you want: goal, acceptance criteria, files or modules likely touched. The Queen reads it and produces the task graph. Agent-specific adapters and hook scripts live under [antfarm/adapters/](antfarm/adapters/).
+
+### Auto-merge modes
+
+| Mode | When to use |
+|---|---|
+| `never` (default) | You want to control merge timing manually. Soldier still runs the local merge gate; you click `gh pr merge`. |
+| `on-review-pass` | You trust the LLM reviewer. Soldier merges via `gh pr merge --squash` once review passes. Skips local tests. |
+| `on-review-pass-and-ci-green` | Repo has GitHub Actions CI. Soldier waits for CI green before merging. |
+| `on-review-pass-and-local-tests` | No GitHub Actions but you still want a test gate. Soldier runs `test_command` locally before merging. |
+
+### Cost tripwire
+
+`--max-cost-usd N` (or `--max-tokens N`) caps mission spend. On breach, the mission pauses (default) or cancels (`--budget-action cancel`). Resume with `antfarm mission extend <id> --additional-usd N`.
 
 ---
 
 ## FAQ
 
-**What does this cost?** Your Claude Max subscription or API usage. Antfarm itself is MIT, no telemetry, no hosted component.
+**What does this cost?** Your Claude Max subscription or API usage. Antfarm itself is MIT, no telemetry, no hosted component. Use `--max-cost-usd N` on `mission create` to cap a mission's blast radius; on breach the mission pauses for operator extend.
 
 **Can I use non-Claude agents?** Shipped: Claude Code reference adapter, Codex, Aider, and a generic curl adapter. Claude Code is the most polished; the others are functional but less exercised.
 
@@ -135,6 +154,10 @@ A spec file is a Markdown document describing the change you want: goal, accepta
 **What if a worker hangs or crashes?** The Doctor classifies stuck workers and the `--fix` flag recovers them. The autoscaler respawns the pool.
 
 **Does it commit to main directly?** The Soldier merges to a configurable integration branch (`--integration-branch`, default `main`). Point it at a `develop` branch if you want a manual review gate before `main`.
+
+**Can it auto-merge GitHub PRs?** Yes — opt-in via `--auto-merge`. See the four modes above. With branch protection rules (ADMIN required on `main`/`master`), pass `--allow-auto-merge-on-external` to opt into trusting your `gh` credentials there.
+
+**Can I watch what's happening in real time?** `antfarm scout --tui` for a full dashboard with worker activity, mission progress, and a rolling event feed. `antfarm scout --watch` for a tail-style color-coded log; pass `--json` for raw SSE for tooling, `-v/--verbose` to include heartbeat-level events.
 
 ---
 
@@ -191,13 +214,17 @@ Deeper reading: [docs/SPEC.md](docs/SPEC.md), [docs/DEVELOPMENT.md](docs/DEVELOP
 | Command | Purpose | When |
 |---|---|---|
 | `antfarm colony` | Start the coordinator (plus queen/soldier/doctor/autoscaler) | Once per project, long-lived |
-| `antfarm mission create` | Submit a spec as a mission | Start of each feature |
-| `antfarm mission status` | Show mission progress and task states | Checking in |
-| `antfarm scout --tui` | Rich dashboard | Monitoring |
-| `antfarm scout --watch` | Raw SSE event feed | Debugging |
-| `antfarm doctor --fix` | Detect and repair stuck state | Before a run; after a crash |
+| `antfarm mission create` | Submit a spec as a mission (`--auto-merge`, `--max-cost-usd`, `--test-command`, `--max-re-plans`, `--no-plan-review`) | Start of each feature |
+| `antfarm mission status` | Show mission progress, task states, and budget | Checking in |
+| `antfarm mission update` | Change config mid-flight (e.g. toggle auto-merge) | Mid-mission corrections |
+| `antfarm mission extend` | Grant additional cost/token budget to a paused mission | After a budget breach |
+| `antfarm mission report` | Final mission summary | After completion |
+| `antfarm scout --tui` | Rich dashboard with live Activity Feed | Monitoring |
+| `antfarm scout --watch` | Color-coded event log (add `--json` for raw, `-v` for verbose) | Tail-style monitoring |
+| `antfarm doctor --fix` | Detect and repair stuck state; auto-prunes stale worktrees | Before a run; after a crash |
 | `antfarm inbox` | Items needing operator attention | Daily triage |
 | `antfarm carry` | Add a single task manually | Outside the mission flow |
+| `antfarm mark-merged` | Manually reconcile a task whose PR was merged outside antfarm | Recovery |
 | `antfarm worker start` | Start a worker by hand | Debugging a specific agent |
 | `antfarm memory show` | Inspect the repo memory store | Understanding scheduler bias |
 
