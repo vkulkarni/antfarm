@@ -1,9 +1,9 @@
 # Mission: mission-test-001
 
 **Spec:** `(inline)`
-**Created:** 2026-05-01T06:31:08.573650+00:00
-**Completed:** 2026-05-01T06:31:08.590567+00:00 (0s)
-**Outcome:** failed (0/2 merged)
+**Created:** 2026-05-01T06:31:09.165692+00:00
+**Completed:** 2026-05-01T06:31:09.182683+00:00 (0s)
+**Outcome:** complete (1/2 merged)
 
 ## Plan
 
@@ -16,11 +16,12 @@
 
 | ID | PR | Attempts | Verdict | Wall | Notes |
 |---|---|---|---|---|---|
-| task-test-01 | — | 0 | blocked | — | blocked |
+| task-test-01 | p | 1 | pass | 0s | — |
 | task-test-02 | — | 0 | blocked | — | blocked |
 
 ## Timeline highlights
 
-- 06:31:08  mission created
-- 06:31:08  plan ready
-- 06:31:08  mission failed
+- 06:31:09  mission created
+- 06:31:09  plan ready
+- 06:31:09  task-test-01 merged
+- 06:31:09  mission complete
