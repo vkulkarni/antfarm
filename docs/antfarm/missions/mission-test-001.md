@@ -1,13 +1,16 @@
 # Mission: mission-test-001
 
 **Spec:** `(inline)`
-**Created:** 2026-05-01T06:29:14.650941+00:00
-**Completed:** 2026-05-01T06:29:14.652440+00:00 (0s)
+**Created:** 2026-05-01T06:29:15.231580+00:00
+**Completed:** 2026-05-01T06:29:15.234460+00:00 (0s)
 **Outcome:** failed (0/0 merged)
 
 ## Plan
 
-_(no plan artifact recorded)_
+| ID | Title | Deps | Touches | Complexity |
+|---|---|---|---|---|
+| task-01 | Child task 1 | — | api | M |
+| task-02 | Child task 2 | — | api | M |
 
 ## Tasks
 
@@ -15,5 +18,6 @@ _(no implementation tasks)_
 
 ## Timeline highlights
 
-- 06:29:14  mission created
-- 06:29:14  mission failed
+- 06:29:15  mission created
+- 06:29:15  plan ready
+- 06:29:15  mission failed
