@@ -1,9 +1,9 @@
 # Mission: mission-test-001
 
 **Spec:** `(inline)`
-**Created:** 2026-05-01T06:45:38.557355+00:00
-**Completed:** 2026-05-01T06:45:38.560557+00:00 (0s)
-**Outcome:** failed (0/0 merged)
+**Created:** 2026-05-01T06:45:39.087495+00:00
+**Completed:** 2026-05-01T06:45:39.104174+00:00 (0s)
+**Outcome:** complete (2/2 merged)
 
 ## Plan
 
@@ -14,10 +14,15 @@
 
 ## Tasks
 
-_(no implementation tasks)_
+| ID | PR | Attempts | Verdict | Wall | Notes |
+|---|---|---|---|---|---|
+| task-test-01 | https://github.com/test/pr/0 | 1 | pass | 0s | — |
+| task-test-02 | https://github.com/test/pr/1 | 1 | pass | 0s | — |
 
 ## Timeline highlights
 
-- 06:45:38  mission created
-- 06:45:38  plan ready
-- 06:45:38  mission failed
+- 06:45:39  mission created
+- 06:45:39  plan ready
+- 06:45:39  task-test-01 merged
+- 06:45:39  task-test-02 merged
+- 06:45:39  mission complete
