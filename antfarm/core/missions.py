@@ -72,6 +72,12 @@ class MissionConfig:
     max_cost_usd: float | None = None
     max_tokens: int | None = None
     budget_action: str = "pause"
+    # Audit doc (issue #379). When True, Queen commits a markdown audit doc
+    # to the integration branch on terminal mission transitions. The path
+    # template is None by default — None means "use the module default
+    # docs/antfarm/missions/{mission_id}.md".
+    commit_audit_doc: bool = True
+    audit_doc_path_template: str | None = None
 
     def __post_init__(self) -> None:
         if self.completion_mode not in VALID_COMPLETION_MODES:
@@ -104,6 +110,8 @@ class MissionConfig:
             "max_cost_usd": self.max_cost_usd,
             "max_tokens": self.max_tokens,
             "budget_action": self.budget_action,
+            "commit_audit_doc": self.commit_audit_doc,
+            "audit_doc_path_template": self.audit_doc_path_template,
         }
 
     @classmethod
@@ -126,6 +134,8 @@ class MissionConfig:
             max_cost_usd=data.get("max_cost_usd"),
             max_tokens=data.get("max_tokens"),
             budget_action=data.get("budget_action", "pause"),
+            commit_audit_doc=data.get("commit_audit_doc", True),
+            audit_doc_path_template=data.get("audit_doc_path_template"),
         )
 
 
