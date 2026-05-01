@@ -1,8 +1,8 @@
 # Mission: mission-test-001
 
 **Spec:** `(inline)`
-**Created:** 2026-05-01T06:45:36.912728+00:00
-**Completed:** 2026-05-01T06:45:36.917904+00:00 (0s)
+**Created:** 2026-05-01T06:45:37.428668+00:00
+**Completed:** 2026-05-01T06:45:37.437780+00:00 (0s)
 **Outcome:** failed (0/0 merged)
 
 ## Plan
@@ -14,7 +14,7 @@
 
 ## Re-plans
 
-Re-plan cycles: **1**.
+Re-plan cycles: **2**.
 
 The plan above is the final accepted version. Earlier rejected drafts can be reconstructed from the plan task's attempt history in `.antfarm/tasks/`.
 
@@ -24,6 +24,6 @@ _(no implementation tasks)_
 
 ## Timeline highlights
 
-- 06:45:36  mission created
-- 06:45:36  plan ready
-- 06:45:36  mission failed
+- 06:45:37  mission created
+- 06:45:37  plan ready
+- 06:45:37  mission failed
