@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.21] - 2026-04-30
+
+### Added
+- feat(queen,cli): mission audit doc — every completed mission writes `docs/antfarm/missions/<mission-id>.md` to the target repo (plan, re-plans, tasks table, budget, timeline) and commits directly to the integration branch. Per-mission opt-out via `--no-audit-doc`. Backfill via `antfarm mission report --write-doc <id> --repo-path <path>`. Preview via `--print-doc`. Doc failures never block the mission state machine. (#379)
+
 ## [0.6.20] - 2026-04-28
 
 ### Added
