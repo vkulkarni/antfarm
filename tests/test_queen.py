@@ -1752,3 +1752,151 @@ def test_queen_resume_after_extend_flips_back_to_building(env):
     queen._advance(m)
     m = backend.get_mission(mission["mission_id"])
     assert m["status"] == "building"
+
+
+# ---------------------------------------------------------------------------
+# Audit doc commit on terminal transitions (issue #379)
+# ---------------------------------------------------------------------------
+
+
+def _drive_mission_to_complete(backend, queen, mission):
+    """Helper: drive a freshly-created mission all the way to COMPLETE."""
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+    artifact = _make_plan_artifact(plan_task_id=m["plan_task_id"])
+    _harvest_plan_task_with_artifact(backend, m["plan_task_id"], artifact)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)  # → BUILDING
+    slug = queen._mission_slug(mission["mission_id"])
+    for i in range(2):
+        child_id = f"task-{slug}-{i + 1:02d}"
+        child = backend.get_task(child_id)
+        child["status"] = "done"
+        child["current_attempt"] = f"att-c{i}"
+        child["attempts"] = [
+            {
+                "attempt_id": f"att-c{i}",
+                "worker_id": "w",
+                "status": "merged",
+                "branch": f"feat/{child_id}",
+                "pr": f"https://example.com/pr/{i}",
+                "started_at": _now_iso(),
+                "completed_at": _now_iso(),
+                "artifact": {},
+            }
+        ]
+        _force_task_state(backend, child_id, child)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+
+
+def test_queen_writes_audit_doc_on_complete(env, event_bus):
+    """On COMPLETE transition, queen calls write_and_commit_doc once."""
+    from unittest.mock import patch
+
+    backend = env["backend"]
+    queen = env["queen"]
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
+
+    with patch("antfarm.core.queen.mission_doc.write_and_commit_doc") as mock_write:
+        mock_write.return_value = True
+        _drive_mission_to_complete(backend, queen, mission)
+
+    assert backend.get_mission(mission["mission_id"])["status"] == "complete"
+    assert mock_write.call_count == 1
+    args, kwargs = mock_write.call_args
+    # Mission dict is passed as positional arg #2 (repo_path is #1).
+    passed_mission = args[1]
+    assert passed_mission["mission_id"] == mission["mission_id"]
+    # Tasks list contains the child impl tasks.
+    passed_tasks = args[2]
+    assert any(t.get("id", "").startswith("task-") for t in passed_tasks)
+
+    events = _find_events(event_bus, type_="audit_doc_committed")
+    assert len(events) == 1
+    assert mission["mission_id"] in events[0]["detail"]
+
+
+def test_queen_writes_audit_doc_on_failed(env, event_bus):
+    """On FAILED transition, queen calls write_and_commit_doc once."""
+    from unittest.mock import patch
+
+    backend = env["backend"]
+    queen = env["queen"]
+    mission = _create_mission(backend)
+    m = backend.get_mission(mission["mission_id"])
+    queen._advance(m)
+    m = backend.get_mission(mission["mission_id"])
+
+    plan_task = backend.get_task(m["plan_task_id"])
+    plan_task["status"] = "blocked"
+    plan_task["attempts"] = [{"attempt_id": f"att-{i}", "status": "superseded"} for i in range(3)]
+    _force_task_state(backend, m["plan_task_id"], plan_task)
+
+    with patch("antfarm.core.queen.mission_doc.write_and_commit_doc") as mock_write:
+        mock_write.return_value = True
+        m = backend.get_mission(mission["mission_id"])
+        queen._advance(m)
+
+    assert backend.get_mission(mission["mission_id"])["status"] == "failed"
+    assert mock_write.call_count == 1
+    events = _find_events(event_bus, type_="audit_doc_committed")
+    assert len(events) == 1
+
+
+def test_queen_skips_audit_doc_when_disabled(env, event_bus):
+    """commit_audit_doc=False → write_and_commit_doc is never called."""
+    from unittest.mock import patch
+
+    backend = env["backend"]
+    queen = env["queen"]
+    mission = _create_mission(
+        backend,
+        config_overrides={"require_plan_review": False, "commit_audit_doc": False},
+    )
+
+    with patch("antfarm.core.queen.mission_doc.write_and_commit_doc") as mock_write:
+        mock_write.return_value = True
+        _drive_mission_to_complete(backend, queen, mission)
+
+    assert backend.get_mission(mission["mission_id"])["status"] == "complete"
+    assert mock_write.call_count == 0
+    # No audit_doc_* events emitted when disabled.
+    assert _find_events(event_bus, type_="audit_doc_committed") == []
+    assert _find_events(event_bus, type_="audit_doc_failed") == []
+
+
+def test_queen_emits_audit_doc_failed_on_helper_failure(env, event_bus):
+    """When write_and_commit_doc returns False, queen emits audit_doc_failed."""
+    from unittest.mock import patch
+
+    backend = env["backend"]
+    queen = env["queen"]
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
+
+    with patch("antfarm.core.queen.mission_doc.write_and_commit_doc") as mock_write:
+        mock_write.return_value = False
+        _drive_mission_to_complete(backend, queen, mission)
+
+    assert backend.get_mission(mission["mission_id"])["status"] == "complete"
+    events = _find_events(event_bus, type_="audit_doc_failed")
+    assert len(events) == 1
+    assert mission["mission_id"] in events[0]["detail"]
+
+
+def test_queen_audit_doc_failure_does_not_block_transition(env, event_bus):
+    """A raise from the helper is swallowed; mission still completes."""
+    from unittest.mock import patch
+
+    backend = env["backend"]
+    queen = env["queen"]
+    mission = _create_mission(backend, config_overrides={"require_plan_review": False})
+
+    with patch("antfarm.core.queen.mission_doc.write_and_commit_doc") as mock_write:
+        mock_write.side_effect = RuntimeError("git went sideways")
+        _drive_mission_to_complete(backend, queen, mission)
+
+    assert backend.get_mission(mission["mission_id"])["status"] == "complete"
+    events = _find_events(event_bus, type_="audit_doc_failed")
+    assert len(events) == 1

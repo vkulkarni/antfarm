@@ -1473,6 +1473,15 @@ def mission():
         "soldier's built-in command."
     ),
 )
+@click.option(
+    "--no-audit-doc",
+    is_flag=True,
+    default=False,
+    help=(
+        "Disable the per-mission audit doc that Queen normally commits to "
+        "docs/antfarm/missions/<id>.md on completion."
+    ),
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
 def mission_create(
@@ -1489,6 +1498,7 @@ def mission_create(
     max_tokens: int | None,
     budget_action: str,
     test_command: tuple[str, ...],
+    no_audit_doc: bool,
     colony_url: str,
     token: str | None,
 ):
@@ -1518,6 +1528,8 @@ def mission_create(
         config["max_tokens"] = max_tokens
     if test_command:
         config["test_command"] = list(test_command)
+    if no_audit_doc:
+        config["commit_audit_doc"] = False
     # Always thread budget_action — even when budgets are unset it's harmless
     # and keeps round-trips deterministic.
     config["budget_action"] = budget_action
@@ -1641,10 +1653,76 @@ def mission_extend(
     show_default=True,
     help="Output format.",
 )
+@click.option(
+    "--write-doc",
+    is_flag=True,
+    default=False,
+    help=(
+        "Render the mission audit doc and commit it to the integration branch "
+        "of the target repo. Idempotent: a no-op if the doc is already up to "
+        "date. Useful for backfilling missions that completed before audit "
+        "doc support landed."
+    ),
+)
+@click.option(
+    "--print-doc",
+    is_flag=True,
+    default=False,
+    help="Render the mission audit doc to stdout. Does not touch git.",
+)
+@click.option(
+    "--repo-path",
+    default=".",
+    show_default=True,
+    help="Path to the target git repo (used by --write-doc).",
+)
 @COLONY_URL_OPTION
 @TOKEN_OPTION
-def mission_report(mission_id: str, fmt: str, colony_url: str, token: str | None):
+def mission_report(
+    mission_id: str,
+    fmt: str,
+    write_doc: bool,
+    print_doc: bool,
+    repo_path: str,
+    colony_url: str,
+    token: str | None,
+):
     """Show mission report."""
+    if write_doc or print_doc:
+        from pathlib import Path
+
+        from antfarm.core import mission_doc
+
+        mission = _get(colony_url, f"/missions/{mission_id}", token=token)
+        tasks = _get(colony_url, f"/tasks?mission_id={mission_id}", token=token)
+        try:
+            usage = _get(colony_url, f"/missions/{mission_id}/usage", token=token)
+        except Exception:
+            usage = None
+
+        if print_doc:
+            click.echo(mission_doc.render_mission_doc(mission, tasks, usage), nl=False)
+            return
+
+        # write_doc
+        cfg = mission.get("config") or {}
+        template = cfg.get("audit_doc_path_template") or mission_doc.DEFAULT_PATH_TEMPLATE
+        integration_branch = cfg.get("integration_branch") or "main"
+        ok = mission_doc.write_and_commit_doc(
+            Path(repo_path),
+            mission,
+            tasks,
+            usage,
+            integration_branch=integration_branch,
+            template=template,
+        )
+        if ok:
+            click.echo(f"Audit doc committed: {template.format(mission_id=mission_id)}")
+        else:
+            click.echo("Audit doc commit failed (see logs).", err=True)
+            sys.exit(1)
+        return
+
     data = _get(colony_url, f"/missions/{mission_id}/report", token=token)
 
     if fmt == "json":

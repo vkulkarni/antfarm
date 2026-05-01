@@ -16,7 +16,9 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
+from antfarm.core import mission_doc
 from antfarm.core.backends.base import TaskBackend
 from antfarm.core.missions import (
     MissionReport,
@@ -206,7 +208,10 @@ class Queen:
             with contextlib.suppress(Exception):
                 self.backend.update_mission(
                     mission_id,
-                    {"status": MissionStatus.CANCELLED.value},
+                    {
+                        "status": MissionStatus.CANCELLED.value,
+                        "completed_at": _now_iso(),
+                    },
                 )
             _emit_event(
                 "mission_budget_exceeded",
@@ -214,6 +219,7 @@ class Queen:
                 detail=(f"mission={mission_id} action=cancel cost={cost:.4f} tokens={tokens}"),
                 actor="queen",
             )
+            self._commit_audit_doc(mission_id)
         return True
 
     # --- phase handlers ---
@@ -835,6 +841,80 @@ class Queen:
                 "mission_complete",
                 "",
                 detail=f"mission={mission['mission_id']}",
+                actor="queen",
+            )
+        if new_status in (
+            MissionStatus.COMPLETE,
+            MissionStatus.FAILED,
+            MissionStatus.CANCELLED,
+        ):
+            self._commit_audit_doc(mission["mission_id"])
+
+    def _commit_audit_doc(self, mission_id: str) -> None:
+        """Best-effort commit of the mission audit doc on terminal transition.
+
+        Reads fresh mission state (the transition's update_mission call has
+        already landed, so completed_at/status reflect the terminal state).
+        Wrapped in try/except — a failure must never block the state machine.
+        See issue #379.
+        """
+        mission = self.backend.get_mission(mission_id)
+        if mission is None:
+            return
+        cfg = mission.get("config") or {}
+        if cfg.get("commit_audit_doc") is False:
+            return
+
+        try:
+            tasks = [t for t in self.backend.list_tasks() if t.get("mission_id") == mission_id]
+        except Exception:
+            logger.warning(
+                "queen: audit doc — failed to list tasks for mission %s",
+                mission_id,
+                exc_info=True,
+            )
+            tasks = []
+
+        try:
+            usage = self.backend.get_mission_usage(mission_id)
+        except Exception:
+            # NotImplementedError on backends without usage tracking, plus any
+            # transient I/O error. Either way, render without a budget block.
+            usage = None
+
+        template = cfg.get("audit_doc_path_template") or mission_doc.DEFAULT_PATH_TEMPLATE
+        integration_branch = cfg.get("integration_branch") or self._integration_branch
+
+        try:
+            ok = mission_doc.write_and_commit_doc(
+                Path(self._repo_path),
+                mission,
+                tasks,
+                usage,
+                integration_branch=integration_branch,
+                template=template,
+            )
+        except Exception:
+            logger.warning(
+                "queen: audit doc — write_and_commit_doc raised for mission %s",
+                mission_id,
+                exc_info=True,
+            )
+            ok = False
+
+        rel_path = template.format(mission_id=mission_id)
+        if ok:
+            _emit_event(
+                "audit_doc_committed",
+                "",
+                detail=f"mission={mission_id} path={rel_path}",
+                actor="queen",
+            )
+        else:
+            _emit_event(
+                "audit_doc_failed",
+                "",
+                detail=f"mission={mission_id} path={rel_path}",
                 actor="queen",
             )
 

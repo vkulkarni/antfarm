@@ -964,3 +964,217 @@ def test_mission_update_max_re_plans_patches_config_preserving_other_fields():
         assert merged_config["auto_merge"] == "never"
         # New value applied
         assert merged_config["max_re_plans"] == 0
+
+
+# ---------------------------------------------------------------------------
+# mission create --no-audit-doc (issue #379)
+# ---------------------------------------------------------------------------
+
+
+def test_mission_create_no_audit_doc_flag(tmp_path: Path):
+    """--no-audit-doc sets commit_audit_doc=False in posted config."""
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("spec")
+
+    runner = CliRunner()
+
+    with patch("antfarm.core.cli.httpx.post") as mock_post:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"mission_id": "m1"}
+        mock_post.return_value = mock_resp
+
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "create",
+                "--spec",
+                str(spec_file),
+                "--no-audit-doc",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1]["json"]
+        assert payload["config"]["commit_audit_doc"] is False
+
+
+# ---------------------------------------------------------------------------
+# mission report --print-doc / --write-doc (issue #379)
+# ---------------------------------------------------------------------------
+
+
+def _stub_mission_responses(mission_id: str = "m1") -> dict:
+    """Build a minimal set of canned httpx responses for /missions and /tasks."""
+    mission = {
+        "mission_id": mission_id,
+        "spec": "spec",
+        "spec_file": "specs/x.md",
+        "status": "complete",
+        "plan_task_id": f"plan-{mission_id}",
+        "plan_artifact": {
+            "plan_task_id": f"plan-{mission_id}",
+            "attempt_id": "a",
+            "proposed_tasks": [
+                {"title": "Step 1", "depends_on": [], "touches": [], "complexity": "M"}
+            ],
+            "task_count": 1,
+            "warnings": [],
+            "dependency_summary": "",
+        },
+        "task_ids": ["task-01"],
+        "blocked_task_ids": [],
+        "config": {"integration_branch": "main"},
+        "created_at": "2026-04-22T12:00:00+00:00",
+        "updated_at": "2026-04-22T12:10:00+00:00",
+        "completed_at": "2026-04-22T12:10:00+00:00",
+        "report": None,
+        "last_progress_at": "2026-04-22T12:10:00+00:00",
+        "re_plan_count": 0,
+    }
+    tasks = [
+        {
+            "id": "task-01",
+            "title": "Implement",
+            "status": "done",
+            "capabilities_required": [],
+            "depends_on": [],
+            "touches": [],
+            "attempts": [
+                {
+                    "attempt_id": "att-1",
+                    "status": "merged",
+                    "branch": "feat/x",
+                    "pr": "https://example.com/pr/1",
+                    "started_at": "2026-04-22T12:01:00+00:00",
+                    "completed_at": "2026-04-22T12:09:00+00:00",
+                }
+            ],
+            "trail": [],
+            "mission_id": mission_id,
+        }
+    ]
+    usage = {"total_cost_usd": 0.1, "total_input_tokens": 10, "total_output_tokens": 20}
+    return {"mission": mission, "tasks": tasks, "usage": usage}
+
+
+def _make_get_router(canned: dict, mission_id: str = "m1"):
+    """Return a side_effect callable for httpx.get that maps URL → response."""
+
+    def _route(url, *args, **kwargs):
+        resp = MagicMock()
+        resp.status_code = 200
+        if url.endswith(f"/missions/{mission_id}"):
+            resp.json.return_value = canned["mission"]
+        elif "/tasks?mission_id=" in url:
+            resp.json.return_value = canned["tasks"]
+        elif url.endswith(f"/missions/{mission_id}/usage"):
+            resp.json.return_value = canned["usage"]
+        else:
+            resp.json.return_value = {}
+        return resp
+
+    return _route
+
+
+def test_mission_report_print_doc(tmp_path: Path):
+    """--print-doc renders markdown to stdout and never invokes git."""
+    canned = _stub_mission_responses()
+    runner = CliRunner()
+
+    with (
+        patch("antfarm.core.cli.httpx.get", side_effect=_make_get_router(canned)),
+        patch("antfarm.core.mission_doc.subprocess.run") as mock_subproc,
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "mission",
+                "report",
+                "m1",
+                "--print-doc",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "# Mission: m1" in result.output
+    assert "## Plan" in result.output
+    # No git ops at all.
+    assert mock_subproc.call_count == 0
+
+
+def test_mission_report_write_doc_idempotent(tmp_path: Path):
+    """Running --write-doc twice with same content → second run is a no-op."""
+    canned = _stub_mission_responses()
+    runner = CliRunner()
+
+    # State for the fake subprocess: first invocation simulates real changes,
+    # second invocation simulates an up-to-date file (diff returns 0).
+    state = {"first_run": True}
+
+    def fake_run(cmd, *args, **kwargs):
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ""
+        result.stdout = ""
+        if "diff" in cmd:
+            # First write: changes are present (rc=1). Second write: up to date (rc=0).
+            result.returncode = 1 if state["first_run"] else 0
+        return result
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # init a git repo so the path is plausible (subprocess is mocked anyway).
+
+    with (
+        patch("antfarm.core.cli.httpx.get", side_effect=_make_get_router(canned)),
+        patch("antfarm.core.mission_doc.subprocess.run", side_effect=fake_run) as mock_subproc,
+    ):
+        result1 = runner.invoke(
+            main,
+            [
+                "mission",
+                "report",
+                "m1",
+                "--write-doc",
+                "--repo-path",
+                str(repo),
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+        calls_first = mock_subproc.call_count
+        commits_first = sum(1 for c in mock_subproc.call_args_list if "commit" in c.args[0])
+
+        state["first_run"] = False
+        result2 = runner.invoke(
+            main,
+            [
+                "mission",
+                "report",
+                "m1",
+                "--write-doc",
+                "--repo-path",
+                str(repo),
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+        commits_second = (
+            sum(1 for c in mock_subproc.call_args_list if "commit" in c.args[0]) - commits_first
+        )
+
+    assert result1.exit_code == 0, result1.output
+    assert result2.exit_code == 0, result2.output
+    # First call did exactly one git commit; second call did zero.
+    assert commits_first == 1
+    assert commits_second == 0
+    # File exists at the standard template path.
+    expected = repo / "docs" / "antfarm" / "missions" / "m1.md"
+    assert expected.exists()
+    assert calls_first > 0  # silence unused-var warnings
