@@ -15,12 +15,16 @@ def _state(
     mergeable: str = "MERGEABLE",
     review_decision: str = "APPROVED",
     ci_conclusion: str | None = "SUCCESS",
+    ci_pending: bool = False,
+    ci_failing: bool = False,
 ) -> PRState:
     return PRState(
         mergeStateStatus=mergeStateStatus,
         mergeable=mergeable,
         review_decision=review_decision,
         ci_conclusion=ci_conclusion,
+        ci_pending=ci_pending,
+        ci_failing=ci_failing,
     )
 
 
@@ -177,7 +181,8 @@ def test_decide_on_review_pass_and_ci_green_clean_merges():
     assert out.action == "merge"
 
 
-def test_decide_on_review_pass_and_ci_green_unstable_waits():
+def test_decide_on_review_pass_and_ci_green_unstable_defensive_waits():
+    """No flags set (defensive fallback) — wait rather than guess wrong."""
     out = decide(
         "on-review-pass-and-ci-green",
         verdict_passed=True,
@@ -185,6 +190,56 @@ def test_decide_on_review_pass_and_ci_green_unstable_waits():
         pr="p",
     )
     assert out.action == "wait_ci"
+    assert "unknown" in out.reason
+
+
+def test_decide_on_review_pass_and_ci_green_unstable_with_failing_check_kicks_back():
+    """#381: UNSTABLE + a terminal-failed check must escalate to kickback."""
+    out = decide(
+        "on-review-pass-and-ci-green",
+        verdict_passed=True,
+        pr_state=_state(
+            mergeStateStatus="UNSTABLE",
+            ci_conclusion="FAILURE",
+            ci_failing=True,
+        ),
+        pr="p",
+    )
+    assert out.action == "kickback_ci"
+    assert out.reason == "ci_check_failed"
+
+
+def test_decide_on_review_pass_and_ci_green_unstable_with_pending_only_waits():
+    """#381: UNSTABLE with only pending checks keeps existing wait behavior."""
+    out = decide(
+        "on-review-pass-and-ci-green",
+        verdict_passed=True,
+        pr_state=_state(
+            mergeStateStatus="UNSTABLE",
+            ci_conclusion="PENDING",
+            ci_pending=True,
+        ),
+        pr="p",
+    )
+    assert out.action == "wait_ci"
+    assert "still pending" in out.reason
+
+
+def test_decide_on_review_pass_and_ci_green_unstable_with_mixed_failing_and_pending_kicks_back():
+    """#381: failing dominates — even with concurrent pending, kick back."""
+    out = decide(
+        "on-review-pass-and-ci-green",
+        verdict_passed=True,
+        pr_state=_state(
+            mergeStateStatus="UNSTABLE",
+            ci_conclusion="FAILURE",
+            ci_failing=True,
+            ci_pending=True,
+        ),
+        pr="p",
+    )
+    assert out.action == "kickback_ci"
+    assert out.reason == "ci_check_failed"
 
 
 def test_decide_on_review_pass_and_ci_green_pending_waits():
@@ -390,3 +445,78 @@ def test_parse_pr_state_missing_fields_coerced_to_empty():
     assert state.mergeable == ""
     assert state.review_decision == ""
     assert state.ci_conclusion is None
+    assert state.ci_pending is False
+    assert state.ci_failing is False
+
+
+def test_parse_pr_state_extracts_ci_pending_and_ci_failing_flags():
+    """#381: parse_pr_state must surface pending/failing summary flags."""
+    failing_with_in_progress = """
+    {
+      "mergeStateStatus": "UNSTABLE",
+      "mergeable": "MERGEABLE",
+      "reviewDecision": "APPROVED",
+      "statusCheckRollup": [
+        {"conclusion": "FAILURE", "status": "COMPLETED"},
+        {"conclusion": "", "status": "IN_PROGRESS"}
+      ]
+    }
+    """
+    state = parse_pr_state(failing_with_in_progress)
+    assert state is not None
+    assert state.ci_conclusion == "FAILURE"
+    assert state.ci_failing is True
+    assert state.ci_pending is True
+
+    only_pending = """
+    {
+      "mergeStateStatus": "UNSTABLE",
+      "mergeable": "MERGEABLE",
+      "reviewDecision": "APPROVED",
+      "statusCheckRollup": [
+        {"conclusion": "", "status": "IN_PROGRESS"},
+        {"conclusion": "PENDING", "status": "QUEUED"}
+      ]
+    }
+    """
+    state = parse_pr_state(only_pending)
+    assert state is not None
+    assert state.ci_conclusion == "PENDING"
+    assert state.ci_pending is True
+    assert state.ci_failing is False
+
+    all_success = """
+    {
+      "mergeStateStatus": "CLEAN",
+      "mergeable": "MERGEABLE",
+      "reviewDecision": "APPROVED",
+      "statusCheckRollup": [
+        {"conclusion": "SUCCESS", "status": "COMPLETED"},
+        {"conclusion": "SUCCESS", "status": "COMPLETED"}
+      ]
+    }
+    """
+    state = parse_pr_state(all_success)
+    assert state is not None
+    assert state.ci_conclusion == "SUCCESS"
+    assert state.ci_pending is False
+    assert state.ci_failing is False
+
+
+def test_summarize_rollup_treats_cancelled_as_pending():
+    """#381 deviation: CANCELLED is transient (operator re-triggers), not terminal."""
+    payload = """
+    {
+      "mergeStateStatus": "UNSTABLE",
+      "mergeable": "MERGEABLE",
+      "reviewDecision": "APPROVED",
+      "statusCheckRollup": [
+        {"conclusion": "CANCELLED", "status": "COMPLETED"}
+      ]
+    }
+    """
+    state = parse_pr_state(payload)
+    assert state is not None
+    assert state.ci_pending is True
+    assert state.ci_failing is False
+    assert state.ci_conclusion == "PENDING"
