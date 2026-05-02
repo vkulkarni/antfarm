@@ -35,12 +35,20 @@ class PRState:
 
     Field names mirror the ``gh pr view --json`` keys so the adapter in
     :func:`parse_pr_state` stays literal.
+
+    ``ci_pending`` and ``ci_failing`` are summary flags derived from the
+    ``statusCheckRollup`` in :func:`parse_pr_state`. They let
+    :func:`decide` disambiguate ``UNSTABLE`` (#381) into "still pending"
+    vs. "already failing terminally" without re-walking the rollup. They
+    default to ``False`` so existing positional/test callers keep working.
     """
 
     mergeStateStatus: str
     mergeable: str
     review_decision: str
     ci_conclusion: str | None
+    ci_pending: bool = False
+    ci_failing: bool = False
 
 
 @dataclass
@@ -161,8 +169,20 @@ def decide(
         if status == "CLEAN":
             return AutoMergeOutcome(action="merge", pr=pr, mode=mode, reason="CLEAN")
         if status == "UNSTABLE":
+            # #381: UNSTABLE conflates "still pending" with "already failed".
+            # Inspect the summarized rollup flags to decide which one we hit.
+            if pr_state.ci_failing:
+                return AutoMergeOutcome(
+                    action="kickback_ci", pr=pr, mode=mode, reason="ci_check_failed"
+                )
+            if pr_state.ci_pending:
+                return AutoMergeOutcome(
+                    action="wait_ci", pr=pr, mode=mode, reason="UNSTABLE ci still pending"
+                )
+            # Defensive: rollup parse failed or pre-existing tests construct
+            # PRState without the new flags. Wait rather than guess wrong.
             return AutoMergeOutcome(
-                action="wait_ci", pr=pr, mode=mode, reason="UNSTABLE ci still pending"
+                action="wait_ci", pr=pr, mode=mode, reason="UNSTABLE ci unknown, waiting"
             )
         if status == "PENDING":
             return AutoMergeOutcome(action="wait_ci", pr=pr, mode=mode, reason="PENDING")
@@ -228,23 +248,50 @@ def parse_pr_state(gh_json_output: str) -> PRState | None:
         return None
 
     rollup = data.get("statusCheckRollup") or []
-    ci_conclusion: str | None = _aggregate_ci(rollup) if isinstance(rollup, list) else None
+    if isinstance(rollup, list):
+        ci_conclusion, ci_pending, ci_failing = _summarize_rollup(rollup)
+    else:
+        ci_conclusion, ci_pending, ci_failing = None, False, False
 
     return PRState(
         mergeStateStatus=str(data.get("mergeStateStatus") or ""),
         mergeable=str(data.get("mergeable") or ""),
         review_decision=str(data.get("reviewDecision") or ""),
         ci_conclusion=ci_conclusion,
+        ci_pending=ci_pending,
+        ci_failing=ci_failing,
     )
 
 
-def _aggregate_ci(rollup: list) -> str | None:
-    """Reduce ``statusCheckRollup`` to a single overall conclusion.
+def _summarize_rollup(rollup: list) -> tuple[str | None, bool, bool]:
+    """Reduce ``statusCheckRollup`` to ``(ci_conclusion, ci_pending, ci_failing)``.
 
-    See :func:`parse_pr_state` docstring for precedence rules.
+    Single pass over the rollup so :func:`decide` can both pick a coarse
+    aggregate conclusion and ALSO see whether any individual check is still
+    in flight or has terminally failed (#381).
+
+    Per-entry classification:
+
+    - ``conclusion`` in ``{FAILURE, TIMED_OUT}`` — terminal failure → set
+      ``saw_failing``.
+    - ``conclusion == "CANCELLED"`` — operators commonly re-trigger
+      cancelled runs, so treat as transient pending rather than terminal
+      failure.
+    - ``conclusion == "PENDING"`` OR ``status`` in
+      ``{IN_PROGRESS, QUEUED}`` — still in flight → set ``saw_pending``.
+    - ``conclusion`` in ``{SUCCESS, NEUTRAL, SKIPPED}`` — counted as
+      success; does not set the failing/pending flags.
+
+    Aggregate ``ci_conclusion`` precedence (most severe wins):
+
+    1. any failing → ``"FAILURE"``
+    2. else any pending → ``"PENDING"``
+    3. else any success → ``"SUCCESS"``
+    4. else → ``None``
     """
     if not rollup:
-        return None
+        return None, False, False
+    saw_failing = False
     saw_pending = False
     saw_success = False
     for entry in rollup:
@@ -252,15 +299,24 @@ def _aggregate_ci(rollup: list) -> str | None:
             continue
         conclusion = str(entry.get("conclusion") or "").upper()
         status = str(entry.get("status") or "").upper()
-        if conclusion == "FAILURE":
-            return "FAILURE"
+        if conclusion in ("FAILURE", "TIMED_OUT"):
+            saw_failing = True
+            continue
+        if conclusion == "CANCELLED":
+            saw_pending = True
+            continue
         if conclusion == "PENDING" or status in ("IN_PROGRESS", "QUEUED"):
             saw_pending = True
             continue
-        if conclusion == "SUCCESS":
+        if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED"):
             saw_success = True
-    if saw_pending:
-        return "PENDING"
-    if saw_success:
-        return "SUCCESS"
-    return None
+
+    if saw_failing:
+        ci_conclusion: str | None = "FAILURE"
+    elif saw_pending:
+        ci_conclusion = "PENDING"
+    elif saw_success:
+        ci_conclusion = "SUCCESS"
+    else:
+        ci_conclusion = None
+    return ci_conclusion, saw_pending, saw_failing

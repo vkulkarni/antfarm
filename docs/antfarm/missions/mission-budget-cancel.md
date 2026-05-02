@@ -1,8 +1,8 @@
 # Mission: mission-budget-cancel
 
 **Spec:** `(inline)`
-**Created:** 2026-05-01T06:45:42.774753+00:00
-**Completed:** 2026-05-01T06:45:42.776682+00:00 (0s)
+**Created:** 2026-05-02T21:15:24.560976+00:00
+**Completed:** 2026-05-02T21:15:24.563037+00:00 (0s)
 **Outcome:** cancelled (0/0 merged)
 
 ## Plan
@@ -20,5 +20,5 @@ _(no implementation tasks)_
 
 ## Timeline highlights
 
-- 06:45:42  mission created
-- 06:45:42  mission cancelled
+- 21:15:24  mission created
+- 21:15:24  mission cancelled

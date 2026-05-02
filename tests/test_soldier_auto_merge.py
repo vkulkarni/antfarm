@@ -179,7 +179,9 @@ def test_ci_green_mode_unstable_waits(monkeypatch):
     monkeypatch.setattr(
         s,
         "_query_pr_state",
-        lambda pr: PRState("UNSTABLE", "MERGEABLE", "APPROVED", "PENDING"),
+        # #381: ci_pending=True explicit so wait_ci branch fires (not the
+        # defensive fallback) — fixture mirrors what parse_pr_state would set.
+        lambda pr: PRState("UNSTABLE", "MERGEABLE", "APPROVED", "PENDING", ci_pending=True),
     )
     monkeypatch.setattr(s, "_resolve_repo_slug", lambda: "org/repo")
     monkeypatch.setattr(s, "_query_viewer_permission", lambda: "ADMIN")
@@ -505,7 +507,10 @@ def test_poll_backoff_suppresses_redundant_polls(monkeypatch):
 
     def fake_state(pr):
         state_calls.append(pr)
-        return PRState("UNSTABLE", "MERGEABLE", "APPROVED", "PENDING")
+        # #381: ci_pending=True so the first call resolves to wait_ci, not
+        # the defensive fallback — backoff suppression then short-circuits
+        # the second call.
+        return PRState("UNSTABLE", "MERGEABLE", "APPROVED", "PENDING", ci_pending=True)
 
     monkeypatch.setattr(s, "_query_pr_state", fake_state)
 
