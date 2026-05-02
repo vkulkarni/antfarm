@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.22] - 2026-05-02
+
+### Fixed
+- fix(soldier,auto_merge): `mergeStateStatus=UNSTABLE` with one or more terminally-failed checks now kicks back instead of looping `auto_merge_waiting_ci` forever; `PRState` exposes `ci_pending` + `ci_failing` flags derived from `statusCheckRollup`; CANCELLED checks are treated as transient (operator re-trigger), not terminal failures (#381)
+
 ## [0.6.21] - 2026-04-30
 
 ### Added
