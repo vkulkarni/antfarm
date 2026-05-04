@@ -11,6 +11,7 @@ from antfarm.core.autoscaler import (
     AutoscalerConfig,
     ManagedWorker,
     compute_depth_aware_target,
+    compute_desired,
     count_ready_unblocked,
 )
 
@@ -26,8 +27,9 @@ def _task(
     capabilities_required: list[str] | None = None,
     attempts: list[dict] | None = None,
     current_attempt: str | None = None,
+    mission_id: str | None = None,
 ) -> dict:
-    return {
+    t: dict = {
         "id": task_id,
         "status": status,
         "touches": touches or [],
@@ -35,6 +37,9 @@ def _task(
         "attempts": attempts or [],
         "current_attempt": current_attempt,
     }
+    if mission_id is not None:
+        t["mission_id"] = mission_id
+    return t
 
 
 def _worker(
@@ -226,6 +231,205 @@ class TestComputeDesired:
         ]
         result = a._compute_desired(tasks, [])
         assert result["reviewer"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Terminal-mission filtering (#383)
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalMissionFiltering:
+    """Tasks belonging to missions in terminal states (complete/failed/
+    cancelled/paused) must not drive reviewer or builder demand. Without
+    this filter the autoscaler respawns reviewers indefinitely after a
+    mission completes (issue #383)."""
+
+    def test_compute_desired_filters_done_unreviewed_in_complete_mission(self):
+        """Done unreviewed task in a complete mission → reviewer count = 0."""
+        config = AutoscalerConfig(max_builders=4)
+        tasks = [
+            _task(
+                "t1",
+                status="done",
+                current_attempt="att-1",
+                attempts=[{"attempt_id": "att-1", "status": "done"}],
+                mission_id="m1",
+            ),
+        ]
+        missions = [{"mission_id": "m1", "status": "complete"}]
+        result = compute_desired(tasks, [], config, missions=missions)
+        assert result["reviewer"] == 0
+
+    def test_compute_desired_filters_ready_review_in_failed_mission(self):
+        """Review task in failed mission → reviewer count = 0."""
+        config = AutoscalerConfig(max_builders=4)
+        tasks = [
+            _task(
+                "review-t1",
+                status="ready",
+                capabilities_required=["review"],
+                mission_id="m1",
+            ),
+        ]
+        missions = [{"mission_id": "m1", "status": "failed"}]
+        result = compute_desired(tasks, [], config, missions=missions)
+        assert result["reviewer"] == 0
+
+    def test_compute_desired_filters_ready_review_in_paused_mission(self):
+        """Review task in paused mission → reviewer count = 0."""
+        config = AutoscalerConfig(max_builders=4)
+        tasks = [
+            _task(
+                "review-t1",
+                status="ready",
+                capabilities_required=["review"],
+                mission_id="m1",
+            ),
+        ]
+        missions = [{"mission_id": "m1", "status": "paused"}]
+        result = compute_desired(tasks, [], config, missions=missions)
+        assert result["reviewer"] == 0
+
+    def test_compute_desired_filters_ready_review_in_cancelled_mission(self):
+        """Review task in cancelled mission → reviewer count = 0."""
+        config = AutoscalerConfig(max_builders=4)
+        tasks = [
+            _task(
+                "review-t1",
+                status="ready",
+                capabilities_required=["review"],
+                mission_id="m1",
+            ),
+        ]
+        missions = [{"mission_id": "m1", "status": "cancelled"}]
+        result = compute_desired(tasks, [], config, missions=missions)
+        assert result["reviewer"] == 0
+
+    def test_compute_desired_keeps_done_unreviewed_in_active_mission(self):
+        """Regression: building (non-terminal) mission, no verdict task →
+        reviewer count = 1. The filter must NOT touch live missions."""
+        config = AutoscalerConfig(max_builders=4)
+        tasks = [
+            _task(
+                "t1",
+                status="done",
+                current_attempt="att-1",
+                attempts=[{"attempt_id": "att-1", "status": "done"}],
+                mission_id="m1",
+            ),
+        ]
+        missions = [{"mission_id": "m1", "status": "building"}]
+        result = compute_desired(tasks, [], config, missions=missions)
+        assert result["reviewer"] == 1
+
+    def test_compute_desired_no_filter_when_missions_none(self):
+        """Backward compat: missions=None ⇒ no-op filter, behavior unchanged."""
+        config = AutoscalerConfig(max_builders=4)
+        tasks = [
+            _task(
+                "t1",
+                status="done",
+                current_attempt="att-1",
+                attempts=[{"attempt_id": "att-1", "status": "done"}],
+                mission_id="m1",
+            ),
+        ]
+        result = compute_desired(tasks, [], config, missions=None)
+        assert result["reviewer"] == 1
+
+    def test_compute_desired_no_filter_when_missions_empty(self):
+        """Backward compat: missions=[] ⇒ no-op filter, behavior unchanged."""
+        config = AutoscalerConfig(max_builders=4)
+        tasks = [
+            _task(
+                "t1",
+                status="done",
+                current_attempt="att-1",
+                attempts=[{"attempt_id": "att-1", "status": "done"}],
+                mission_id="m1",
+            ),
+        ]
+        result = compute_desired(tasks, [], config, missions=[])
+        assert result["reviewer"] == 1
+
+    def test_compute_desired_handles_task_without_mission_id(self):
+        """Task lacking a `mission_id` field is treated as live (not filtered)."""
+        config = AutoscalerConfig(max_builders=4)
+        tasks = [
+            _task(
+                "t1",
+                status="done",
+                current_attempt="att-1",
+                attempts=[{"attempt_id": "att-1", "status": "done"}],
+                # no mission_id
+            ),
+        ]
+        # Even with a complete mission listed, this task isn't part of it.
+        missions = [{"mission_id": "m1", "status": "complete"}]
+        result = compute_desired(tasks, [], config, missions=missions)
+        assert result["reviewer"] == 1
+
+    def test_count_ready_unblocked_filters_terminal_mission_tasks(self):
+        """No point spawning builders for terminal-mission tasks either."""
+        tasks = [
+            _task("t1", status="ready", mission_id="m1"),
+            _task("t2", status="ready", mission_id="m2"),
+        ]
+        missions = [
+            {"mission_id": "m1", "status": "complete"},
+            {"mission_id": "m2", "status": "building"},
+        ]
+        # m1 task filtered out, m2 task counted.
+        assert count_ready_unblocked(tasks, missions=missions) == 1
+
+    def test_count_ready_unblocked_no_missions_is_unchanged(self):
+        """Backward compat: missions=None counts all eligible tasks."""
+        tasks = [
+            _task("t1", status="ready"),
+            _task("t2", status="ready"),
+        ]
+        assert count_ready_unblocked(tasks) == 2
+        assert count_ready_unblocked(tasks, missions=None) == 2
+        assert count_ready_unblocked(tasks, missions=[]) == 2
+
+    def test_reconcile_passes_missions_to_compute_desired(self):
+        """_reconcile() must call backend.list_missions() once and pass the
+        result through, so terminal-mission tasks don't drive demand."""
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm, max_builders=4)
+        a.backend.list_tasks.return_value = [
+            _task(
+                "t1",
+                status="done",
+                current_attempt="att-1",
+                attempts=[{"attempt_id": "att-1", "status": "done"}],
+                mission_id="m1",
+            ),
+        ]
+        a.backend.list_workers.return_value = []
+        a.backend.list_missions.return_value = [
+            {"mission_id": "m1", "status": "complete"},
+        ]
+
+        a._reconcile()
+
+        # backend.list_missions() should be called by _reconcile.
+        assert a.backend.list_missions.called
+        # No reviewer should be spawned because the mission is complete.
+        reviewer_starts = [c for c in pm.start.call_args_list if "reviewer" in str(c)]
+        assert len(reviewer_starts) == 0
+
+    def test_reconcile_tolerates_backend_without_list_missions(self):
+        """Backends that don't implement list_missions still work — the
+        autoscaler treats it as 'no filtering' rather than crashing."""
+        pm = _mock_pm()
+        a = _make_autoscaler(_pm=pm, max_builders=4)
+        a.backend.list_tasks.return_value = []
+        a.backend.list_workers.return_value = []
+        a.backend.list_missions.side_effect = AttributeError("list_missions not implemented")
+
+        # Should not raise.
+        a._reconcile()
 
 
 # ---------------------------------------------------------------------------
@@ -848,9 +1052,7 @@ class TestScaleUpThreshold:
         a._reconcile()
 
         # Exactly one builder spawned despite ready_unblocked < threshold.
-        builder_starts = [
-            c for c in pm.start.call_args_list if "builder" in str(c)
-        ]
+        builder_starts = [c for c in pm.start.call_args_list if "builder" in str(c)]
         assert len(builder_starts) == 1
 
     def test_no_spawn_when_actual_zero_and_no_ready_work(self):
@@ -870,9 +1072,7 @@ class TestScaleUpThreshold:
 
         a._reconcile()
 
-        builder_starts = [
-            c for c in pm.start.call_args_list if "builder" in str(c)
-        ]
+        builder_starts = [c for c in pm.start.call_args_list if "builder" in str(c)]
         assert len(builder_starts) == 0
 
     def test_no_spawn_above_baseline_when_below_threshold(self):
@@ -903,9 +1103,7 @@ class TestScaleUpThreshold:
 
         # desired=ceil(1*2.0)=2, actual=1, delta=1. ready_unblocked=1 < threshold=2
         # AND actual != 0, so the anti-flutter branch holds steady.
-        builder_starts = [
-            c for c in pm.start.call_args_list if "builder" in str(c)
-        ]
+        builder_starts = [c for c in pm.start.call_args_list if "builder" in str(c)]
         assert len(builder_starts) == 0
 
     def test_scale_up_above_baseline_when_threshold_met(self):
@@ -933,9 +1131,7 @@ class TestScaleUpThreshold:
 
         a._reconcile()
 
-        builder_starts = [
-            c for c in pm.start.call_args_list if "builder" in str(c)
-        ]
+        builder_starts = [c for c in pm.start.call_args_list if "builder" in str(c)]
         assert len(builder_starts) == 1
 
     def test_first_spawn_respects_max_builders_cap(self):
@@ -955,9 +1151,7 @@ class TestScaleUpThreshold:
 
         a._reconcile()
 
-        builder_starts = [
-            c for c in pm.start.call_args_list if "builder" in str(c)
-        ]
+        builder_starts = [c for c in pm.start.call_args_list if "builder" in str(c)]
         assert len(builder_starts) == 1
 
 
