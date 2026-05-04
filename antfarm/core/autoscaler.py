@@ -60,21 +60,49 @@ def _emit(event_type: str, task_id: str, detail: str = "") -> None:
 # ---------------------------------------------------------------------------
 
 
-def count_ready_unblocked(tasks: list[dict]) -> int:
+_TERMINAL_MISSION_STATUSES: frozenset[str] = frozenset(
+    {"complete", "failed", "cancelled", "paused"}
+)
+
+
+def _is_task_in_terminal_mission(task: dict, missions_by_id: dict[str, dict]) -> bool:
+    """Return True if the task belongs to a mission in a terminal state.
+
+    Conservative: tasks without ``mission_id``, or with a ``mission_id`` not in
+    the provided dict, return False (assumed live). This preserves backward
+    compatibility for callers that don't supply a missions list — empty
+    ``missions_by_id`` ⇒ no filtering.
+    """
+    mission_id = task.get("mission_id")
+    if not mission_id:
+        return False
+    mission = missions_by_id.get(mission_id)
+    if mission is None:
+        return False
+    return str(mission.get("status", "")).lower() in _TERMINAL_MISSION_STATUSES
+
+
+def count_ready_unblocked(tasks: list[dict], missions: list[dict] | None = None) -> int:
     """Count ready, non-infra, dependency-met build tasks.
 
     A task counts toward builder demand when:
     - ``status == "ready"``
     - It is NOT an infra task (id does not start with ``plan-`` or ``review-``)
     - All ``depends_on`` entries are in ``done_task_ids`` or ``merged_task_ids``
+    - Its mission (if any) is NOT in a terminal state (issue #383)
 
     ``merged_task_ids`` here is the set of task ids whose current attempt has
     ``status == "merged"``. ``done_task_ids`` is every task currently in
     ``done`` (a merged task is still in ``done``, so this union is safe).
+
+    ``missions`` is optional; when None or empty, no terminal-mission filtering
+    is applied (backward compatible).
     """
     done_task_ids = {t["id"] for t in tasks if t["status"] == "done"}
     merged_task_ids = {t["id"] for t in tasks if has_merged_attempt(t)}
     unblocked_ids = done_task_ids | merged_task_ids
+
+    missions_by_id = {m["mission_id"]: m for m in (missions or []) if "mission_id" in m}
 
     count = 0
     for t in tasks:
@@ -89,6 +117,8 @@ def count_ready_unblocked(tasks: list[dict]) -> int:
             continue
         deps = t.get("depends_on") or []
         if any(d not in unblocked_ids for d in deps):
+            continue
+        if _is_task_in_terminal_mission(t, missions_by_id):
             continue
         count += 1
     return count
@@ -112,19 +142,33 @@ def compute_depth_aware_target(ready_unblocked: int, config: AutoscalerConfig) -
 
 
 def compute_desired(
-    tasks: list[dict], workers: list[dict], config: AutoscalerConfig
+    tasks: list[dict],
+    workers: list[dict],
+    config: AutoscalerConfig,
+    missions: list[dict] | None = None,
 ) -> dict[str, int]:
     """Compute desired worker counts by role.
 
     Shared by single-host and multi-node autoscalers.
+
+    ``missions`` is optional; when supplied, tasks belonging to missions in a
+    terminal state (``complete``/``failed``/``cancelled``/``paused``) are
+    excluded from reviewer and builder demand. This prevents the autoscaler
+    from respawning reviewers indefinitely after a mission has finished
+    (issue #383). When None or empty, no filtering is applied (backward
+    compatible).
     """
+    missions_by_id = {m["mission_id"]: m for m in (missions or []) if "mission_id" in m}
+
     ready_plan = [
         t for t in tasks if t["status"] == "ready" and "plan" in t.get("capabilities_required", [])
     ]
     ready_review = [
         t
         for t in tasks
-        if t["status"] == "ready" and "review" in t.get("capabilities_required", [])
+        if t["status"] == "ready"
+        and "review" in t.get("capabilities_required", [])
+        and not _is_task_in_terminal_mission(t, missions_by_id)
     ]
     done_unreviewed = [
         t
@@ -134,9 +178,10 @@ def compute_desired(
         and not t.get("cancelled_at")
         and not has_verdict(t)
         and not has_merged_attempt(t)
+        and not _is_task_in_terminal_mission(t, missions_by_id)
     ]
 
-    ready_unblocked = count_ready_unblocked(tasks)
+    ready_unblocked = count_ready_unblocked(tasks, missions=missions)
     desired_builders = compute_depth_aware_target(ready_unblocked, config)
 
     active_builders = [
@@ -321,9 +366,16 @@ class Autoscaler:
         self._cleanup_exited()
         tasks = self.backend.list_tasks()
         workers = self.backend.list_workers()
-        desired = self._compute_desired(tasks, workers)
+        # Fetch missions once per reconcile so we can filter out tasks that
+        # belong to terminal missions (issue #383). Tolerate backends that
+        # don't implement list_missions yet — treat as no filtering.
+        try:
+            missions = self.backend.list_missions()
+        except (AttributeError, NotImplementedError):
+            missions = []
+        desired = self._compute_desired(tasks, workers, missions=missions)
         actual = self._count_actual()
-        ready_unblocked = count_ready_unblocked(tasks)
+        ready_unblocked = count_ready_unblocked(tasks, missions=missions)
         self._update_builder_idle_tracking(workers)
         for role in ("planner", "builder", "reviewer"):
             if role == "builder":
@@ -331,8 +383,13 @@ class Autoscaler:
             else:
                 self._reconcile_role(role, desired[role], actual.get(role, 0))
 
-    def _compute_desired(self, tasks: list[dict], workers: list[dict]) -> dict[str, int]:
-        return compute_desired(tasks, workers, self.config)
+    def _compute_desired(
+        self,
+        tasks: list[dict],
+        workers: list[dict],
+        missions: list[dict] | None = None,
+    ) -> dict[str, int]:
+        return compute_desired(tasks, workers, self.config, missions=missions)
 
     @staticmethod
     def _count_scope_groups(tasks: list[dict]) -> int:
@@ -625,8 +682,12 @@ class MultiNodeAutoscaler:
 
         tasks = self.backend.list_tasks()
         workers = self.backend.list_workers()
+        try:
+            missions = self.backend.list_missions()
+        except (AttributeError, NotImplementedError):
+            missions = []
         nodes = self._get_node_capacities()
-        desired_total = compute_desired(tasks, workers, self.config)
+        desired_total = compute_desired(tasks, workers, self.config, missions=missions)
         placement = compute_placement(desired_total, nodes)
         self._generation += 1
         for node_id, desired in placement.items():
