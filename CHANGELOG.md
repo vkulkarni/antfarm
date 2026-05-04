@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.23] - 2026-05-03
+
+### Fixed
+- fix(autoscaler): filter terminal-mission tasks (complete/failed/cancelled/paused) from reviewer + builder demand; ends the post-mission reviewer respawn loop that spawned ~12 ghost reviewers per hour after every completed mission (#383)
+
 ## [0.6.22] - 2026-05-02
 
 ### Fixed
