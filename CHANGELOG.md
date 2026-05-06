@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.24] - 2026-05-05
+
+### Added
+- feat(tui,cli): activity quietened by default — `worker_spawned`/`worker_retired` events suppressed unless `-v`/`--verbose`; sticky "Now: <worker> <action> <target> (elapsed)" line at top of TUI Activity panel showing the most recent active worker (clears after 90s of inactivity) (#385)
+
 ## [0.6.23] - 2026-05-03
 
 ### Fixed
