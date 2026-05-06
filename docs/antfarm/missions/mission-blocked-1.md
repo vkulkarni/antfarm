@@ -1,8 +1,8 @@
 # Mission: mission-blocked-1
 
 **Spec:** `(inline)`
-**Created:** 2026-05-04T07:01:06.077692+00:00
-**Completed:** 2026-05-04T07:01:06.111006+00:00 (0s)
+**Created:** 2026-05-06T05:52:56.316023+00:00
+**Completed:** 2026-05-06T05:52:56.348135+00:00 (0s)
 **Outcome:** complete (1/2 merged)
 
 ## Plan
@@ -21,10 +21,10 @@
 
 ## Timeline highlights
 
-- 07:01:06  mission created
-- 07:01:06  plan ready
-- 07:01:06  task-blocked-02 merged
-- 07:01:06  task-blocked-01 kicked back (kickback)
-- 07:01:06  task-blocked-01 kicked back (kickback)
-- 07:01:06  task-blocked-01 kicked back (kickback)
-- 07:01:06  mission complete
+- 05:52:56  mission created
+- 05:52:56  plan ready
+- 05:52:56  task-blocked-02 merged
+- 05:52:56  task-blocked-01 kicked back (kickback)
+- 05:52:56  task-blocked-01 kicked back (kickback)
+- 05:52:56  task-blocked-01 kicked back (kickback)
+- 05:52:56  mission complete
