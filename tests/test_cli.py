@@ -522,6 +522,80 @@ def test_scout_oneshot_unchanged():
         mock_get.assert_called_once()
 
 
+def test_scout_tui_mission_flag():
+    """`scout --tui --mission abc` constructs the TUI with mission_id='abc'."""
+    runner = CliRunner()
+
+    captured: dict = {}
+
+    def _fake_init(self, **kwargs):  # type: ignore[no-redef]
+        captured.update(kwargs)
+        # Stash a sentinel so .run() is a no-op.
+        self._stub = True
+
+    def _fake_run(self):  # type: ignore[no-redef]
+        return None
+
+    with (
+        patch("antfarm.core.cli.httpx.get") as mock_get,
+        patch("antfarm.core.tui.AntfarmTUI.__init__", _fake_init),
+        patch("antfarm.core.tui.AntfarmTUI.run", _fake_run),
+    ):
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"mission_id": "abc"}
+        mock_get.return_value = ok
+
+        result = runner.invoke(
+            main,
+            [
+                "scout",
+                "--tui",
+                "--mission",
+                "abc",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured.get("mission_id") == "abc"
+    assert captured.get("colony_url") == "http://localhost:7433"
+
+
+def test_scout_tui_mission_unknown_id():
+    """`scout --tui --mission unknown` exits non-zero with a clear message."""
+    runner = CliRunner()
+
+    not_found = MagicMock()
+    not_found.status_code = 404
+    not_found.json.return_value = {"detail": "Mission 'unknown' not found"}
+
+    with (
+        patch("antfarm.core.cli.httpx.get", return_value=not_found),
+        patch("antfarm.core.tui.AntfarmTUI") as mock_tui,
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "scout",
+                "--tui",
+                "--mission",
+                "unknown",
+                "--colony-url",
+                "http://localhost:7433",
+            ],
+        )
+
+    assert result.exit_code != 0
+    # Either stderr or output, depending on Click version
+    combined = (result.output or "") + (getattr(result, "stderr_bytes", b"") or b"").decode(
+        "utf-8", errors="replace"
+    )
+    assert "not found" in combined or "unknown" in combined
+    mock_tui.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # doctor
 # ---------------------------------------------------------------------------

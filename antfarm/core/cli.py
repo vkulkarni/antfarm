@@ -725,6 +725,15 @@ def _scout_watch(colony_url: str, token: str | None, json_mode: bool, verbose: b
     help="Seconds between TUI refreshes (with --tui).",
 )
 @click.option(
+    "--mission",
+    "mission_id",
+    default=None,
+    help=(
+        "With --tui, replace the global activity panel with a mission-scoped "
+        "per-task progress tree (#386)."
+    ),
+)
+@click.option(
     "--json",
     "json_mode",
     is_flag=True,
@@ -744,6 +753,7 @@ def scout(
     watch: bool,
     tui: bool,
     refresh: float,
+    mission_id: str | None,
     json_mode: bool,
     verbose: bool,
     colony_url: str,
@@ -753,7 +763,29 @@ def scout(
     if tui:
         from antfarm.core.tui import AntfarmTUI
 
-        dashboard = AntfarmTUI(colony_url=colony_url, token=token, refresh_interval=refresh)
+        # Pre-flight check for --mission so we exit cleanly with a helpful
+        # message instead of dropping the user into an empty TUI when the id
+        # is wrong (#386). Connection errors fall through to the TUI's own
+        # error-panel handling.
+        if mission_id:
+            try:
+                resp = httpx.get(
+                    f"{colony_url.rstrip('/')}/missions/{mission_id}",
+                    headers=({"Authorization": f"Bearer {token}"} if token else {}),
+                    timeout=5,
+                )
+            except httpx.HTTPError:
+                resp = None
+            if resp is not None and resp.status_code == 404:
+                click.echo(f"Mission '{mission_id}' not found", err=True)
+                raise SystemExit(1)
+
+        dashboard = AntfarmTUI(
+            colony_url=colony_url,
+            token=token,
+            refresh_interval=refresh,
+            mission_id=mission_id,
+        )
         dashboard.run()
         return
 
