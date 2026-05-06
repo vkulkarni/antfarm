@@ -1238,15 +1238,18 @@ def test_render_activity_formats_rows():
     rendered = tui._render_activity()
     plain = rendered.plain
 
-    # Two rows, newest last (auto-scroll)
+    # Layout (#385): Now header + separator + event tail. Skip the two
+    # header rows before asserting on body content.
     lines = plain.split("\n")
-    assert len(lines) == 2
-    assert "soldier" in lines[0]
-    assert "merging task-001 to main" in lines[0]
-    assert "queen" in lines[1]
-    assert "created plan plan-v061" in lines[1]
+    assert lines[0].startswith("Now: ")
+    body = lines[2:]
+    assert len(body) == 2
+    assert "soldier" in body[0]
+    assert "merging task-001 to main" in body[0]
+    assert "queen" in body[1]
+    assert "created plan plan-v061" in body[1]
     # Actor column is fixed-width 12
-    assert lines[0].split("  ")[1].startswith("soldier")
+    assert body[0].split("  ")[1].startswith("soldier")
 
 
 def test_render_activity_uses_tail_when_over_max_rows():
@@ -1264,10 +1267,13 @@ def test_render_activity_uses_tail_when_over_max_rows():
     rendered = tui._render_activity(max_rows=4)
     plain = rendered.plain
     lines = plain.split("\n")
-    assert len(lines) == 4
+    # Layout (#385): Now header + separator + 4-row tail.
+    assert lines[0].startswith("Now: ")
+    body = lines[2:]
+    assert len(body) == 4
     # Newest (event-10) rendered last
-    assert "event-10" in lines[-1]
-    assert "event-7" in lines[0]
+    assert "event-10" in body[-1]
+    assert "event-7" in body[0]
 
 
 def test_render_activity_failed_type_is_red():
@@ -1578,10 +1584,13 @@ def test_render_activity_max_rows_20():
         )
     rendered = tui._render_activity(max_rows=20)
     lines = rendered.plain.split("\n")
-    assert len(lines) == 20
+    # Layout (#385): Now header + separator + 20-row tail.
+    assert lines[0].startswith("Now: ")
+    body = lines[2:]
+    assert len(body) == 20
     # Newest event ends up last.
-    assert "edit-25" in lines[-1]
-    assert "edit-6" in lines[0]
+    assert "edit-25" in body[-1]
+    assert "edit-6" in body[0]
 
 
 def test_render_activity_colors_only_workers_not_colony():
@@ -1631,4 +1640,135 @@ def test_render_activity_colors_only_workers_not_colony():
     )
     assert all(not any(c in s for c in palette) for s in soldier_styles), (
         f"soldier actor span unexpectedly colored: {soldier_styles}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Activity Feed: sticky "Now" line (#385)
+# ---------------------------------------------------------------------------
+
+
+def _now_iso(seconds_ago: int = 0) -> str:
+    """ISO 8601 timestamp ``seconds_ago`` seconds before now (UTC)."""
+    from datetime import UTC, datetime, timedelta
+
+    return (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+
+
+def test_render_activity_shows_now_line_when_recent_worker_activity():
+    """Recent worker_activity from a non-subsystem actor pins the Now line."""
+    tui = _make_tui()
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "worker_activity",
+            "actor": "node1/worker-3",
+            "detail": "editing src/foo.py",
+            "task_id": "",
+            "ts": _now_iso(seconds_ago=10),
+        }
+    )
+    rendered = tui._render_activity()
+    plain = rendered.plain
+    first_line = plain.split("\n")[0]
+    assert first_line.startswith("Now: ")
+    assert "node1/worker-3" in first_line
+    assert "editing src/foo.py" in first_line
+
+
+def test_render_activity_now_line_clears_when_stale():
+    """worker_activity older than 90s collapses the Now line to ``Now: --``."""
+    tui = _make_tui()
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "worker_activity",
+            "actor": "node1/worker-3",
+            "detail": "editing src/foo.py",
+            "task_id": "",
+            "ts": _now_iso(seconds_ago=100),
+        }
+    )
+    rendered = tui._render_activity()
+    first_line = rendered.plain.split("\n")[0]
+    assert first_line.strip() == "Now: --"
+
+
+def test_render_activity_now_line_ignores_subsystem_actors():
+    """Subsystem actors (soldier/doctor/colony/queen/autoscaler) never pin the
+    Now line — it's reserved for actual workers (#385)."""
+    tui = _make_tui()
+    # Pin the Now line with a real worker first.
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "worker_activity",
+            "actor": "node1/worker-3",
+            "detail": "editing src/foo.py",
+            "task_id": "",
+            "ts": _now_iso(seconds_ago=5),
+        }
+    )
+    # Subsystem worker_activity events must NOT overwrite the Now line.
+    for actor in ("soldier", "doctor", "colony", "queen", "autoscaler"):
+        tui._ingest_event(
+            {
+                "id": 2,
+                "type": "worker_activity",
+                "actor": actor,
+                "detail": f"{actor} is doing thing",
+                "task_id": "",
+                "ts": _now_iso(seconds_ago=1),
+            }
+        )
+    first_line = tui._render_activity().plain.split("\n")[0]
+    assert "node1/worker-3" in first_line
+    assert "editing src/foo.py" in first_line
+    for actor in ("soldier", "doctor", "colony", "queen", "autoscaler"):
+        assert f"{actor} is doing thing" not in first_line
+
+    # And: when no real worker activity has ever been seen, only subsystem
+    # noise has streamed in -> Now line stays at "--".
+    tui2 = _make_tui()
+    tui2._ingest_event(
+        {
+            "id": 1,
+            "type": "worker_activity",
+            "actor": "soldier",
+            "detail": "merging",
+            "task_id": "",
+            "ts": _now_iso(seconds_ago=1),
+        }
+    )
+    first2 = tui2._render_activity().plain.split("\n")[0]
+    assert first2.strip() == "Now: --"
+
+
+def test_render_activity_now_line_uses_palette_color():
+    """The Now line's actor segment is colored via _color_for_worker."""
+    tui = _make_tui()
+    actor = "node1/worker-3"
+    tui._ingest_event(
+        {
+            "id": 1,
+            "type": "worker_activity",
+            "actor": actor,
+            "detail": "editing src/foo.py",
+            "task_id": "",
+            "ts": _now_iso(seconds_ago=5),
+        }
+    )
+    rendered = tui._render_activity()
+    expected = tui._color_for_worker(actor)
+
+    # Locate the span covering the actor substring on the Now line and
+    # confirm its style carries the expected palette color.
+    actor_styles: list[str] = []
+    for span in rendered.spans:
+        substr = rendered.plain[span.start : span.end]
+        if substr == actor:
+            actor_styles.append(str(span.style))
+    assert actor_styles, "actor span not found on the Now line"
+    assert any(expected in s for s in actor_styles), (
+        f"Now-line actor missing palette color {expected}: {actor_styles}"
     )

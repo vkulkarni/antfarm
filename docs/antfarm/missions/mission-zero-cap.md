@@ -1,8 +1,8 @@
 # Mission: mission-zero-cap
 
 **Spec:** `(inline)`
-**Created:** 2026-05-04T07:01:13.520444+00:00
-**Completed:** 2026-05-04T07:01:13.523578+00:00 (0s)
+**Created:** 2026-05-06T05:53:23.678269+00:00
+**Completed:** 2026-05-06T05:53:23.681334+00:00 (0s)
 **Outcome:** failed (0/0 merged)
 
 ## Plan
@@ -18,6 +18,6 @@ _(no implementation tasks)_
 
 ## Timeline highlights
 
-- 07:01:13  mission created
-- 07:01:13  plan ready
-- 07:01:13  mission failed
+- 05:53:23  mission created
+- 05:53:23  plan ready
+- 05:53:23  mission failed
