@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.25] - 2026-05-05
+
+### Added
+- feat(tui): `antfarm scout --tui --mission <id>` opens a mission-scoped narrative panel — per-task progress tree showing builder + current tool call + elapsed, review status, and merge state for each implementation task. Replaces the global activity feed when `--mission` is provided. (#386)
+
 ## [0.6.24] - 2026-05-05
 
 ### Added
