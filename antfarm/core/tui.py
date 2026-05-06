@@ -45,6 +45,34 @@ class PipelineSnapshot:
     warnings: list[dict] = field(default_factory=list)
 
 
+@dataclass
+class MissionTaskState:
+    """Per-task state record powering the mission-scoped TUI panel (#386).
+
+    Aggregates the few fields that drive the build/review/merge columns:
+    builder identity, most recent tool action, harvest + PR metadata, review
+    verdict, merge state, and attempt counter. Updated incrementally by
+    ``AntfarmTUI._ingest_event`` as SSE events arrive, then rendered by
+    ``_render_mission_panel``.
+    """
+
+    task_id: str
+    title: str
+    deps: list[str] = field(default_factory=list)
+    builder_worker: str | None = None
+    last_tool_action: str | None = None
+    last_tool_target: str | None = None
+    last_tool_ts: datetime | None = None
+    harvested_at: datetime | None = None
+    pr_url: str | None = None
+    # queued | reviewing | pass | needs_changes
+    review_status: str = "queued"
+    review_verdict: str | None = None
+    # — | waiting_ci | rebasing | merged | failed
+    merge_status: str = "—"
+    attempts: int = 1
+
+
 class AntfarmTUI:
     """Live TUI dashboard for an Antfarm colony.
 
@@ -60,6 +88,7 @@ class AntfarmTUI:
         token: str | None = None,
         refresh_interval: float = 2.0,
         autostart_activity: bool = True,
+        mission_id: str | None = None,
     ):
         self.colony_url = colony_url.rstrip("/")
         self.token = token
@@ -75,6 +104,23 @@ class AntfarmTUI:
         self._latest_worker_activity: dict | None = None
         self._activity_lock = threading.Lock()
         self._activity_thread: threading.Thread | None = None
+
+        # Mission-scoped panel state (#386). When ``mission_id`` is set the
+        # build_display path swaps the global activity panel for the per-task
+        # progress tree fed by ``_mission_task_states``. ``_mission_seeded``
+        # toggles to True after the first successful state seed so we don't
+        # repeatedly clobber live event-driven updates with stale snapshots.
+        # ``_mission_not_found`` is sticky once set (mission was never valid).
+        self._mission_id: str | None = mission_id
+        self._mission_task_states: dict[str, MissionTaskState] = {}
+        self._mission: dict | None = None
+        self._mission_seeded: bool = False
+        self._mission_not_found: bool = False
+        # Maps worker_id -> task_id for the active builder/reviewer claim.
+        # Used to attribute ``worker_activity`` events (which carry empty
+        # task_id) back to the right row in the mission panel.
+        self._worker_to_task: dict[str, str] = {}
+
         if autostart_activity:
             self._start_activity_thread()
 
@@ -195,6 +241,121 @@ class AntfarmTUI:
                 if actor and actor not in self._NON_WORKER_ACTORS:
                     self._latest_worker_activity = event
 
+        # Mission-scoped panel update (#386). Held outside the activity lock
+        # because it touches a separate state map and the activity lock is
+        # already released. Filtered to events that name a task in the
+        # mission, plus worker_activity events whose actor maps to a known
+        # builder via ``_worker_to_task``.
+        if self._mission_id is not None:
+            self._update_mission_state(event)
+
+    def _update_mission_state(self, event: dict) -> None:
+        """Apply a single SSE event to the mission-scoped task state map.
+
+        Events relevant to mission rows fall into three buckets:
+
+        * ``worker_activity`` -- updates ``builder_worker`` and the latest
+          tool action/target/timestamp on the row owned by this worker.
+        * task lifecycle (``harvested``, ``merged``, ``auto_merged``,
+          ``kickback``/``kicked_back``, ``auto_merge_waiting_ci``,
+          ``auto_merge_rebasing``, ``merge_failed``) -- update the matching
+          task row by ``task_id``.
+        * Review verdict events -- update review_status / review_verdict.
+
+        Events that don't match a known task in the mission are ignored.
+        """
+        if not self._mission_task_states:
+            return
+
+        ev_type = event.get("type") or ""
+        task_id = event.get("task_id") or ""
+        actor = event.get("actor") or ""
+        ts = self._parse_event_ts(event.get("ts"))
+
+        # worker_activity has no task_id; map actor -> task via the running
+        # claim record. If we don't know the worker, drop it silently.
+        if ev_type == "worker_activity":
+            if not actor or actor in self._NON_WORKER_ACTORS:
+                return
+            mapped = self._worker_to_task.get(actor)
+            if not mapped or mapped not in self._mission_task_states:
+                return
+            state = self._mission_task_states[mapped]
+            state.builder_worker = actor
+            data = event.get("data") or {}
+            action = data.get("action")
+            target = data.get("target")
+            # Fall back to parsing detail if data dict is absent (older
+            # emitters). The detail string already encodes verb+target so we
+            # store it as ``action`` and leave target empty.
+            if action is None and target is None:
+                detail = event.get("detail") or ""
+                state.last_tool_action = detail or state.last_tool_action
+            else:
+                state.last_tool_action = action or state.last_tool_action
+                state.last_tool_target = target or state.last_tool_target
+            if ts is not None:
+                state.last_tool_ts = ts
+            return
+
+        if not task_id or task_id not in self._mission_task_states:
+            return
+        state = self._mission_task_states[task_id]
+
+        if ev_type == "harvested":
+            state.harvested_at = ts or state.harvested_at
+            state.review_status = "queued"
+            detail = event.get("detail") or ""
+            for chunk in detail.split():
+                if chunk.startswith("pr="):
+                    state.pr_url = chunk[3:]
+                    break
+        elif ev_type in ("merged", "auto_merged"):
+            state.merge_status = "merged"
+            # Keep pr_url if previously captured. Detail may include
+            # "attempt=...". No further mutation needed.
+        elif ev_type in ("kickback", "kicked_back", "task_kicked_back"):
+            state.attempts += 1
+            state.builder_worker = None
+            state.last_tool_action = None
+            state.last_tool_target = None
+            state.last_tool_ts = None
+            state.harvested_at = None
+            state.merge_status = "—"
+            state.review_status = "queued"
+            state.review_verdict = None
+            # Drop any stale worker mapping pointing at this task.
+            for w, t in list(self._worker_to_task.items()):
+                if t == task_id:
+                    self._worker_to_task.pop(w, None)
+        elif ev_type == "auto_merge_waiting_ci":
+            state.merge_status = "waiting_ci"
+        elif ev_type == "auto_merge_rebasing":
+            state.merge_status = "rebasing"
+        elif ev_type == "merge_failed":
+            state.merge_status = "failed"
+        elif ev_type in ("review_started", "review_claimed"):
+            state.review_status = "reviewing"
+        elif ev_type in ("review_verdict", "review_pass", "review_passed"):
+            state.review_status = "pass"
+            state.review_verdict = event.get("detail") or "pass"
+        elif ev_type in ("review_needs_changes", "review_failed"):
+            state.review_status = "needs_changes"
+            state.review_verdict = event.get("detail") or "needs_changes"
+
+    @staticmethod
+    def _parse_event_ts(raw: str | None) -> datetime | None:
+        """Parse an ISO timestamp from an SSE event into an aware datetime."""
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+
     def run(self) -> None:
         """Main loop using rich.live.Live."""
         with Live(self._build_display(), refresh_per_second=1) as live:
@@ -235,6 +396,22 @@ class AntfarmTUI:
             missions = self._fetch("/missions")
         except Exception:
             missions = []
+
+        # Mission-scoped mode (#386): seed/refresh per-task state from the
+        # current snapshot, and replace the activity panel with the mission
+        # progress tree. Connection-error and 404 paths short-circuit before
+        # full panel rendering for a clean error message.
+        if self._mission_id is not None:
+            self._refresh_mission_state(missions, tasks, workers)
+            if self._mission_not_found:
+                layout = Layout()
+                layout.update(
+                    Panel(
+                        f"[red]Mission '{self._mission_id}' not found[/red]",
+                        title="Antfarm TUI",
+                    )
+                )
+                return layout
 
         snap = self._classify_tasks(tasks)
         snap.warnings = full.get("warnings", [])
@@ -391,12 +568,20 @@ class AntfarmTUI:
             )
         )
 
-        layout["activity"].update(
-            Panel(
-                self._render_activity(max_rows=20),
-                title="[bold white]Activity[/bold white]",
+        if self._mission_id is not None and self._mission is not None:
+            layout["activity"].update(
+                Panel(
+                    self._render_mission_panel(self._mission, self._mission_task_states),
+                    title=f"[bold white]Mission: {self._mission_id}[/bold white]",
+                )
             )
-        )
+        else:
+            layout["activity"].update(
+                Panel(
+                    self._render_activity(max_rows=20),
+                    title="[bold white]Activity[/bold white]",
+                )
+            )
 
         return layout
 
@@ -406,6 +591,286 @@ class AntfarmTUI:
         r = httpx.get(f"{self.colony_url}{path}", headers=headers, timeout=5)
         r.raise_for_status()
         return r.json()
+
+    # ------------------------------------------------------------------
+    # Mission-scoped panel (#386)
+    # ------------------------------------------------------------------
+
+    def _refresh_mission_state(
+        self,
+        missions: list[dict],
+        tasks: list[dict],
+        workers: list[dict],
+    ) -> None:
+        """Refresh per-task mission state and worker→task map from a snapshot.
+
+        Called once per ``_build_display`` cycle. Three responsibilities:
+
+        1. Locate the targeted mission. If absent on first refresh, set the
+           ``_mission_not_found`` sticky flag so the next render shows an
+           error panel and exits.
+        2. Seed/refresh ``_mission_task_states`` from the task list. New
+           tasks get a fresh ``MissionTaskState``; already-tracked tasks
+           keep event-driven fields (last_tool_*, etc.) but accept derived
+           updates from the snapshot (merge_status, harvested_at, attempts).
+        3. Rebuild ``_worker_to_task`` so that incoming ``worker_activity``
+           events can be attributed to a row.
+        """
+        target = next(
+            (m for m in (missions or []) if m.get("mission_id") == self._mission_id),
+            None,
+        )
+        if target is None and not self._mission_seeded:
+            self._mission_not_found = True
+            return
+        if target is None:
+            return  # transient — keep the last known state
+
+        self._mission = target
+        task_ids = set(target.get("task_ids", []))
+        # Implementation tasks only — plan/review tasks live as infra-tasks
+        # alongside the mission and would clutter the per-task table.
+        task_by_id = {t.get("id", ""): t for t in tasks if t.get("id") in task_ids}
+        impl_tasks = [t for tid, t in task_by_id.items() if not is_infra_task(t)]
+
+        new_states: dict[str, MissionTaskState] = {}
+        new_worker_to_task: dict[str, str] = {}
+        for task in impl_tasks:
+            tid = task.get("id", "")
+            existing = self._mission_task_states.get(tid)
+            state = existing or MissionTaskState(
+                task_id=tid,
+                title=task.get("title", "") or "",
+            )
+            state.title = task.get("title", "") or state.title
+            state.deps = list(task.get("depends_on", []) or [])
+            state.attempts = max(state.attempts, len(task.get("attempts", []) or []) or 1)
+
+            current_id = task.get("current_attempt")
+            current_attempt = None
+            for att in task.get("attempts", []) or []:
+                if att.get("attempt_id") == current_id:
+                    current_attempt = att
+                    break
+
+            if current_attempt is not None:
+                worker_id = current_attempt.get("worker_id") or None
+                if worker_id and task.get("status") == "active":
+                    state.builder_worker = worker_id
+                    new_worker_to_task[worker_id] = tid
+                # Harvested timestamp — use completed_at on done attempts
+                if current_attempt.get("status") in ("done", "merged"):
+                    completed = current_attempt.get("completed_at")
+                    if completed and state.harvested_at is None:
+                        state.harvested_at = self._parse_event_ts(completed)
+                # PR URL backfill — soldier marks branch+pr on harvest
+                if not state.pr_url:
+                    pr = current_attempt.get("pr") or current_attempt.get("pr_url")
+                    if pr:
+                        state.pr_url = pr
+                # Review verdict on the current attempt seeds the panel even
+                # before the live event arrives (e.g. on TUI restart mid-run).
+                rv = current_attempt.get("review_verdict") or {}
+                if isinstance(rv, dict) and rv:
+                    verdict = rv.get("verdict")
+                    if verdict == "pass" and state.review_status == "queued":
+                        state.review_status = "pass"
+                        state.review_verdict = "pass"
+                    elif verdict == "needs_changes" and state.review_status == "queued":
+                        state.review_status = "needs_changes"
+                        state.review_verdict = rv.get("reason") or "needs_changes"
+                # Merge status — derived from attempt status for snapshot
+                # seeding only. Live events authoritative once stream attaches.
+                if current_attempt.get("status") == "merged":
+                    state.merge_status = "merged"
+
+            new_states[tid] = state
+
+        self._mission_task_states = new_states
+        # Filter the worker map to currently-active claims (drop stale).
+        # Workers with no active assignment are simply absent from the map.
+        live_worker_ids = {w.get("worker_id") for w in (workers or []) if w.get("worker_id")}
+        self._worker_to_task = {
+            w: t for w, t in new_worker_to_task.items() if w in live_worker_ids or not workers
+        }
+        self._mission_seeded = True
+
+    def _render_mission_panel(
+        self,
+        mission: dict,
+        task_states: dict[str, MissionTaskState],
+        now: datetime | None = None,
+    ) -> Table:
+        """Render the per-task mission progress tree.
+
+        Columns: ID | Builder + current activity | Build | Review | Merge.
+        The Builder column folds together the worker_id, the most recent
+        tool action+target, and elapsed seconds since that action started.
+        Build column shows ``done`` once harvested, otherwise ``in flight``
+        or ``queued (deps: …)``. Review column maps from the
+        ``MissionTaskState.review_status`` enum to a human glyph. Merge
+        column maps the merge_status enum likewise.
+        """
+        table = Table(
+            show_header=True,
+            header_style="bold",
+            box=None,
+            padding=(0, 1),
+            title=self._mission_panel_title(mission, task_states),
+            title_justify="left",
+        )
+        table.add_column("ID", max_width=12, no_wrap=True)
+        table.add_column("Builder", max_width=40, no_wrap=True)
+        table.add_column("Build", max_width=18, no_wrap=True)
+        table.add_column("Review", max_width=16, no_wrap=True)
+        table.add_column("Merge", max_width=22, no_wrap=True)
+
+        if not task_states:
+            table.add_row(
+                Text("--", style="dim"),
+                Text("no tasks yet — mission may still be planning", style="dim"),
+                Text(""),
+                Text(""),
+                Text(""),
+            )
+            return table
+
+        ordered = sorted(task_states.values(), key=lambda s: s.task_id)
+        merged_ids = {s.task_id for s in ordered if s.merge_status == "merged"}
+        for state in ordered:
+            table.add_row(
+                Text(state.task_id[:10], style="bold"),
+                self._render_builder_cell(state, now=now),
+                self._render_build_cell(state, merged_ids),
+                self._render_review_cell(state),
+                self._render_merge_cell(state),
+            )
+        return table
+
+    def _mission_panel_title(
+        self,
+        mission: dict,
+        task_states: dict[str, MissionTaskState],
+    ) -> str:
+        """Build a one-line header for the mission panel.
+
+        Format: ``Mission: <id>     Status: <status>     Tasks: M/N merged``.
+        ``M`` counts ``MissionTaskState.merge_status == "merged"`` so the
+        number tracks the live event stream rather than the lagging report.
+        """
+        mid = mission.get("mission_id", self._mission_id or "")
+        mstatus = mission.get("status", "")
+        total = len(task_states)
+        merged = sum(1 for s in task_states.values() if s.merge_status == "merged")
+        return f"Mission: {mid}     Status: {mstatus}     Tasks: {merged}/{total} merged"
+
+    def _render_builder_cell(
+        self,
+        state: MissionTaskState,
+        now: datetime | None = None,
+    ) -> Text:
+        """Render ``worker (now: <action> <target> <elapsed>)`` or em-dash."""
+        if not state.builder_worker:
+            return Text("—", style="dim")
+        text = Text()
+        text.append(state.builder_worker, style=self._color_for_worker(state.builder_worker))
+        if state.last_tool_action:
+            current = now or datetime.now(UTC)
+            elapsed_str = ""
+            if state.last_tool_ts is not None:
+                secs = max(0, int((current - state.last_tool_ts).total_seconds()))
+                if secs < 60:
+                    elapsed_str = f"{secs}s"
+                elif secs < 3600:
+                    mins, rem = divmod(secs, 60)
+                    elapsed_str = f"{mins}m{rem}s"
+                else:
+                    hrs, rem = divmod(secs, 3600)
+                    elapsed_str = f"{hrs}h{rem // 60}m"
+            target = state.last_tool_target or ""
+            label = state.last_tool_action
+            if target:
+                label = f"{label} {target}"
+            label = label[:24]
+            suffix = f" (now: {label}"
+            if elapsed_str:
+                suffix += f" {elapsed_str}"
+            suffix += ")"
+            text.append(suffix, style="dim")
+        return text
+
+    def _render_build_cell(
+        self,
+        state: MissionTaskState,
+        merged_ids: set[str],
+    ) -> Text:
+        """Render Build column glyph for a single task row."""
+        if state.harvested_at is not None or state.merge_status == "merged":
+            return Text("✓ done", style="green")
+        if state.builder_worker is not None:
+            return Text("in flight", style="yellow")
+        # No builder yet — distinguish "blocked on deps" from "ready to claim".
+        unmet = [d for d in state.deps if d not in merged_ids]
+        if unmet:
+            short = ", ".join(d.split("-")[-1] for d in unmet[:2])
+            if len(unmet) > 2:
+                short += "+"
+            return Text(f"queued (deps: {short})", style="dim")
+        return Text("queued", style="dim")
+
+    def _render_review_cell(self, state: MissionTaskState) -> Text:
+        """Map ``review_status`` to a glyph + style for the Review column."""
+        if state.review_status == "pass":
+            return Text("✓ pass", style="green")
+        if state.review_status == "needs_changes":
+            label = state.review_verdict or "needs_changes"
+            if len(label) > 14:
+                label = label[:11] + "…"
+            return Text(label, style="red")
+        if state.review_status == "reviewing":
+            return Text("in flight", style="yellow")
+        # queued — show em-dash if there's nothing to review yet, "queued"
+        # once the task is harvested.
+        if state.harvested_at is not None:
+            return Text("queued", style="dim")
+        return Text("—", style="dim")
+
+    def _render_merge_cell(self, state: MissionTaskState) -> Text:
+        """Map ``merge_status`` to a glyph + style for the Merge column."""
+        if state.merge_status == "merged":
+            pr = state.pr_url or ""
+            label = "✓ merged"
+            if pr:
+                label += f" → {self._format_pr(pr)}"
+            return Text(label, style="green")
+        if state.merge_status == "waiting_ci":
+            return Text("waiting CI", style="yellow")
+        if state.merge_status == "rebasing":
+            return Text("rebasing", style="yellow")
+        if state.merge_status == "failed":
+            return Text("failed", style="red")
+        return Text("—", style="dim")
+
+    @staticmethod
+    def _format_pr(pr: str) -> str:
+        """Compress a PR URL into ``PR#<n>`` when possible.
+
+        Accepts either a bare number, a ``#123`` form, or a full GitHub URL
+        ending in ``/pull/<n>``. Falls back to the raw input when the number
+        can't be extracted.
+        """
+        if not pr:
+            return ""
+        s = pr.strip()
+        if s.startswith("#"):
+            return f"PR{s}"
+        if s.isdigit():
+            return f"PR#{s}"
+        if "/pull/" in s:
+            tail = s.rsplit("/pull/", 1)[-1].split("/")[0].split("?")[0]
+            if tail.isdigit():
+                return f"PR#{tail}"
+        return s[:18]
 
     # ------------------------------------------------------------------
     # Classification
@@ -1149,8 +1614,7 @@ class AntfarmTUI:
             # OR when the actor isn't a known subsystem (heuristic - covers
             # legacy events that pre-date the worker_activity type).
             actor_is_worker = (
-                event_type_raw == "worker_activity"
-                or actor_raw not in self._NON_WORKER_ACTORS
+                event_type_raw == "worker_activity" or actor_raw not in self._NON_WORKER_ACTORS
             )
 
             # Row-level style for special event kinds - overrides actor color
