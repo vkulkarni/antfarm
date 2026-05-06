@@ -63,7 +63,17 @@ _HEARTBEAT_VERBS: frozenset[str] = frozenset(
     {"heartbeat", "polling", "idle", "scanning", "cleanup"}
 )
 LOW_SIGNAL_TYPES: frozenset[str] = frozenset(
-    {"heartbeat", "scanning", "idle", "polling", "cleanup"}
+    {
+        "heartbeat",
+        "scanning",
+        "idle",
+        "polling",
+        "cleanup",
+        # Autoscaler spawn/retire events are infrastructure noise during
+        # short missions / idle periods (#385). Verbose mode keeps them.
+        "worker_spawned",
+        "worker_retired",
+    }
 )
 
 

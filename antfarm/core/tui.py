@@ -69,6 +69,10 @@ class AntfarmTUI:
         self._activity_cursor: int = 0
         self._activity_epoch: str = ""
         self._activity_status: str = "connected"
+        # Sticky "Now" line state (#385): the most recent worker_activity
+        # event whose actor is *not* a subsystem (colony/queen/autoscaler/
+        # soldier/doctor). Cleared visually when older than 90s.
+        self._latest_worker_activity: dict | None = None
         self._activity_lock = threading.Lock()
         self._activity_thread: threading.Thread | None = None
         if autostart_activity:
@@ -162,6 +166,10 @@ class AntfarmTUI:
         If the event carries an epoch that differs from the one we've been
         tracking, the colony restarted — zero the cursor so we replay events
         from the new server's id=1 onward (#306).
+
+        Also pins the most recent ``worker_activity`` event from a non-
+        subsystem actor as ``_latest_worker_activity`` so the Activity panel
+        can render a sticky "Now" header (#385).
         """
         with self._activity_lock:
             incoming_epoch = event.get("epoch", "")
@@ -178,6 +186,14 @@ class AntfarmTUI:
             eid = event.get("id", 0)
             if isinstance(eid, int) and eid > self._activity_cursor:
                 self._activity_cursor = eid
+            # Pin the latest real worker_activity event for the "Now" header.
+            # Subsystem actors (colony/queen/autoscaler/soldier/doctor) are
+            # excluded — the Now line is specifically for "what is a worker
+            # doing right now".
+            if event.get("type") == "worker_activity":
+                actor = event.get("actor") or ""
+                if actor and actor not in self._NON_WORKER_ACTORS:
+                    self._latest_worker_activity = event
 
     def run(self) -> None:
         """Main loop using rich.live.Live."""
@@ -239,7 +255,9 @@ class AntfarmTUI:
             Layout(name="review", size=12),
             Layout(name="merge_ready", size=6),
             Layout(name="merged", size=6),
-            Layout(name="activity", size=22),
+            # +2 over the legacy 22-row size: room for the sticky "Now"
+            # header line plus a thin separator above the event tail (#385).
+            Layout(name="activity", size=24),
         ]
         if snap.warnings:
             column_slices.insert(0, Layout(name="warnings", size=warnings_size))
@@ -996,10 +1014,96 @@ class AntfarmTUI:
         h = sum(ord(c) for c in actor)
         return self._WORKER_PALETTE[h % len(self._WORKER_PALETTE)]
 
-    def _render_activity(self, max_rows: int = 6) -> Text:
-        """Render the tail of the activity event deque as timestamped lines.
+    # Stale TTL for the "Now" header — events older than this collapse to
+    # ``Now: --`` so the panel doesn't lie about live state when workers
+    # have gone idle (#385).
+    _NOW_LINE_STALE_SECONDS: int = 90
 
-        Two row formats coexist:
+    @staticmethod
+    def _format_elapsed_seconds(iso_timestamp: str, now: datetime | None = None) -> str:
+        """Format elapsed time as ``Ns``, ``NmMs``, or ``NhMm``.
+
+        Returns ``""`` if the timestamp is missing or unparseable. Used by
+        the sticky "Now" header so very-recent activity reads as ``10s``
+        and longer-running tool calls read as ``4m12s``.
+        """
+        if not iso_timestamp:
+            return ""
+        try:
+            start = datetime.fromisoformat(iso_timestamp)
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=UTC)
+            current = now or datetime.now(UTC)
+            secs = int((current - start).total_seconds())
+        except (ValueError, TypeError):
+            return ""
+        if secs < 0:
+            secs = 0
+        if secs < 60:
+            return f"{secs}s"
+        if secs < 3600:
+            mins, rem = divmod(secs, 60)
+            return f"{mins}m{rem}s"
+        hrs, rem_secs = divmod(secs, 3600)
+        mins = rem_secs // 60
+        return f"{hrs}h{mins}m"
+
+    def _render_now_line(self, now: datetime | None = None) -> Text:
+        """Render the sticky ``Now: <actor>  <text>  (<elapsed>)`` header.
+
+        Returns ``Now: --`` (dim) when the most recent worker_activity is
+        absent or older than :attr:`_NOW_LINE_STALE_SECONDS`. Otherwise the
+        actor segment is colored via :meth:`_color_for_worker` so the eye
+        can lock onto whichever worker is currently active (#385).
+        """
+        text = Text()
+        text.append("Now: ", style="bold")
+
+        with self._activity_lock:
+            latest = self._latest_worker_activity
+
+        ts_raw = (latest or {}).get("ts") or ""
+        elapsed = self._format_elapsed_seconds(ts_raw, now=now)
+
+        # Determine staleness. A missing/bad timestamp is treated as stale
+        # so we never show a Now line we can't age-check.
+        is_stale = True
+        if latest and ts_raw:
+            try:
+                start = datetime.fromisoformat(ts_raw)
+                if start.tzinfo is None:
+                    start = start.replace(tzinfo=UTC)
+                current = now or datetime.now(UTC)
+                age = (current - start).total_seconds()
+                is_stale = age > self._NOW_LINE_STALE_SECONDS
+            except (ValueError, TypeError):
+                is_stale = True
+
+        if not latest or is_stale:
+            text.append("--", style="dim")
+            return text
+
+        actor_raw = str(latest.get("actor") or "")
+        detail = str(latest.get("detail") or "-")
+        text.append(actor_raw, style=self._color_for_worker(actor_raw))
+        text.append("  ")
+        text.append(detail)
+        if elapsed:
+            text.append(f"  ({elapsed})", style="dim")
+        return text
+
+    def _render_activity(self, max_rows: int = 6) -> Text:
+        """Render the activity panel.
+
+        Layout (#385):
+
+        * Line 1 — sticky ``Now: <actor>  <text>  (<elapsed>)`` header that
+          mirrors the most recent ``worker_activity`` from a non-subsystem
+          actor. Collapses to ``Now: --`` after 90s of silence.
+        * Line 2 — thin separator made of box-drawing ``─`` chars.
+        * Lines 3+ — event tail (up to ``max_rows`` rows).
+
+        Two row formats coexist in the tail:
 
         * ``worker_activity`` events render as ``HH:MM:SS  actor  text`` --
           the live per-worker action feed (#372). The ``text`` comes from
@@ -1017,6 +1121,13 @@ class AntfarmTUI:
             events = list(self._activity_events)
 
         text = Text()
+        # Sticky "Now" header — always rendered, even when the event deque
+        # is empty, so the panel has consistent shape across colony states.
+        text.append_text(self._render_now_line())
+        text.append("\n")
+        text.append("─" * 40, style="dim")
+        text.append("\n")
+
         if not events:
             text.append("(waiting for events\u2026)", style="dim")
             return text

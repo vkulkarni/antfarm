@@ -70,6 +70,39 @@ def test_is_low_signal_high_signal_events():
         assert watch_format.is_low_signal({"type": t}) is False
 
 
+def test_is_low_signal_filters_worker_spawned():
+    """Autoscaler worker_spawned events are filtered by default (#385)."""
+    ev = {"type": "worker_spawned", "actor": "autoscaler"}
+    assert watch_format.is_low_signal(ev) is True
+
+
+def test_is_low_signal_filters_worker_retired():
+    """Autoscaler worker_retired events are filtered by default (#385)."""
+    ev = {"type": "worker_retired", "actor": "autoscaler"}
+    assert watch_format.is_low_signal(ev) is True
+
+
+def test_format_event_human_skips_worker_spawned_via_is_low_signal():
+    """Confirm the filter+formatter chain works for worker_spawned (#385).
+
+    ``scout --watch`` drops events where ``is_low_signal`` returns True
+    *before* calling the formatter. We assert both halves of that contract:
+    the filter returns True for worker_spawned, and the formatter still
+    produces a clean row if anyone bypasses the gate (e.g. ``--verbose``).
+    """
+    ev = {
+        "type": "worker_spawned",
+        "actor": "autoscaler",
+        "task_id": "",
+        "detail": "role=builder name=builder-1",
+        "ts": "2026-04-16T14:32:11+00:00",
+    }
+    assert watch_format.is_low_signal(ev) is True
+    out = watch_format.format_event_human(ev, use_color=False)
+    assert "spawned worker" in out
+    assert "autoscaler" in out
+
+
 # ---------------------------------------------------------------------------
 # Timestamp formatting
 # ---------------------------------------------------------------------------
