@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import uuid
 from unittest.mock import patch
 
 import pytest
@@ -218,19 +219,51 @@ def test_tmux_pm_writes_metadata(tmp_path):
 
 @pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not installed")
 def test_tmux_pm_adopt_existing(tmp_path):
+    # Hermetic prefix so the test ignores any leftover ``auto-*`` tmux sessions
+    # already on the host (e.g. from a prior antfarm mission). Without this
+    # filter ``max_counter`` would parse all sessions matching the manager's
+    # default ``auto-`` prefix and the assertion below would be host-dependent.
+    prefix = f"auto-test-{uuid.uuid4().hex[:8]}-"
+    builder_name = f"{prefix}builder-5"
+    reviewer_name = f"{prefix}reviewer-2"
+
     pm = TmuxProcessManager(state_dir=str(tmp_path))
     try:
-        pm.start("auto-builder-5", ["sleep", "60"], role="builder")
-        pm.start("auto-reviewer-2", ["sleep", "60"], role="reviewer")
-        # New manager discovers existing sessions
+        pm.start(builder_name, ["sleep", "60"], role="builder")
+        pm.start(reviewer_name, ["sleep", "60"], role="reviewer")
+        # New manager discovers existing sessions, scoped to this test's prefix.
         pm2 = TmuxProcessManager(state_dir=str(tmp_path))
-        adopted = pm2.adopt_existing()
-        assert "auto-builder-5" in adopted
-        assert adopted["auto-builder-5"] == "builder"
-        assert pm2.max_counter() == 5
+        adopted = pm2.adopt_existing(prefix=prefix)
+        assert builder_name in adopted
+        assert adopted[builder_name] == "builder"
+        assert pm2.max_counter(prefix=prefix) == 5
     finally:
-        pm.stop("auto-builder-5")
-        pm.stop("auto-reviewer-2")
+        pm.stop(builder_name)
+        pm.stop(reviewer_name)
+
+
+@pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not installed")
+def test_tmux_pm_adopt_existing_filters_by_prefix(tmp_path):
+    """Explicit prefix narrows adoption: only matching sessions are adopted."""
+    prefix = f"auto-test-{uuid.uuid4().hex[:8]}-"
+    matching_name = f"{prefix}builder-1"
+    # Use a different uuid-scoped prefix for the non-matching session so we
+    # don't pollute (or collide with) any other test or real colony state.
+    other_prefix = f"auto-test-{uuid.uuid4().hex[:8]}-"
+    non_matching_name = f"{other_prefix}builder-1"
+
+    pm = TmuxProcessManager(state_dir=str(tmp_path))
+    try:
+        pm.start(matching_name, ["sleep", "60"], role="builder")
+        pm.start(non_matching_name, ["sleep", "60"], role="builder")
+
+        pm2 = TmuxProcessManager(state_dir=str(tmp_path))
+        adopted = pm2.adopt_existing(prefix=prefix)
+        assert matching_name in adopted
+        assert non_matching_name not in adopted
+    finally:
+        pm.stop(matching_name)
+        pm.stop(non_matching_name)
 
 
 @pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not installed")

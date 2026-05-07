@@ -309,7 +309,7 @@ class ProcessManager(ABC):
         """List names of all managed processes matching this manager's prefix."""
         ...
 
-    def adopt_existing(self) -> dict[str, str]:
+    def adopt_existing(self, prefix: str | None = None) -> dict[str, str]:
         """Discover and return existing processes from a previous run.
 
         Uses TWO sources for discovery:
@@ -325,8 +325,18 @@ class ProcessManager(ABC):
           SubprocessProcessManager, which overrides this method to
           return {} anyway — see that class for rationale)
 
+        Args:
+            prefix: Optional name prefix to filter on. When set, only
+                sessions/metadata whose ``name`` starts with this prefix
+                are considered. When ``None`` (default), the manager's
+                own ``self.prefix`` is used — preserving backward
+                compatibility for callers that don't need hermetic
+                scoping. Pass an explicit, narrower prefix (e.g. a
+                uuid-scoped one) to ignore unrelated host state.
+
         Returns: {name: role} for each adopted process.
         """
+        effective_prefix = prefix if prefix is not None else self.prefix
         adopted: dict[str, str] = {}
         seen: set[str] = set()
         my_type = self._manager_type()
@@ -334,7 +344,7 @@ class ProcessManager(ABC):
         # 1. Metadata file adoption — FILTERED BY MANAGER TYPE.
         #    A tmux manager must not trust subprocess metadata, and vice versa.
         for meta in self._list_metadata():
-            if not meta.name.startswith(self.prefix):
+            if not meta.name.startswith(effective_prefix):
                 continue
             if meta.manager_type != my_type:
                 continue  # foreign metadata — ignore (subclass may sweep it)
@@ -348,10 +358,12 @@ class ProcessManager(ABC):
         for name in self.list_managed():
             if name in seen:
                 continue
+            if not name.startswith(effective_prefix):
+                continue
             if not self.is_alive(name):
                 self.cleanup(name)
                 continue
-            parsed = parse_session_name(name, self.prefix)
+            parsed = parse_session_name(name, effective_prefix)
             if parsed:
                 adopted[name] = parsed[0]
                 # Write metadata retroactively so next adoption finds it
@@ -382,17 +394,28 @@ class ProcessManager(ABC):
         """Return 'tmux' or 'subprocess'."""
         ...
 
-    def max_counter(self) -> int:
+    def max_counter(self, prefix: str | None = None) -> int:
         """Return the highest counter value among managed processes.
 
         Checks both live sessions and metadata files.
+
+        Args:
+            prefix: Optional name prefix to filter on. When set, only
+                sessions/metadata whose ``name`` starts with this prefix
+                are considered. When ``None`` (default), the manager's
+                own ``self.prefix`` is used — preserving backward
+                compatibility. Use a uuid-scoped prefix to avoid leaking
+                unrelated host state into the result.
         """
+        effective_prefix = prefix if prefix is not None else self.prefix
         max_n = 0
         all_names = set(self.list_managed())
         for meta in self._list_metadata():
             all_names.add(meta.name)
         for name in all_names:
-            parsed = parse_session_name(name, self.prefix)
+            if not name.startswith(effective_prefix):
+                continue
+            parsed = parse_session_name(name, effective_prefix)
             if parsed:
                 max_n = max(max_n, parsed[1])
         return max_n
@@ -514,7 +537,7 @@ class SubprocessProcessManager(ProcessManager):
         logger.info("started subprocess: %s pid=%d", name, process.pid)
         return True
 
-    def adopt_existing(self) -> dict[str, str]:
+    def adopt_existing(self, prefix: str | None = None) -> dict[str, str]:
         """Subprocess backend does NOT support restart adoption.
 
         Rationale:
@@ -526,10 +549,17 @@ class SubprocessProcessManager(ProcessManager):
         Behavior: scan subprocess metadata files left by prior runs and
         remove them (best-effort cleanup), then return empty. Callers
         that need restart recovery must use TmuxProcessManager.
+
+        Args:
+            prefix: Optional name prefix to filter on. Maintained for
+                signature parity with the base class (and tmux backend);
+                only metadata whose ``name`` starts with this prefix is
+                swept. Defaults to ``self.prefix``.
         """
+        effective_prefix = prefix if prefix is not None else self.prefix
         removed = 0
         for meta in self._list_metadata():
-            if not meta.name.startswith(self.prefix):
+            if not meta.name.startswith(effective_prefix):
                 continue
             if meta.manager_type != "subprocess":
                 continue
