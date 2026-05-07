@@ -869,6 +869,17 @@ class WorkerRuntime:
         # Ensure Claude Code agent definitions exist in the worktree
         self._setup_agent_definitions(workspace)
 
+        # Register the Stop hook so usage telemetry (#354) reaches the colony.
+        # Without this, claude never invokes stop.sh and cost tracking is
+        # silently broken (#391). Only relevant for the claude-code adapter.
+        if self.agent_type == "claude-code":
+            from antfarm.core.hook_setup import register_stop_hook, stop_hook_path
+
+            try:
+                register_stop_hook(workspace, stop_hook_path())
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("failed to register Claude Code Stop hook: %s", exc)
+
         if is_plan:
             prompt = (
                 f"Task: {title}\n\n"

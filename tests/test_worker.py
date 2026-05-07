@@ -407,6 +407,109 @@ def test_aider_command_includes_yes_and_no_auto_commits(tmp_path, http_client):
 
 
 # ---------------------------------------------------------------------------
+# Test 9: Claude Code Stop hook registration (#391)
+# ---------------------------------------------------------------------------
+
+
+def test_launch_agent_claude_code_registers_stop_hook(tmp_path, http_client):
+    """For agent_type=claude-code, .claude/settings.json registers stop.sh
+    before `claude` is invoked. Without this the Stop hook never fires and
+    per-mission usage telemetry (#354) silently fails (#391).
+    """
+    import json
+    import subprocess
+    import threading
+    from unittest.mock import patch
+
+    from antfarm.core.hook_setup import stop_hook_path
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-cc",
+        agent_type="claude-code",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        client=http_client,
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    rt.workspace_mgr.create = MagicMock(return_value=str(workspace))
+
+    task = {
+        "id": "task-cc-001",
+        "title": "Test Claude Code Task",
+        "spec": "add a hello function",
+        "current_attempt": 1,
+    }
+
+    settings_at_launch: dict = {}
+    main_thread = threading.current_thread()
+
+    def fake_run(cmd, **kwargs):
+        # Capture the settings file state at the moment claude is invoked.
+        if threading.current_thread() is main_thread:
+            settings_path = workspace / ".claude" / "settings.json"
+            if settings_path.exists():
+                settings_at_launch.update(json.loads(settings_path.read_text()))
+        return MagicMock(returncode=0, stdout="done", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        rt._launch_agent(task, str(workspace))
+
+    # Assert hook was registered before claude was invoked.
+    assert "hooks" in settings_at_launch
+    stop = settings_at_launch["hooks"]["Stop"]
+    assert len(stop) == 1
+    assert stop[0]["hooks"][0]["type"] == "command"
+    assert stop[0]["hooks"][0]["command"] == str(stop_hook_path())
+
+
+def test_launch_agent_non_claude_code_skips_hook_registration(tmp_path, http_client):
+    """For non-claude-code adapters, no .claude/settings.json is written."""
+    import subprocess
+    import threading
+    from unittest.mock import patch
+
+    rt = WorkerRuntime(
+        colony_url="http://test",
+        node_id="node-1",
+        name="worker-codex",
+        agent_type="codex",
+        workspace_root=str(tmp_path / "workspaces"),
+        repo_path=str(tmp_path),
+        integration_branch="main",
+        heartbeat_interval=999.0,
+        client=http_client,
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    rt.workspace_mgr.create = MagicMock(return_value=str(workspace))
+
+    task = {
+        "id": "task-codex-002",
+        "title": "Test Codex Task",
+        "spec": "add a hello function",
+        "current_attempt": 1,
+    }
+
+    main_thread = threading.current_thread()
+
+    def fake_run(cmd, **kwargs):
+        if threading.current_thread() is main_thread:
+            pass
+        return MagicMock(returncode=0, stdout="done", stderr="")
+
+    with patch.object(subprocess, "run", side_effect=fake_run):
+        rt._launch_agent(task, str(workspace))
+
+    # Codex adapter has no Stop hook; settings.json must not be created.
+    assert not (workspace / ".claude" / "settings.json").exists()
+
+
+# ---------------------------------------------------------------------------
 # v0.5.1: Failure classification + retry policy
 # ---------------------------------------------------------------------------
 
