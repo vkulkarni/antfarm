@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.26] - 2026-05-07
+
+### Fixed
+- fix(worker,adapter): Claude Code Stop hook now registered per-worktree by deep-merging into `<workspace>/.claude/settings.json`; previously `setup.sh` only printed instructions and never wrote to `~/.claude/settings.json`, so cost tracking was silently broken on every worker. New `antfarm/core/hook_setup.py` is idempotent (3 calls produce 1 entry) and preserves existing `permissions`/`env`/`PreToolUse` blocks (#391)
+- fix(tests,process_manager): `test_tmux_pm_adopt_existing` no longer depends on host state — `adopt_existing()` and `max_counter()` accept an optional `prefix` parameter that filters both metadata-file and live `tmux list-sessions` passes, so the test counter reflects only its own UUID-prefixed sessions (#389)
+
 ## [0.6.25] - 2026-05-05
 
 ### Added
