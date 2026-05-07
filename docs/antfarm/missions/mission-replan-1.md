@@ -1,8 +1,8 @@
 # Mission: mission-replan-1
 
 **Spec:** `(inline)`
-**Created:** 2026-05-07T03:50:04.049053+00:00
-**Completed:** 2026-05-07T03:50:04.091134+00:00 (0s)
+**Created:** 2026-05-07T04:02:39.907508+00:00
+**Completed:** 2026-05-07T04:02:39.946050+00:00 (0s)
 **Outcome:** complete (2/2 merged)
 
 ## Plan
@@ -27,8 +27,8 @@ The plan above is the final accepted version. Earlier rejected drafts can be rec
 
 ## Timeline highlights
 
-- 03:50:04  mission created
-- 03:50:04  plan ready
-- 03:50:04  task-replan-01 merged
-- 03:50:04  task-replan-02 merged
-- 03:50:04  mission complete
+- 04:02:39  mission created
+- 04:02:39  plan ready
+- 04:02:39  task-replan-01 merged
+- 04:02:39  task-replan-02 merged
+- 04:02:39  mission complete
