@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Stop hook: report the final assistant message's usage block to the colony.
 #
-# Claude Code invokes Stop hooks when the conversation ends. The transcript
-# path is passed in $CLAUDE_TRANSCRIPT_PATH; the last assistant message
-# carries a `usage` object with input_tokens / output_tokens / cache_*_tokens.
+# Claude Code invokes Stop hooks when the conversation ends. The hook event
+# data is delivered as a JSON object on stdin per Claude Code's hook protocol;
+# `.transcript_path` is the canonical source for the transcript file. The
+# `$CLAUDE_TRANSCRIPT_PATH` env var is honored as a fallback for manual
+# invocation or older Claude Code versions.
+#
+# The transcript is JSONL; the last assistant message carries a `usage` object
+# with input_tokens / output_tokens / cache_*_tokens.
 #
 # This is best-effort — every failure path falls through to `|| true`, so a
 # broken jq install or a missing transcript never blocks Claude. We POST to
@@ -15,6 +20,25 @@ set -u
 : "${WORKER_ID:=}"
 : "${CLAUDE_TRANSCRIPT_PATH:=}"
 
+# Require jq for JSON extraction. If jq isn't installed, skip silently —
+# antfarm will warn about it elsewhere. We need jq both for parsing the
+# stdin event payload and for walking the transcript further down.
+if ! command -v jq >/dev/null 2>&1; then
+  exit 0
+fi
+
+# Claude Code pipes the hook event JSON on stdin. Prefer that over the env
+# var so we don't get fooled by stale environment from a parent process.
+if ! [ -t 0 ]; then
+  STDIN_JSON="$(cat 2>/dev/null || true)"
+  if [ -n "${STDIN_JSON}" ]; then
+    TPATH_FROM_STDIN="$(printf '%s' "${STDIN_JSON}" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
+    if [ -n "${TPATH_FROM_STDIN}" ]; then
+      CLAUDE_TRANSCRIPT_PATH="${TPATH_FROM_STDIN}"
+    fi
+  fi
+fi
+
 # If any required input is missing, do nothing. Do not error — Claude stops
 # anyway and the hook must stay out of the way.
 if [ -z "${ANTFARM_URL}" ] || [ -z "${WORKER_ID}" ] || [ -z "${CLAUDE_TRANSCRIPT_PATH}" ]; then
@@ -22,12 +46,6 @@ if [ -z "${ANTFARM_URL}" ] || [ -z "${WORKER_ID}" ] || [ -z "${CLAUDE_TRANSCRIPT
 fi
 
 if [ ! -f "${CLAUDE_TRANSCRIPT_PATH}" ]; then
-  exit 0
-fi
-
-# Require jq for JSON extraction. If jq isn't installed, skip silently —
-# antfarm will warn about it elsewhere.
-if ! command -v jq >/dev/null 2>&1; then
   exit 0
 fi
 
