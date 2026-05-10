@@ -6,6 +6,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.6.27] - 2026-05-10
+
+### Fixed
+- fix(adapter,stop_hook): Claude Code Stop hook now reads `transcript_path` from the JSON event piped on stdin (the protocol Claude Code actually uses), with `$CLAUDE_TRANSCRIPT_PATH` retained as a fallback for manual invocation. Previously the script read only the env var, which Claude Code never sets, so it silently exited and no usage telemetry ever reached the colony. Combined with #391 (hook registration), cost tracking is now fully wired end-to-end — mission audit docs will show real `Budget:` figures instead of `$0.00`. Resolves #390 and #392 as side-effects. (#395)
+
 ## [0.6.26] - 2026-05-07
 
 ### Fixed
